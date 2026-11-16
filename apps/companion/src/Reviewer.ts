@@ -1,6 +1,6 @@
-import { type AgentAccount, type AgentDecisionOpinion, AgentOpinion, AgentQuick, AgentSort, type Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
+import { type AgentAccount, type AgentDecisionOpinion, type AgentFinding, AgentOpinion, AgentQuick, AgentSort, type Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
-import { type Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream, SubscriptionRef } from 'effect'
+import { type Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Stream, SubscriptionRef } from 'effect'
 import { Agent, type AgentTurns, type SessionOptions } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
@@ -47,6 +47,11 @@ type Tracker = ReturnType<typeof tracker>
 
 /** Where a session's steps go. */
 type Slot = { phase: Phase['id']; worker: number }
+
+const samePaths = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) => a.length === b.length && a.every((p) => b.includes(p))
+
+/** A finding as the agent gave it, so a carried one is checked and anchored again at the new head. */
+const asAgentFinding = ({ severity, axis, kind, title, take, evidence, alternative, comment, anchor, handledIn }: AgentFinding): AgentFinding => ({ severity, axis, kind, title, take, evidence, alternative, comment, anchor, handledIn })
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
@@ -197,7 +202,11 @@ export class Reviewer extends Context.Service<
         if (!wantOpinion) yield* Fiber.interrupt(ticket)
         // Fetched while the sort runs.
         const contextFiber = wantOpinion ? yield* Effect.forkChild(opiner.context(ref, headSha)) : undefined
-        const sortPrompt = cachedSort ? undefined : yield* sorter.prepare(ref, headSha)
+        // A push to a PR reviewed before is sorted from that sort and the interdiff, and decisions whose change is the
+        // same keep their opinion; a push of `RESORT_LINES` or more starts over.
+        const last = cachedSort ? undefined : Option.getOrUndefined(yield* Effect.orDie(store.lastOpinion.get(`${repoKey}#${ref.number}`)))
+        const previous = last ? yield* sorter.since(ref, headSha, last) : undefined
+        const sortPrompt = cachedSort ? undefined : yield* sorter.prepare(ref, headSha, undefined, previous)
         yield* t.end('fetch', 'done')
         if (sortedEarlier) {
           yield* t.begin('sort', 'Sorted earlier')
@@ -216,6 +225,18 @@ export class Reviewer extends Context.Service<
         let specReady = false
         let specTaken = false
         const decided = new Map<string, DecisionOpinion>()
+        const changed = new Set(previous?.changed)
+        /** Decisions whose files change as they did at the previous head, with the opinion they had there. */
+        const carried = new Map<string, { decision: Decision; opinion: DecisionOpinion }>()
+        const carryOf = (d: Decision) => {
+          if (!previous || !last) return undefined
+          const paths = d.files.map((f) => f.path)
+          const old = previous.sort.decisions.find((e) => e.id === d.id || samePaths(e.files.map((f) => f.path), paths))
+          const opinion = old && last.opinion.decisions.find((o) => o.decisionId === old.id)
+          return opinion && ![...paths, ...old!.files.map((f) => f.path)].some((p) => changed.has(p)) ? opinion : undefined
+        }
+        /** What is left for the agent to judge. */
+        const toJudge = (s: SortResult) => judged(s).filter((d) => !carried.has(d.id))
         // Each decision once, taken from the sort as it writes them, then the rest of the finished sort; then the spec turn.
         const queue = yield* Queue.unbounded<Decision | 'spec', Cause.Done>()
         const queued: Decision[] = []
@@ -228,7 +249,13 @@ export class Reviewer extends Context.Service<
 
         const enqueue = (ds: ReadonlyArray<Decision>) =>
           Effect.gen(function* () {
-            const fresh = ds.filter((d) => !queued.some((q) => q.id === d.id))
+            const before = carried.size
+            for (const d of ds) {
+              const opinion = !carried.has(d.id) && !queued.some((q) => q.id === d.id) ? carryOf(d) : undefined
+              if (opinion) carried.set(d.id, { decision: d, opinion })
+            }
+            if (context && carried.size > before) yield* settleCarried(context)
+            const fresh = ds.filter((d) => !queued.some((q) => q.id === d.id) && !carried.has(d.id))
             if (!fresh.length) return
             queued.push(...fresh)
             yield* Queue.offerAll(queue, fresh)
@@ -255,6 +282,17 @@ export class Reviewer extends Context.Service<
           if (!context) return t.partial({ sort: s, opinion: null })
           return Effect.flatMap(context.opinion(judged(s).flatMap((d) => decided.get(d.id) ?? []), true), (opinion) => t.partial({ sort: s, opinion }))
         })
+        /** Carried opinions, checked and anchored at this head, marked with the head they were judged on. */
+        const settleCarried = (c: OpinionContext) =>
+          Effect.forEach(
+            [...carried].filter(([id]) => !decided.has(id)),
+            ([id, { decision, opinion }]) =>
+              c.decide({ decisionId: id, authorCase: opinion.authorCase, checked: opinion.checked, findings: opinion.findings.map(asAgentFinding) }, decision, opinion.deep).pipe(
+                Effect.map((made) => made && void decided.set(id, { ...made, carriedFrom: opinion.carriedFrom ?? previous!.headSha })),
+                Effect.ignore,
+              ),
+            { discard: true },
+          ).pipe(Effect.andThen(publish))
         /** A decision's answers so far, with its Spec findings once they are in, made the decision's opinion. */
         const settle = (c: OpinionContext, id: string) =>
           Effect.gen(function* () {
@@ -285,7 +323,7 @@ export class Reviewer extends Context.Service<
           })
         const specTurn = (turns: AgentTurns, c: OpinionContext, continued: boolean) =>
           Effect.gen(function* () {
-            const prompt = yield* c.prompt(judged(sort!), { continued, spec: 'only' })
+            const prompt = yield* c.prompt(toJudge(sort!), { continued, spec: 'only' })
             const answer = yield* turns.structured(prompt, AgentOpinion, 'main', 'opinion')
             for (const a of answer.decisions) specAnswers.set(a.decisionId, a)
             specDone = true
@@ -304,7 +342,7 @@ export class Reviewer extends Context.Service<
             const got = yield* Effect.result(Fiber.join(contextFiber!).pipe(measure('context.wait', { on: 'context' })))
             if (got._tag === 'Failure') return void (opinionError = got.failure.message)
             const c = (context = got.success)
-            yield* publish
+            yield* settleCarried(c)
             let first = true
             for (;;) {
               // The spec turn goes first once it can run, so it doesn't trail the last decision.
@@ -339,7 +377,7 @@ export class Reviewer extends Context.Service<
         /** Ends the queue once the sort is done; first, when the ticket is read, the spec turn goes in ahead of what is left. */
         const specGate = Effect.gen(function* () {
           yield* Deferred.await(sorted)
-          if (sort && !specDone && judged(sort).length) {
+          if (sort && !specDone && toJudge(sort).length) {
             yield* Fiber.await(ticket)
             specReady = true
             // Queued too, to wake a session waiting on the queue.
@@ -417,8 +455,9 @@ export class Reviewer extends Context.Service<
         if (!sort) return yield* Effect.die('the session ended without a sort')
 
         // A turn that failed in another session left its work; one more try in a session of its own.
-        const left = context && !opinionError ? judged(sort).filter((d) => !answers.has(d.id)) : []
-        const specLeft = context !== undefined && !opinionError && !specDone && judged(sort).length > 0
+        if (context) yield* settleCarried(context)
+        const left = context && !opinionError ? toJudge(sort).filter((d) => !answers.has(d.id)) : []
+        const specLeft = context !== undefined && !opinionError && !specDone && toJudge(sort).length > 0
         if (left.length || specLeft) {
           const c = context!
           const retried = yield* Effect.result(
@@ -430,7 +469,7 @@ export class Reviewer extends Context.Service<
         }
         if (contextFiber && judged(sort).length) {
           const decisions = judged(sort)
-          yield* annotate({ decisions: decisions.length, highDecisions: decisions.filter((d) => impact(d) === 'high').length, streamed, retried: left.length, slowTicket, specRetried: specLeft })
+          yield* annotate({ decisions: decisions.length, highDecisions: decisions.filter((d) => impact(d) === 'high').length, streamed, retried: left.length, slowTicket, specRetried: specLeft, since: previous !== undefined, carried: carried.size })
         }
 
         let opinion: PrOpinion | undefined
@@ -438,6 +477,13 @@ export class Reviewer extends Context.Service<
           opinion = yield* context.opinion(judged(sort).flatMap((d) => decided.get(d.id) ?? []))
           yield* opiner.remember(ref, headSha, opinion)
           yield* Effect.orDie(store.lastOpinion.set(`${repoKey}#${ref.number}`, { headSha, ...(sort.mergeBase ? { mergeBase: sort.mergeBase } : {}), opinion }))
+          // What the reviewer did with a carried finding (posted, dismissed) carries with it.
+          const ids = new Set(opinion.decisions.filter((d) => d.carriedFrom !== undefined).flatMap((d) => d.findings.map((f) => f.id)))
+          const here = `${repoKey}#${ref.number}@${headSha}`
+          if (last && ids.size && Option.isNone(yield* Effect.orDie(store.findings.get(here)))) {
+            const before = Option.getOrElse(yield* Effect.orDie(store.findings.get(`${repoKey}#${ref.number}@${last.headSha}`)), () => ({}))
+            yield* Effect.orDie(store.findings.set(here, Object.fromEntries(Object.entries(before).filter(([id]) => ids.has(id)))))
+          }
         }
         if (wantOpinion) yield* t.end('opinion', opinionError ? 'failed' : 'done')
         return { sort, opinion: opinion ?? cachedOpinion ?? null, ...(opinionError ? { opinionError } : {}) } satisfies Review

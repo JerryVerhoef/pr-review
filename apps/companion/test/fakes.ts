@@ -17,7 +17,7 @@ export type AgentCall = {
   related?: ReadonlyArray<string>
   prefer?: 'deep'
   resume?: string
-  log: { kind: string; number: number }
+  log: { kind: string; number: number; headSha?: string }
   session?: number
   account?: string
   turn?: number
@@ -103,7 +103,7 @@ export const fakeGit = (o: { files?: FileStat[]; diff?: string | ((from: string,
     Git.of({
       dir: () => '/cache/repo.git',
       ensureClone: () => Effect.void,
-      fetchPr: () => Effect.succeed({ headSha: 'HEAD1', baseSha: 'BASE1', mergeBase: 'MB1' }),
+      fetchPr: (_k, _n, _b, headSha) => Effect.succeed({ headSha: headSha || 'HEAD1', baseSha: 'BASE1', mergeBase: 'MB1' }),
       numstat: () => Effect.succeed(o.files ?? []),
       diff: (_k, from, to, paths = []) => Effect.sync(() => (diffPaths.push(paths), typeof o.diff === 'function' ? o.diff(from, to, paths) : (o.diff ?? ''))),
       show: (_k, ref, path) =>

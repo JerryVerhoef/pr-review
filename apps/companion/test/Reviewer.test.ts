@@ -39,6 +39,7 @@ const setup = (
     sort?: (call: AgentCall) => Effect.Effect<unknown, AgentError>
     ticket?: Effect.Effect<TicketSummary>
     github?: Partial<GitHubClient>
+    diff?: (from: string, to: string, paths: ReadonlyArray<string>) => string
   } = {},
 ) => {
   const agent = fakeAgent(
@@ -47,7 +48,7 @@ const setup = (
     o.pool,
   )
   const files = o.stats ?? (o.decisions ?? many).map((d) => ({ path: d.files[0]!.path, additions: 100, deletions: 1 }))
-  const deps = Layer.mergeAll(agent.layer, fakeGit({ files, diff: 'THE DIFF' }).layer, fakeGitHub(o.github), configLayer(), Layer.succeed(Tickets, Tickets.of({ summary: () => o.ticket ?? Effect.succeed({ text: null, note: 'none' }) })))
+  const deps = Layer.mergeAll(agent.layer, fakeGit({ files, diff: o.diff ?? 'THE DIFF' }).layer, fakeGitHub(o.github), configLayer(), Layer.succeed(Tickets, Tickets.of({ summary: () => o.ticket ?? Effect.succeed({ text: null, note: 'none' }) })))
   const layer = Reviewer.layer.pipe(Layer.provideMerge(Opiner.layer), Layer.provideMerge(Sorter.layer), Layer.provideMerge(Store.layerWith(KeyValueStore.layerMemory)), Layer.provideMerge(deps))
   return { agent, layer }
 }
@@ -528,4 +529,45 @@ describe('Reviewer', () => {
       const e = yield* Effect.flip(review.pipe(Effect.provide(layer)))
       assert.strictEqual(e.message, 'no')
     }))
+
+  describe('after a push', () => {
+    const patch = (path: string, line: string) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+${line}\n`
+    /** h1 changes the same way at both heads; l1 changes differently at HEAD2, by an interdiff of `lines` lines. */
+    const pushed = (lines: number) => (from: string, to: string, paths: ReadonlyArray<string>) => {
+      if (from === 'HEAD1' && to === 'HEAD2') return `diff --git a/src/l1.ts b/src/l1.ts\n--- a/src/l1.ts\n+++ b/src/l1.ts\n@@ -1,1 +1,${lines} @@\n${'+x\n'.repeat(lines)}`
+      if (from !== 'MB1') return 'THE DIFF'
+      return paths.length > 2 ? 'THE DIFF' : patch('src/h1.ts', 'one') + patch('src/l1.ts', to === 'HEAD2' ? 'two' : 'one')
+    }
+    const twice = Effect.gen(function* () {
+      const reviewer = yield* Reviewer
+      yield* reviewer.result(ref, 'HEAD1')
+      return yield* reviewer.result(ref, 'HEAD2')
+    })
+
+    it.effect('a small push sorts from the previous sort and judges only decisions whose change differs', () =>
+      Effect.gen(function* () {
+        const { agent, layer } = setup({ decisions: few, diff: pushed(3) })
+        const r = yield* twice.pipe(Effect.provide(layer))
+        const second = agent.calls.filter((c) => c.log.headSha === 'HEAD2')
+        const sort = second.find((c) => c.log.kind === 'sort')!.prompt
+        assert.include(sort, '# Previous sort (head HEAD1)')
+        assert.match(sort, /# Changed since then\n.*\nsrc\/l1\.ts\n/)
+        assert.notInclude(sort, 'THE DIFF')
+        assert.deepStrictEqual(opinionTurns(second).flatMap((c) => c.ids), ['l1'])
+        const byId = new Map(r.opinion!.decisions.map((d) => [d.decisionId, d]))
+        assert.strictEqual(byId.get('h1')?.carriedFrom, 'HEAD1')
+        assert.strictEqual(byId.get('h1')?.authorCase, 'case h1')
+        assert.isUndefined(byId.get('l1')?.carriedFrom)
+      }))
+
+    it.effect('a push of 400 lines or more sorts and judges from scratch', () =>
+      Effect.gen(function* () {
+        const { agent, layer } = setup({ decisions: few, diff: pushed(400) })
+        const r = yield* twice.pipe(Effect.provide(layer))
+        const second = agent.calls.filter((c) => c.log.headSha === 'HEAD2')
+        assert.notInclude(second.find((c) => c.log.kind === 'sort')!.prompt, '# Previous sort')
+        assert.sameMembers(opinionTurns(second).flatMap((c) => c.ids), ['h1', 'l1'])
+        assert.isTrue(r.opinion!.decisions.every((d) => d.carriedFrom === undefined))
+      }))
+  })
 })

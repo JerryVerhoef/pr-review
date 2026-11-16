@@ -197,7 +197,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
         const o = old && last.opinion.decisions.find((x) => x.decisionId === old.id)
         if (!o || !(yield* unchangedBetween(ref, last, { headSha, mergeBase: sort.mergeBase }, [...new Set([...paths, ...old!.files.map((f) => f.path)])]))) continue
         // Lines may have moved since the old head, and an anchor off the diff fails the whole review.
-        decisions.push({ ...o, decisionId: d.id, findings: o.findings.map((f) => ({ ...f, decisionId: d.id, anchor: null })) })
+        decisions.push({ ...o, decisionId: d.id, carriedFrom: o.carriedFrom ?? last.headSha, findings: o.findings.map((f) => ({ ...f, decisionId: d.id, anchor: null })) })
       }
       if (!decisions.length) return undefined
       // Copied once, so a finding restored on this head stays restored.

@@ -71,6 +71,8 @@ export const DecisionOpinion = Struct({
   checked: NullOr(String),
   findings: Array(Finding),
   deep: Boolean,
+  /** The head this opinion was judged on, when it comes from an earlier push where the decision's change was the same. */
+  carriedFrom: optionalKey(String),
 })
 export type DecisionOpinion = typeof DecisionOpinion.Type
 

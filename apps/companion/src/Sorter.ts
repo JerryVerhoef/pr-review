@@ -6,6 +6,7 @@ import { Agent } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
+import { sameChange } from './interdiff.ts'
 import { normalize } from './normalize.ts'
 import { guidanceSection } from './opinionContext.ts'
 import { annotate, measure } from './Perf.ts'
@@ -37,6 +38,23 @@ export const writtenDecisions = (text: string): ReadonlyArray<Decision> => {
 /** A sort ready to run: the prompt, and what makes the agent's answer a `SortResult`. */
 export type SortPrompt = { prompt: string; cwd: string; files: ReadonlyArray<FileStat>; finish(answer: AgentSort): SortResult }
 
+/** A push smaller than this, in interdiff lines, is sorted from the previous sort; a larger one from scratch. */
+export const RESORT_LINES = 400
+
+/** The sort of an earlier head of the PR, and the files whose change differs since: see `Sorter.since`. */
+export type PreviousSort = { headSha: string; sort: SortResult; changed: ReadonlyArray<string>; interdiff: string }
+
+/** A patch per file, keyed by its path at the new side (the old side for a deleted file). */
+export const patchesByPath = (patch: string) =>
+  new Map(
+    patch
+      .split(/^(?=diff --git )/m)
+      .filter((s) => s.startsWith('diff --git '))
+      .map((s) => [/^\+\+\+ b\/(.+)$/m.exec(s)?.[1] ?? /^rename to (.+)$/m.exec(s)?.[1] ?? /^--- a\/(.+)$/m.exec(s)?.[1] ?? /^diff --git a\/(.+?) b\//.exec(s)?.[1] ?? '', s] as const),
+  )
+
+const sortPaths = (s: SortResult) => [...s.decisions.flatMap((d) => d.files.map((f) => f.path)), ...s.skim.flatMap((a) => a.files), ...s.trusted.flatMap((g) => g.files)]
+
 /** See `Sorter.claim`. */
 export type SortClaim = { running: Effect.Effect<SortResult, SortError> } | { done(exit: Exit.Exit<SortResult, SortError>): Effect.Effect<void> }
 
@@ -49,7 +67,12 @@ export class Sorter extends Context.Service<
     /** What a running sort is doing: the current step, then each new one. Never ends; interrupt it when the sort is done. */
     steps(ref: PrRef, headSha: string): Stream.Stream<string>
     /** Everything a sort needs short of the agent turn, for runs that make the turn themselves. */
-    prepare(ref: PrRef, headSha: string, report?: (step: string) => Effect.Effect<void>): Effect.Effect<SortPrompt, SortError>
+    prepare(ref: PrRef, headSha: string, report?: (step: string) => Effect.Effect<void>, previous?: PreviousSort): Effect.Effect<SortPrompt, SortError>
+    /**
+     * The cached sort of `before`, an earlier head of the PR, with the files whose change differs at `headSha`; undefined
+     * when there is none, or when the interdiff reaches `RESORT_LINES`. Never fails.
+     */
+    since(ref: PrRef, headSha: string, before: { headSha: string; mergeBase?: string | undefined }): Effect.Effect<PreviousSort | undefined>
     /**
      * One sort per head at a time: either the sort already running for this head, or the caller's claim to make it.
      * While claimed, `sort` waits for the claimant; `remember` or `done` settles it.
@@ -69,7 +92,12 @@ export class Sorter extends Context.Service<
       const steps = yield* makeSteps
       const keyOf = (k: { host: string; owner: string; repo: string; number: number; headSha: string }) => `${k.host}/${k.owner}/${k.repo}#${k.number}@${k.headSha}`
 
-      const prepare = Effect.fn('Sorter.prepare')(function* ({ host, owner, repo, number }: PrRef, headSha: string, report: (step: string) => Effect.Effect<void> = () => Effect.void) {
+      const prepare = Effect.fn('Sorter.prepare')(function* (
+        { host, owner, repo, number }: PrRef,
+        headSha: string,
+        report: (step: string) => Effect.Effect<void> = () => Effect.void,
+        previous?: PreviousSort,
+      ) {
         const repoKey = `${host}/${owner}/${repo}`
         yield* report('Fetching the PR')
         const { review } = yield* config.settings
@@ -83,7 +111,7 @@ export class Sorter extends Context.Service<
         const paths = rest.flatMap((f) => (f.previous ? [f.previous, f.path] : [f.path]))
         const master = `origin/${yield* git.defaultBranch(repoKey)}`
         const [diff, guidance] = yield* Effect.all(
-          [paths.length ? git.diff(repoKey, mergeBase, head, paths) : Effect.succeed(''), review.guidance.length ? git.lsTree(repoKey, master, review.guidance) : Effect.succeed([])],
+          [paths.length && !previous ? git.diff(repoKey, mergeBase, head, paths) : Effect.succeed(''), review.guidance.length ? git.lsTree(repoKey, master, review.guidance) : Effect.succeed([])],
           { concurrency: 2 },
         )
         const prompt = [
@@ -93,9 +121,21 @@ export class Sorter extends Context.Service<
           `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
           `# Changed files\n${rest.map((f) => `${f.path}\t+${f.additions}\t-${f.deletions}`).join('\n')}`,
           `# Likely trusted (not in the diff below; read with git diff if unsure)\n${groups.map((g) => `## ${g.group}: ${g.why}\n${g.files.join('\n')}`).join('\n\n') || '(none)'}`,
-          diff.length > review.maxDiffKb * 1000
-            ? `# Diff\nDiff too large; read files with git show ${head}:<path> and compare with git diff ${mergeBase} ${head} -- <path>`
-            : `# Diff\n${diff}`,
+          ...(previous
+            ? [
+                `# Previous sort (head ${previous.headSha})\n${JSON.stringify({ summary: previous.sort.summary ?? '', decisions: previous.sort.decisions, skim: previous.sort.skim, trusted: previous.sort.trusted, claims: previous.sort.claims })}`,
+                `# Changed since then\nOnly these files change differently than at ${previous.headSha}; every other file's change is as it was:\n${previous.changed.join('\n')}\n\n${
+                  previous.interdiff.length > review.maxDiffKb * 1000
+                    ? `Interdiff too large; read it with git diff ${previous.headSha} ${head} -- <path>`
+                    : `Interdiff (git diff ${previous.headSha} ${head}):\n${previous.interdiff}`
+                }`,
+                `# This sort\nThe PR was sorted at ${previous.headSha} (above) and pushed to since. Return the whole sort for ${head}. Keep each decision whose files are not under "Changed since then" exactly as it was: same id, title, lens, reason, theme, note, existing and files. Revise, split, merge or add decisions for the changed code, place new files, and leave out files no longer in the PR. The full diff is git diff ${mergeBase} ${head}; read from it where the interdiff is not enough.`,
+              ]
+            : [
+                diff.length > review.maxDiffKb * 1000
+                  ? `# Diff\nDiff too large; read files with git show ${head}:<path> and compare with git diff ${mergeBase} ${head} -- <path>`
+                  : `# Diff\n${diff}`,
+              ]),
         ].join('\n\n')
         yield* annotate({
           files: files.length,
@@ -106,6 +146,7 @@ export class Sorter extends Context.Service<
           diffInlined: diff.length <= review.maxDiffKb * 1000,
           guidanceFiles: guidance.length,
           promptBytes: Buffer.byteLength(prompt),
+          ...(previous ? { since: true, changedFiles: previous.changed.length } : {}),
         })
         return { prompt, cwd: git.dir(repoKey), files, finish: (answer) => normalize(answer, files, groups, head, review.neverTrust, mergeBase) } satisfies SortPrompt
       }, measure('context.prepare'))
@@ -123,6 +164,30 @@ export class Sorter extends Context.Service<
       const read = yield* peek('sort')
       const write = yield* poke('sort')
       const scope = yield* Effect.scope
+
+      const since = (ref: PrRef, headSha: string, before: { headSha: string; mergeBase?: string | undefined }) =>
+        Effect.gen(function* () {
+          if (before.headSha === headSha || !before.mergeBase) return undefined
+          const sort = yield* read(new SortKey({ ...ref, headSha: before.headSha }))
+          if (!sort || sort.quick) return undefined
+          const repoKey = `${ref.host}/${ref.owner}/${ref.repo}`
+          const pr = yield* (yield* github.forHost(ref.host)).getPr(ref.owner, ref.repo, ref.number)
+          const { headSha: head, mergeBase } = yield* git.fetchPr(repoKey, ref.number, pr.baseRef, headSha)
+          const files = yield* git.numstat(repoKey, mergeBase, head)
+          const paths = [...new Set([...files.flatMap((f) => (f.previous ? [f.previous, f.path] : [f.path])), ...sortPaths(sort)])]
+          const [was, now] = yield* Effect.all([git.diff(repoKey, before.mergeBase, before.headSha, paths), git.diff(repoKey, mergeBase, head, paths)], { concurrency: 2 })
+          const [a, b] = [patchesByPath(was), patchesByPath(now)]
+          const changed = [...new Set([...a.keys(), ...b.keys()])].filter((p) => !a.has(p) || !b.has(p) || !sameChange(a.get(p)!, b.get(p)!))
+          const interdiff = changed.length ? yield* git.diff(repoKey, before.headSha, head, changed) : ''
+          const lines = interdiff.split('\n').filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l)).length
+          yield* annotate({ interdiffLines: lines, changedFiles: changed.length })
+          return lines >= RESORT_LINES ? undefined : ({ headSha: before.headSha, sort, changed, interdiff } satisfies PreviousSort)
+        }).pipe(
+          // The old head may be gone from the clone; then the sort starts over.
+          Effect.orElseSucceed(() => undefined),
+          measure('sort.since'),
+        )
+
       const inflight = new Map<string, Deferred.Deferred<SortResult, SortError>>()
       const settle = (key: string, exit: Exit.Exit<SortResult, SortError>) =>
         Effect.suspend(() => {
@@ -141,6 +206,7 @@ export class Sorter extends Context.Service<
         })
       return Sorter.of({
         prepare,
+        since,
         claim,
         remember: (ref, headSha, result) => {
           const key = new SortKey({ ...ref, headSha })
