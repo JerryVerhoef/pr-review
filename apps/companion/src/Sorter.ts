@@ -7,6 +7,7 @@ import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { normalize } from './normalize.ts'
+import { guidanceSection } from './opinionContext.ts'
 import { annotate, measure } from './Perf.ts'
 import { makeSteps } from './steps.ts'
 import { cacheOptions, measuredCache, peek, poke, SortKey, storeFailuresDie } from './Store.ts'
@@ -88,7 +89,7 @@ export class Sorter extends Context.Service<
         const prompt = [
           instructions,
           `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`,
-          `# Review guidance (the repo's own rules; read the ones that apply with git show ${master}:<path>)\n${guidance.join('\n') || '(none)'}`,
+          guidanceSection(master, guidance),
           `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
           `# Changed files\n${rest.map((f) => `${f.path}\t+${f.additions}\t-${f.deletions}`).join('\n')}`,
           `# Likely trusted (not in the diff below; read with git diff if unsure)\n${groups.map((g) => `## ${g.group}: ${g.why}\n${g.files.join('\n')}`).join('\n\n') || '(none)'}`,

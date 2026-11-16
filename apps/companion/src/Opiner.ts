@@ -234,12 +234,12 @@ export class Opiner extends Context.Service<
                   ? ['Now these decisions, the same way.']
                   : [
                       skill,
-                      `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`,
-                      guidanceSection(master, guidance),
+                      // A continued turn has the refs, guidance and PR from the sort prompt above it.
+                      ...(o.continued ? [] : [`# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`, guidanceSection(master, guidance)]),
                       relatedSection(related),
                       ticketText,
                       `# Stack (bottom first; compare a PR with the one below it using git diff <head below> <its head>)\n${stackText.join('\n\n') || '(not stacked)'}`,
-                      `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
+                      ...(o.continued ? [] : [`# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`]),
                     ]),
                 `# Decisions\n${JSON.stringify(decisions)}`,
                 // Here, not in the skill: a repo's own skill must still show which decision is being judged.

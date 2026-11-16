@@ -5,7 +5,7 @@ import { KeyValueStore } from 'effect/persistence'
 import { Config } from '../src/Config.ts'
 import type { GitHubClient } from '../src/GitHub.ts'
 import { Opiner } from '../src/Opiner.ts'
-import { contentIds } from '../src/opinionContext.ts'
+import { contentIds, guidanceFiles } from '../src/opinionContext.ts'
 import { Sorter } from '../src/Sorter.ts'
 import { Store } from '../src/Store.ts'
 import { type TicketSummary, Tickets } from '../src/Tickets.ts'
@@ -99,6 +99,27 @@ describe('Opiner', () => {
       assert.strictEqual(agent.calls[0]!.log.kind, 'opinion')
       assert.isBelow(p.indexOf('# Ticket'), p.indexOf('# Stack'))
     }))
+
+  it.effect('a turn continuing the sort leaves out what the sort prompt already gave', () =>
+    Effect.gen(function* () {
+      const { layer } = setup()
+      const p = yield* Effect.gen(function* () {
+        const c = yield* (yield* Opiner).context(ref, 'HEAD1')
+        return yield* c.prompt([decision('d1', 'src/a.ts')], { continued: true })
+      }).pipe(Effect.provide(layer))
+      assert.match(p, /name: pr-opinion/)
+      assert.match(p, /# Stack/)
+      assert.match(p, /# Decisions/)
+      for (const gone of ['# Refs', '# Review guidance', '# PR #7']) assert.notInclude(p, gone)
+    }))
+
+  it('lists a skill by its SKILL.md alone', () => {
+    assert.deepStrictEqual(guidanceFiles(['AGENTS.md', '.agents/skills/a/SKILL.md', '.agents/skills/a/EXECUTION.md', '.agents/skills/a/ref/x.md', '.agents/agents/b.md']), [
+      'AGENTS.md',
+      '.agents/skills/a/SKILL.md',
+      '.agents/agents/b.md',
+    ])
+  })
 
   it.effect('the ticket goes in as untrusted input, and its note comes back with the opinion', () =>
     Effect.gen(function* () {

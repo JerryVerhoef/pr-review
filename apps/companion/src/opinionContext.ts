@@ -5,8 +5,14 @@ import type { Git } from './Git.ts'
 import type { GitHub } from './GitHub.ts'
 import type { TicketSummary } from './Tickets.ts'
 
+/** A skill's own files are named in its SKILL.md, so a skill is listed by that file alone. */
+export const guidanceFiles = (guidance: ReadonlyArray<string>) => {
+  const skills = guidance.filter((p) => p.endsWith('/SKILL.md')).map((p) => p.slice(0, -'SKILL.md'.length))
+  return guidance.filter((p) => p.endsWith('/SKILL.md') || !skills.some((dir) => p.startsWith(dir)))
+}
+
 export const guidanceSection = (master: string, guidance: ReadonlyArray<string>) =>
-  `# Review guidance (the repo's own rules; read the ones that apply with git show ${master}:<path>)\n${guidance.join('\n') || '(none)'}`
+  `# Review guidance (the repo's own rules; read the ones that apply with git show ${master}:<path>)\n${guidanceFiles(guidance).join('\n') || '(none)'}`
 
 export const relatedSection = (related: ReadonlyArray<RelatedRepo>) =>
   related.length
