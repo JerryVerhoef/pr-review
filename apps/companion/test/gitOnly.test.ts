@@ -24,6 +24,42 @@ describe('gitOnly', () => {
     assert.isTrue(await allowed('Bash', { command: 'git log -p -1 --output-indicator-new=+ x' }))
   })
 
+  it('allows shell characters inside quotes, where bash keeps them literal', async () => {
+    for (const command of [
+      'git grep -n "EnabledRolloutsInterface\\|UserRollouts" abc -- apps/core',
+      'git grep -n "Repository->search(" abc -- apps/core',
+      'git grep -n -e "calculateOrderInQuoteField(\\$row)" abc -- apps',
+      "git grep -n 'UserRollouts $' abc -- apps",
+      "git show 'b351:apps/web/src/routes/$clientId/x.tsx'",
+      'git grep -n "a;b && c > d" abc',
+    ]) {
+      assert.isTrue(await allowed('Bash', { command }), command)
+    }
+  })
+
+  it('allows one trailing head or tail', async () => {
+    for (const command of ['git grep -n foo abc | head', 'git log --oneline x | head -n 20', 'git grep -n "a|b" x | tail -5']) {
+      assert.isTrue(await allowed('Bash', { command }), command)
+    }
+    for (const command of ['git log | head | sh', 'git log | head; rm x', 'git log | head -c 1 > x', 'git log | sed -n 1p', 'git log || head', 'git log |& head']) {
+      assert.isFalse(await allowed('Bash', { command }), command)
+    }
+  })
+
+  it('denies expansion in double quotes and options smuggled past quotes', async () => {
+    for (const command of [
+      'git show "$(id)"',
+      'git show "\\\\$(id)"',
+      'git show "`id`"',
+      'git log "\\"" --output=x "y"',
+      'git log \'unclosed',
+      'git -c core.pager=sh log',
+      '"git" push',
+    ]) {
+      assert.isFalse(await allowed('Bash', { command }), command)
+    }
+  })
+
   it('denies options that run commands or write files, however spelled', async () => {
     for (const command of [
       "git grep --no-index -O'touch PWNED' bare",
