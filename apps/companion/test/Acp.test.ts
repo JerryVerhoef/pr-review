@@ -2,6 +2,7 @@ import * as acp from '@agentclientprotocol/sdk'
 import { assert, describe, it } from '@effect/vitest'
 import { type AgentAccount, AgentError } from '@pr-review/domain'
 import { Effect, Stream } from 'effect'
+import { makeTracer, type PerformanceEvent } from '../src/Perf.ts'
 import { Acp, type AcpSession, type AcpUpdate } from '../src/Acp.ts'
 
 const account: AgentAccount = { id: 'a', name: 'Fake', agent: 'custom', command: 'unused', env: {}, concurrency: 2, enabled: true }
@@ -10,7 +11,7 @@ type Say = (update: acp.SessionUpdate) => Promise<void>
 type Ask = (command: string, kind?: acp.ToolKind) => Promise<boolean>
 
 /** An ACP agent in-process: answers each prompt with `turn`, and records what the client asked of it. */
-const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp.StopReason>; needsLogin?: boolean } = {}) => {
+const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp.StopReason | { stopReason: acp.StopReason; usage?: unknown }>; needsLogin?: boolean } = {}) => {
   const seen = { modes: [] as string[], models: [] as string[], auth: [] as string[], resumed: [] as string[], prompts: [] as string[], meta: [] as unknown[] }
   let loggedIn = false
   const app = acp
@@ -64,7 +65,8 @@ const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp
         })
         return r.outcome.outcome === 'selected' && r.outcome.optionId === 'yes'
       }
-      return { stopReason: o.turn ? await o.turn(say, ask, text) : 'end_turn' }
+      const out = o.turn ? await o.turn(say, ask, text) : 'end_turn'
+      return typeof out === 'string' ? { stopReason: out } : (out as acp.PromptResponse)
     })
   return { app, seen }
 }
@@ -196,5 +198,48 @@ describe('Acp', () => {
       })
       const e = yield* Effect.flip(run(agent, (s) => collect(s.prompt('x'))))
       assert.match(e.message, /usage limit/)
+    }))
+
+  it.live('times each tool call and the prompt around them, and logs no prompt or tool arguments', () =>
+    Effect.gen(function* () {
+      const events: PerformanceEvent[] = []
+      const agent = fakeAgent({
+        turn: async (say, ask) => {
+          await ask('git show HEAD:secret/plan.md')
+          await new Promise((r) => setTimeout(r, 40))
+          await say({ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', _meta: { claudeCode: { toolName: 'Bash' } } })
+          await say({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'the private answer' } })
+          await say({ sessionUpdate: 'usage_update', used: 1200, size: 200000 })
+          // Never finished: the turn ends with it open.
+          await say({ sessionUpdate: 'tool_call', toolCallId: 'open', title: 'Read', kind: 'read', status: 'pending' })
+          return { stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20, cachedReadTokens: 80, totalTokens: 120 } }
+        },
+      })
+      yield* run(agent, (s) => collect(s.prompt('a secret prompt'))).pipe(Effect.withTracer(makeTracer((e) => void events.push(e))))
+
+      assert.includeMembers(events.map((e) => e.phase), ['agent.spawn', 'acp.initialize', 'acp.session', 'acp.setMode', 'agent.prompt', 'agent.tool'])
+      const prompt = events.find((e) => e.phase === 'agent.prompt')!
+      const [done, open] = events.filter((e) => e.phase === 'agent.tool')
+      assert.strictEqual(done!.parentId, prompt.spanId)
+      assert.strictEqual(done!.status, 'success')
+      assert.isAtLeast(done!.durationMs, 35)
+      assert.deepInclude(done!.metadata!, { tool: 'Bash', toolKind: 'execute', command: 'git', subcommand: 'show', permission: 'allowed' })
+      assert.strictEqual(open!.status, 'cancelled')
+      assert.deepInclude(prompt.metadata!, {
+        promptBytes: Buffer.byteLength('a secret prompt'),
+        toolCalls: 2,
+        textChunks: 1,
+        stopReason: 'end_turn',
+        inputTokens: 100,
+        outputTokens: 20,
+        cachedReadTokens: 80,
+        contextTokens: 1200,
+      })
+      const m = prompt.metadata as Record<string, number>
+      assert.isAtLeast(m.toolMs!, 35)
+      assert.isAtMost(m.toolMs! + m.unclassifiedMs!, prompt.durationMs + 1)
+      assert.isAtLeast(m.firstTextMs!, m.firstToolMs!)
+      const log = JSON.stringify(events)
+      for (const leak of ['secret', 'plan.md', 'private answer', '/repo']) assert.notInclude(log, leak)
     }))
 })

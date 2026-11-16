@@ -3,6 +3,7 @@ import { Cache, Context, Duration, Effect, Exit, Layer, Stream } from 'effect'
 import { ChildProcess, ChildProcessSpawner } from 'effect/process'
 import { Octokit, RequestError } from 'octokit'
 import { description } from './description.ts'
+import { measure } from './Perf.ts'
 
 export const apiUrlFor = (host: string) => (host === 'github.com' ? 'https://api.github.com' : `https://${host}/api/v3`)
 
@@ -53,11 +54,12 @@ const toThread = (c: RawComment): Thread => ({
   createdAt: c.created_at,
 })
 
-const call = <A>(f: () => Promise<A>) =>
+/** One API request, measured as `github.request` under `op`. */
+const call = <A>(op: string, f: () => Promise<A>) =>
   Effect.tryPromise({
     try: f,
     catch: (e) => (e instanceof RequestError ? new GitHubError({ status: e.status, message: e.message }) : new GitHubError({ status: 0, message: String(e) })),
-  })
+  }).pipe(measure('github.request', { op }))
 
 const successFor = (ttl: Duration.Input) => (exit: Exit.Exit<unknown, unknown>) => (Exit.isSuccess(exit) ? ttl : 0)
 
@@ -73,7 +75,7 @@ const cachedRead = <A>(lookup: (args: ReadonlyArray<string | number>) => Effect.
 
 export const makeClient = Effect.fnUntraced(function* (octokit: Octokit) {
   const getPr = yield* cachedRead(([owner, repo, n]) =>
-    call(() => octokit.rest.pulls.get({ owner: String(owner), repo: String(repo), pull_number: Number(n) })).pipe(
+    call('getPr', () => octokit.rest.pulls.get({ owner: String(owner), repo: String(repo), pull_number: Number(n) })).pipe(
       Effect.map(({ data: p }): PrMeta => ({
         number: p.number,
         title: p.title,
@@ -108,7 +110,7 @@ export const makeClient = Effect.fnUntraced(function* (octokit: Octokit) {
       const prs: StackEntry[] = []
       let after: string | null = null
       do {
-        const page: OpenPrs['repository']['pullRequests'] = (yield* call(() => octokit.graphql<OpenPrs>(openPrsQuery, { owner, repo, after }))).repository.pullRequests
+        const page: OpenPrs['repository']['pullRequests'] = (yield* call('listOpenPrs', () => octokit.graphql<OpenPrs>(openPrsQuery, { owner, repo, after }))).repository.pullRequests
         for (const p of page.nodes) {
           const text = p.body ? description(p.body) : undefined
           prs.push({
@@ -127,12 +129,12 @@ export const makeClient = Effect.fnUntraced(function* (octokit: Octokit) {
     }),
   )
   const listThreads = yield* cachedRead(([owner, repo, n]) =>
-    call(() => octokit.paginate(octokit.rest.pulls.listReviewComments, { owner: String(owner), repo: String(repo), pull_number: Number(n), per_page: 100 })).pipe(
+    call('listThreads', () => octokit.paginate(octokit.rest.pulls.listReviewComments, { owner: String(owner), repo: String(repo), pull_number: Number(n), per_page: 100 })).pipe(
       Effect.map((cs) => cs.map(toThread)),
     ),
   )
   const getChecks = yield* cachedRead(([owner, repo, sha]) =>
-    call(() => octokit.rest.checks.listForRef({ owner: String(owner), repo: String(repo), ref: String(sha), per_page: 100 })).pipe(
+    call('getChecks', () => octokit.rest.checks.listForRef({ owner: String(owner), repo: String(repo), ref: String(sha), per_page: 100 })).pipe(
       Effect.map(({ data }): Checks => {
         const runs = data.check_runs
         if (runs.length === 0) return 'none'
@@ -143,12 +145,12 @@ export const makeClient = Effect.fnUntraced(function* (octokit: Octokit) {
     ),
   )
   const requestedReviewers = yield* cachedRead(([owner, repo, n]) =>
-    call(() => octokit.rest.pulls.listRequestedReviewers({ owner: String(owner), repo: String(repo), pull_number: Number(n) })).pipe(
+    call('requestedReviewers', () => octokit.rest.pulls.listRequestedReviewers({ owner: String(owner), repo: String(repo), pull_number: Number(n) })).pipe(
       Effect.map(({ data }) => data.users.map((u) => u.login)),
     ),
   )
 
-  const viewer = yield* Cache.makeWith(() => call(() => octokit.rest.users.getAuthenticated()).pipe(Effect.map(({ data }) => data.login)), {
+  const viewer = yield* Cache.makeWith(() => call('viewer', () => octokit.rest.users.getAuthenticated()).pipe(Effect.map(({ data }) => data.login)), {
     capacity: 1,
     timeToLive: successFor(Infinity),
   })
@@ -161,19 +163,19 @@ export const makeClient = Effect.fnUntraced(function* (octokit: Octokit) {
     requestedReviewers: (owner, repo, n) => requestedReviewers(owner, repo, n),
     viewer: () => Cache.get(viewer, 'me'),
     fileAt: (owner, repo, path, ref) =>
-      call(() => octokit.request('GET /repos/{owner}/{repo}/contents/{path}', { owner, repo, path, ...(ref ? { ref } : {}), mediaType: { format: 'raw' } })).pipe(
+      call('fileAt', () => octokit.request('GET /repos/{owner}/{repo}/contents/{path}', { owner, repo, path, ...(ref ? { ref } : {}), mediaType: { format: 'raw' } })).pipe(
         Effect.map(({ data }) => (typeof data === 'string' ? data : undefined)),
         Effect.catchIf((e) => e.status === 404, () => Effect.undefined),
       ),
     getIssue: (owner, repo, n) =>
-      call(() => octokit.rest.issues.get({ owner, repo, issue_number: n })).pipe(
+      call('getIssue', () => octokit.rest.issues.get({ owner, repo, issue_number: n })).pipe(
         Effect.map(({ data }) => (data.pull_request ? null : { title: data.title, body: data.body ?? '' })),
         Effect.catchIf((e) => e.status === 404, () => Effect.succeed(null)),
       ),
     description: (owner, repo, n) =>
-      call(() => octokit.rest.pulls.get({ owner, repo, pull_number: n, mediaType: { format: 'html' } })).pipe(Effect.map(({ data }) => (data as { body_html?: string | null }).body_html ?? '')),
+      call('description', () => octokit.rest.pulls.get({ owner, repo, pull_number: n, mediaType: { format: 'html' } })).pipe(Effect.map(({ data }) => (data as { body_html?: string | null }).body_html ?? '')),
     submitReview: (owner, repo, n, r) =>
-      call(() =>
+      call('submitReview', () =>
         octokit.rest.pulls.createReview({
           owner,
           repo,

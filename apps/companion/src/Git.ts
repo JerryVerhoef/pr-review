@@ -3,6 +3,7 @@ import { Cache, Context, Effect, Exit, FileSystem, Layer, Stream } from 'effect'
 import { ChildProcess, ChildProcessSpawner } from 'effect/process'
 import { dirname, join } from 'node:path'
 import { Config } from './Config.ts'
+import { annotate, measure } from './Perf.ts'
 
 export interface PrShas {
   readonly headSha: string
@@ -71,14 +72,16 @@ export class Git extends Context.Service<
           Effect.gen(function* () {
             const target = dir(key)
             if (yield* fs.exists(join(target, 'HEAD')).pipe(Effect.orElseSucceed(() => false))) return
-            const url = yield* remoteUrl(key)
-            const partial = `${target}.partial`
-            yield* Effect.orDie(fs.makeDirectory(dirname(target), { recursive: true }))
-            yield* Effect.orDie(fs.remove(partial, { recursive: true, force: true }))
-            yield* exec(['clone', '--bare', '--quiet', url, partial])
-            yield* exec(['config', 'gc.auto', '0'], partial)
-            yield* exec(['config', 'maintenance.auto', 'false'], partial)
-            yield* Effect.orDie(fs.rename(partial, target))
+            yield* Effect.gen(function* () {
+              const url = yield* remoteUrl(key)
+              const partial = `${target}.partial`
+              yield* Effect.orDie(fs.makeDirectory(dirname(target), { recursive: true }))
+              yield* Effect.orDie(fs.remove(partial, { recursive: true, force: true }))
+              yield* exec(['clone', '--bare', '--quiet', url, partial])
+              yield* exec(['config', 'gc.auto', '0'], partial)
+              yield* exec(['config', 'maintenance.auto', 'false'], partial)
+              yield* Effect.orDie(fs.rename(partial, target))
+            }).pipe(measure('git.clone'))
           }),
         { capacity: 64, timeToLive: failuresExpire },
       )
@@ -96,12 +99,14 @@ export class Git extends Context.Service<
             if (baseRef !== defaultBranch) refspecs.push(`+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}`)
             // A head already fetched (before a restart) needs no network: a base that moved on since leaves the merge-base where it was.
             const local = yield* inRepo(key, 'rev-parse', ...refspecs.map((r) => r.split(':')[1]!)).pipe(Effect.orElseSucceed(() => ''))
-            if (local.split('\n')[0] !== wanted) yield* inRepo(key, 'fetch', '--quiet', yield* remoteUrl(key), ...refspecs)
+            const network = local.split('\n')[0] !== wanted
+            yield* annotate({ network, refspecs: refspecs.length })
+            if (network) yield* inRepo(key, 'fetch', '--quiet', yield* remoteUrl(key), ...refspecs)
             const headSha = (yield* inRepo(key, 'rev-parse', `refs/pr/${n}`)).trim()
             const baseSha = (yield* inRepo(key, 'rev-parse', `refs/remotes/origin/${baseRef}`)).trim()
             const mergeBase = (yield* inRepo(key, 'merge-base', baseSha, headSha)).trim()
             return { headSha, baseSha, mergeBase }
-          }),
+          }).pipe(measure('git.fetch')),
         { capacity: 256, timeToLive: failuresExpire },
       )
 
@@ -110,11 +115,24 @@ export class Git extends Context.Service<
         ensureClone,
         fetchPr: (key, n, baseRef, headSha) => Cache.get(fetches, JSON.stringify([key, n, baseRef, headSha])),
         defaultBranch: branchOf,
-        numstat: (key, from, to) => inRepo(key, 'diff', '--numstat', '-z', '-M', from, to).pipe(Effect.map(parseNumstat)),
+        numstat: (key, from, to) =>
+          inRepo(key, 'diff', '--numstat', '-z', '-M', from, to).pipe(
+            Effect.map(parseNumstat),
+            measure('git.numstat', {}, (files: ReadonlyArray<FileStat>) => ({
+              files: files.length,
+              additions: files.reduce((n, f) => n + f.additions, 0),
+              deletions: files.reduce((n, f) => n + f.deletions, 0),
+            })),
+          ),
         // -M: a moved file diffs as a rename when both its paths are asked for.
-        diff: (key, from, to, paths = []) => inRepo(key, 'diff', '--no-color', '--no-ext-diff', '-M', from, to, '--', ...paths),
-        show: (key, sha, path) => inRepo(key, 'show', `${sha}:${path}`),
-        lsTree: (key, ref, paths) => inRepo(key, 'ls-tree', '-r', '--name-only', ref, '--', ...paths).pipe(Effect.map((out) => out.split('\n').filter(Boolean))),
+        diff: (key, from, to, paths = []) =>
+          inRepo(key, 'diff', '--no-color', '--no-ext-diff', '-M', from, to, '--', ...paths).pipe(measure('git.diff', { paths: paths.length }, (d: string) => ({ bytes: Buffer.byteLength(d) }))),
+        show: (key, sha, path) => inRepo(key, 'show', `${sha}:${path}`).pipe(measure('git.show', {}, (t: string) => ({ bytes: Buffer.byteLength(t) }))),
+        lsTree: (key, ref, paths) =>
+          inRepo(key, 'ls-tree', '-r', '--name-only', ref, '--', ...paths).pipe(
+            Effect.map((out) => out.split('\n').filter(Boolean)),
+            measure('git.lsTree', {}, (entries: ReadonlyArray<string>) => ({ entries: entries.length })),
+          ),
       })
     }),
   )

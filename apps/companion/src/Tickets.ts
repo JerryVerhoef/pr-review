@@ -3,6 +3,7 @@ import { Cache, Context, Effect, Exit, Layer } from 'effect'
 import { readFileSync } from 'node:fs'
 import { Agent } from './Agent.ts'
 import { GitHub } from './GitHub.ts'
+import { annotate, measure } from './Perf.ts'
 import { MAX, ticketRefs } from './ticketRefs.ts'
 
 const ticketPrompt = readFileSync(new URL('../prompts/ticket.md', import.meta.url), 'utf8')
@@ -53,8 +54,9 @@ export class Tickets extends Context.Service<
               notes.push(`Fetched ${others.join(', ')} through the ticket session`)
             } else notes.push(`Could not fetch ${others.join(', ')}${answer._tag === 'Failure' ? `: ${answer.failure.message}` : ''}`)
           }
+          yield* annotate({ refs: refs.length, githubIssues: issues, otherRefs: others.length, found: texts.length > 0 })
           return { text: texts.length ? texts.join('\n\n') : null, note: notes.join('; ') || 'No ticket reference found' } satisfies TicketSummary
-        })
+        }).pipe(measure('ticket.lookup'))
 
       // Keyed per PR, so a new head reuses the summary. The lookup reads the PR as last passed in.
       const latest = new Map<string, { ref: PrRef; pr: PrMeta }>()

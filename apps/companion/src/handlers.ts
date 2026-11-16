@@ -12,6 +12,7 @@ import { moveLine, sameChange } from './interdiff.ts'
 import { Opiner } from './Opiner.ts'
 import { guidanceSection } from './opinionContext.ts'
 import { Overview } from './Overview.ts'
+import { annotate, measure } from './Perf.ts'
 import { Reviewer } from './Reviewer.ts'
 import { Sorter } from './Sorter.ts'
 import { buildStack } from './stack.ts'
@@ -415,6 +416,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
         Stream.callback<StackEvent, Effect.Error<ReturnType<typeof openStack>>>((queue) =>
           Effect.gen(function* () {
             const { stack } = yield* openStack(ref)
+            yield* annotate({ prs: stack.length })
             // The bottom PR is where the reviewer starts; opening each PR then prepares the one above it.
             const bottom = stack[0]
             if (bottom) yield* reviewer.prepare({ ...ref, number: bottom.number }, bottom.headSha)
@@ -485,7 +487,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
               yield* emit()
             }
             yield* Queue.end(queue)
-          }),
+          }).pipe(measure('operation', { kind: 'stack', owner: ref.owner, repo: ref.repo, prNumber: ref.number })),
         ),
 
       StackOpinion: ({ ref, run }) => {

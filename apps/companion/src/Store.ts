@@ -1,10 +1,11 @@
 import { AgentError, AskTarget, ChatTurn, DecisionOpinion, DecisionState, DecisionStates, Draft, FileStat, FindingStates, GitError, GitHubError, PrOpinion, RepoNotConfigured, Rereview, SortResult, StackOpinion, StackOverview } from '@pr-review/domain'
 import { Context, Effect, Exit, Layer, Schema } from 'effect'
-import { KeyValueStore, Persistable, Persistence } from 'effect/persistence'
+import { KeyValueStore, Persistable, PersistedCache, Persistence } from 'effect/persistence'
 import { NodeServices } from '@effect/platform-node'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { Config } from './Config.ts'
+import { annotate, measure } from './Perf.ts'
 
 /** Conversations per target key, with the Claude session a follow-up resumes. */
 export const Chats = Schema.Record(Schema.String, Schema.Struct({ target: AskTarget, sessionId: Schema.String, turns: Schema.Array(ChatTurn) }))
@@ -83,13 +84,31 @@ export const peek = Effect.fnUntraced(function* (storeId: string) {
       Effect.catchTag('SchemaError', () => Effect.undefined),
       Effect.orDie,
       Effect.map((exit): A['Type'] | undefined => (exit && Exit.isSuccess(exit) ? exit.value : undefined)),
+      measure('cache.read', { store: storeId }, (hit: unknown) => ({ hit: hit !== undefined })),
     )
 })
 
 /** Writes a success where a `PersistedCache` with this store id reads it. Invalidate the cache's key first: it keeps hits in memory too. */
 export const poke = Effect.fnUntraced(function* (storeId: string) {
   const store = yield* (yield* Persistence.Persistence).make({ storeId, timeToLive: cacheOptions.timeToLive })
-  return <A extends Schema.Constraint, E extends Schema.Constraint>(key: Persistable.Persistable<A, E>, value: A['Type']) => Effect.orDie(store.set(key, Exit.succeed(value)))
+  return <A extends Schema.Constraint, E extends Schema.Constraint>(key: Persistable.Persistable<A, E>, value: A['Type']) =>
+    Effect.orDie(store.set(key, Exit.succeed(value))).pipe(measure('cache.write', { store: storeId }))
+})
+
+/**
+ * `PersistedCache.make`, with each `get` measured as `cache.read`. `hit` is false when that get ran the lookup, and
+ * true when the result was stored, in memory, or came from the same key's run already in flight.
+ */
+export const measuredCache = Effect.fnUntraced(function* <K extends Persistable.Any>(
+  lookup: (key: K) => Effect.Effect<Persistable.Success<K>, Persistable.Error<K>>,
+  options: { readonly storeId: string } & typeof cacheOptions,
+) {
+  const ran = new WeakSet<K>()
+  const cache = yield* PersistedCache.make((key: K) => Effect.suspend(() => (ran.add(key), lookup(key))), options)
+  return {
+    get: (key: K) => cache.get(key).pipe(Effect.ensuring(Effect.suspend(() => annotate({ hit: !ran.has(key) }))), measure('cache.read', { store: options.storeId })),
+    invalidate: cache.invalidate,
+  }
 })
 
 /** A broken store must not hide the result: storage failures become defects. */
