@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { Acp, type AcpSession } from './Acp.ts'
 import { Config } from './Config.ts'
 import { annotate, measure, measureStream } from './Perf.ts'
+import { Skills } from './Skills.ts'
 
 export type RunLog = { kind: 'sort' | 'ask' | 'chat' | 'overview' | 'opinion' | 'deeper' | 'stack-opinion' | 'ticket' | 'rule'; owner: string; repo: string; number: number; headSha: string }
 type Opts = { cwd: string; related?: ReadonlyArray<string>; /** Only `deep` accounts when the pool has any, else the whole pool. */ prefer?: 'deep'; log: RunLog; onStep?: (step: string) => Effect.Effect<void> }
@@ -68,6 +69,7 @@ export class Agent extends Context.Service<
     Effect.gen(function* () {
       const acp = yield* Acp
       const config = yield* Config
+      const skills = yield* Skills
       const fs = yield* FileSystem.FileSystem
       const usagePath = join(config.cacheRoot, 'usage.jsonl')
       const states = new Map<string, { busy: number; until: number; error: string | null }>()
@@ -203,7 +205,9 @@ export class Agent extends Context.Service<
               const scope = yield* Effect.scope
               // Opened in the first turn, so a one-turn run's time limit and usage line cover the open as before.
               const open = yield* Effect.cached(
-                acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind) }).pipe(Effect.tap(() => step(o, `${a.name} is reading the PR`)), Scope.provide(scope)),
+                Effect.flatMap(skills.plugins(a, o.cwd), (plugins) =>
+                  acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind), plugins, readable: skills.root }),
+                ).pipe(Effect.tap(() => step(o, `${a.name} is reading the PR`)), Scope.provide(scope)),
               )
               let onFast = false
               const toModel = (s: AcpSession, model: 'fast' | 'main') => {
@@ -282,7 +286,7 @@ export class Agent extends Context.Service<
           return Stream.unwrap(
             Effect.gen(function* () {
               const a = yield* acquire(o, new Set(), owner)
-              const session = yield* acp.open(a, o.cwd, sessionId)
+              const session = yield* acp.open(a, o.cwd, sessionId, { plugins: yield* skills.plugins(a, o.cwd), readable: skills.root })
               yield* annotate({ agent: a.agent, account: a.id, model: a.model || session.defaultModel })
               const startedAt = yield* Clock.currentTimeMillis
               return session.prompt(o.prompt).pipe(

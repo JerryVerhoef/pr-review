@@ -113,12 +113,8 @@ describe('Opiner', () => {
       for (const gone of ['# Refs', '# Review guidance', '# PR #7']) assert.notInclude(p, gone)
     }))
 
-  it('lists a skill by its SKILL.md alone', () => {
-    assert.deepStrictEqual(guidanceFiles(['AGENTS.md', '.agents/skills/a/SKILL.md', '.agents/skills/a/EXECUTION.md', '.agents/skills/a/ref/x.md', '.agents/agents/b.md']), [
-      'AGENTS.md',
-      '.agents/skills/a/SKILL.md',
-      '.agents/agents/b.md',
-    ])
+  it("leaves the repo's skills out of the guidance list; the Skill tool has them", () => {
+    assert.deepStrictEqual(guidanceFiles(['AGENTS.md', '.agents/skills/a/SKILL.md', '.agents/skills/a/ref/x.md', '.agents/agents/b.md', 'apps/web/.claude/skills/c/SKILL.md']), ['AGENTS.md', '.agents/agents/b.md'])
   })
 
   it.effect('the ticket goes in as untrusted input, and its note comes back with the opinion', () =>

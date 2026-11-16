@@ -115,6 +115,7 @@ export const fakeGit = (o: { files?: FileStat[]; diff?: string | ((from: string,
         }),
       lsTree: (_k, _ref, paths) => Effect.sync(() => (listed.push(paths), o.rules ?? [])),
       defaultBranch: () => Effect.succeed('master'),
+      revParse: (_k, ref) => Effect.succeed(ref),
     }),
   )
   return { diffPaths, shown, listed, layer }

@@ -8,7 +8,7 @@ import { Acp, type AcpSession, type AcpUpdate } from '../src/Acp.ts'
 const account: AgentAccount = { id: 'a', name: 'Fake', agent: 'custom', command: 'unused', env: {}, concurrency: 2, enabled: true }
 
 type Say = (update: acp.SessionUpdate) => Promise<void>
-type Ask = (command: string, kind?: acp.ToolKind) => Promise<boolean>
+type Ask = (command: string, kind?: acp.ToolKind, rawInput?: Record<string, unknown>) => Promise<boolean>
 
 /** An ACP agent in-process: answers each prompt with `turn`, and records what the client asked of it. */
 const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp.StopReason | { stopReason: acp.StopReason; usage?: unknown }>; needsLogin?: boolean } = {}) => {
@@ -55,12 +55,12 @@ const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp
       seen.prompts.push(text)
       const say: Say = (update) => ctx.client.notify(acp.methods.client.session.update, { sessionId: ctx.params.sessionId, update })
       let n = 0
-      const ask: Ask = async (command, kind = 'execute') => {
+      const ask: Ask = async (command, kind = 'execute', rawInput = { command }) => {
         const id = `t${++n}`
-        await say({ sessionUpdate: 'tool_call', toolCallId: id, title: command, kind, status: 'pending', rawInput: { command } })
+        await say({ sessionUpdate: 'tool_call', toolCallId: id, title: command, kind, status: 'pending', rawInput })
         const r = await ctx.client.request(acp.methods.client.session.requestPermission, {
           sessionId: ctx.params.sessionId,
-          toolCall: { toolCallId: id, title: command, kind, rawInput: { command } },
+          toolCall: { toolCallId: id, title: command, kind, rawInput },
           options: [
             { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
             { optionId: 'no', name: 'Reject', kind: 'reject_once' },
@@ -74,7 +74,7 @@ const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp
   return { app, seen }
 }
 
-const run = <A>(agent: ReturnType<typeof fakeAgent>, f: (s: AcpSession) => Effect.Effect<A, AgentError>, a: AgentAccount = account, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; effort?: string }) =>
+const run = <A>(agent: ReturnType<typeof fakeAgent>, f: (s: AcpSession) => Effect.Effect<A, AgentError>, a: AgentAccount = account, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; effort?: string; plugins?: ReadonlyArray<string>; readable?: string }) =>
   Effect.gen(function* () {
     const session = yield* (yield* Acp).open(a, '/repo', resume, o)
     return yield* f(session)
@@ -148,6 +148,31 @@ describe('Acp', () => {
       yield* run(agent, () => Effect.void)
       assert.deepStrictEqual(options(1).settingSources, [])
       assert.notInclude(options(1).disallowedTools, 'Read')
+    }))
+
+  it.live('a review session gets skills as plugins, and may use them and read their files only', () =>
+    Effect.gen(function* () {
+      const answers: boolean[] = []
+      const agent = fakeAgent({
+        turn: async (_say, ask) => {
+          answers.push(
+            await ask('Skill', 'other', { skill: 'repo:api-design' }),
+            await ask('Read', 'read', { file_path: '/skills/repo/x/api-design/RULES.md' }),
+            await ask('Read', 'read', { file_path: '/skills/../etc/passwd' }),
+            await ask('Read', 'read', { file_path: '/repo/config' }),
+          )
+          return 'end_turn'
+        },
+      })
+      yield* run(agent, (s) => collect(s.prompt('go')), account, undefined, { plugins: ['/skills/own/1', '/skills/repo/x'], readable: '/skills' })
+      assert.deepStrictEqual(answers, [true, true, false, false])
+      const options = (agent.seen.meta[0] as { claudeCode: { options: { tools: string[]; plugins: unknown[]; env: Record<string, string> } } }).claudeCode.options
+      assert.deepStrictEqual(options.tools, ['Bash', 'Skill', 'Read'])
+      assert.deepStrictEqual(options.plugins, [
+        { type: 'local', path: '/skills/own/1', skipMcpDiscovery: true },
+        { type: 'local', path: '/skills/repo/x', skipMcpDiscovery: true },
+      ])
+      assert.strictEqual(options.env.ENABLE_CLAUDEAI_MCP_SERVERS, 'false')
     }))
 
   it.live('picks a read-only mode the agent offers, or the account mode, and the account model', () =>

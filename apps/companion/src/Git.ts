@@ -41,6 +41,7 @@ export class Git extends Context.Service<
     diff(key: string, from: string, to: string, paths?: ReadonlyArray<string>): Effect.Effect<string, GitError>
     show(key: string, sha: string, path: string): Effect.Effect<string, GitError>
     lsTree(key: string, ref: string, paths: ReadonlyArray<string>): Effect.Effect<ReadonlyArray<string>, GitError>
+    revParse(key: string, ref: string): Effect.Effect<string, GitError>
   }
 >()('pr-review/Git') {
   static readonly layer = Layer.effect(
@@ -127,6 +128,7 @@ export class Git extends Context.Service<
         // -M: a moved file diffs as a rename when both its paths are asked for.
         diff: (key, from, to, paths = []) =>
           inRepo(key, 'diff', '--no-color', '--no-ext-diff', '-M', from, to, '--', ...paths).pipe(measure('git.diff', { paths: paths.length }, (d: string) => ({ bytes: Buffer.byteLength(d) }))),
+        revParse: (key, ref) => Effect.map(inRepo(key, 'rev-parse', '--verify', `${ref}^{commit}`), (s) => s.trim()),
         show: (key, sha, path) => inRepo(key, 'show', `${sha}:${path}`).pipe(measure('git.show', {}, (t: string) => ({ bytes: Buffer.byteLength(t) }))),
         lsTree: (key, ref, paths) =>
           inRepo(key, 'ls-tree', '-r', '--name-only', ref, '--', ...paths).pipe(

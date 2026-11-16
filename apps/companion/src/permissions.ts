@@ -1,3 +1,5 @@
+import { resolve, sep } from 'node:path'
+
 const READ_VERB = /^(get|read|search|list|find|query|view|show|lookup|describe)(?=[A-Z_]|$)/
 const WRITE_OR_NETWORK =
   /merge|push|create|update|delete|remove|add|edit|transition|assign|post|send|write|comment|move|archive|save|set|close|reopen|link|upload|download|publish|invite|approve|fetch|http|url|web|browse|request|curl/i
@@ -11,3 +13,6 @@ export const ticketPermission = (toolCall: { kind?: string | null; title?: strin
   if ((toolCall.kind !== 'search' && toolCall.kind !== 'other') || !name.startsWith('mcp__') || WRITE_OR_NETWORK.test(name)) return false
   return READ_VERB.test(name.split('__').at(-1)!)
 }
+
+/** Whether a Read stays inside `root`, after `..` is resolved. */
+export const readsUnder = (root: string, path: string) => resolve(path).startsWith(resolve(root) + sep)
