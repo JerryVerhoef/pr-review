@@ -80,7 +80,7 @@ const paths = ['api.ts', 'cohesion.ts', 'page.tsx']
 const pr: PrView = {
   number: 7, title: 'Settings shell', author: 'sam', body: '', baseRef: 'master', headRef: 'h', headSha: 'HEAD1', state: 'open',
   host: 'github.com', owner: 'acme', repo: 'core', baseSha: 'B', mergeBase: 'MB', defaultBranch: 'master',
-  files: paths.map((path) => ({ path, additions: 1, deletions: 0 })), threads: [], checks: 'pass', stack: [], viewer: 'jorrin',
+  files: paths.map((path) => ({ path, additions: 1, deletions: 0 })), threads: [], checks: 'pass', stack: [], viewer: 'jorrin', stopped: false,
 }
 
 const decision = (id: string, path: string): Decision => ({

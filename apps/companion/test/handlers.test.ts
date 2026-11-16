@@ -522,6 +522,37 @@ describe('handlers', () => {
       assert.deepStrictEqual(asked.agent.calls.map((x) => x.log.kind), ['sort'])
     }).pipe(Effect.scoped))
 
+  it.effect('GetPr says whether the review was stopped', () =>
+    Effect.gen(function* () {
+      const c = yield* setup().client
+      assert.isFalse((yield* c.GetPr({ ref })).stopped)
+      yield* c.StopReview({ ref })
+      assert.isTrue((yield* c.GetPr({ ref })).stopped)
+      yield* c.ResumeReview({ ref })
+      assert.isFalse((yield* c.GetPr({ ref })).stopped)
+    }).pipe(Effect.scoped))
+
+  it.live('after StopReview, Prepare starts nothing', () =>
+    Effect.gen(function* () {
+      const { agent, client } = setup({ delay: 100, github: { requestedReviewers: () => Effect.succeed(['Me']) } })
+      const c = yield* client
+      yield* c.StopReview({ ref })
+      yield* c.Prepare({ ref })
+      yield* Effect.sleep('30 millis')
+      assert.strictEqual(agent.calls.length, 0)
+    }).pipe(Effect.scoped))
+
+  it.live('stopping a stacked PR does not prepare the one above', () =>
+    Effect.gen(function* () {
+      const { agent, client } = setup({ delay: 100, files: [{ path: 'src/a.ts', additions: 300, deletions: 0 }], github: { listOpenPrs: () => Effect.succeed([entry(7, 'master', 'feat'), entry(8, 'feat', 'feat2')]) } })
+      const c = yield* client
+      yield* Effect.forkChild(Stream.runDrain(c.Review({ ref, headSha: 'HEAD1' })))
+      yield* Effect.sleep('20 millis')
+      yield* c.StopReview({ ref })
+      yield* Effect.sleep('150 millis')
+      assert.deepStrictEqual(agent.calls.map((x) => x.log.number), [7])
+    }).pipe(Effect.scoped))
+
   it.effect('Opinion with run false and nothing cached is Idle', () =>
     Effect.gen(function* () {
       const { agent, client } = setup()

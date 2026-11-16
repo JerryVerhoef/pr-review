@@ -251,6 +251,8 @@ export const HandlersLive = ReviewRpcs.toLayer(
     /** The PR stacked right on top of this one gets its review prepared, so it's ready when the reviewer moves up. */
     const prepareAbove = (ref: PrRef) =>
       Effect.gen(function* () {
+        // A stopped run ends too; that must not start the PR above.
+        if (yield* reviewer.isStopped(ref)) return
         const { stack } = yield* openStack(ref)
         const self = stack.find((p) => p.number === ref.number)
         const above = self && stack.find((p) => p.baseRef === self.headRef)
@@ -285,7 +287,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
           ],
           { concurrency: 2 },
         )
-        return { ...rest, host: ref.host, owner: ref.owner, repo: ref.repo, defaultBranch, stack }
+        return { ...rest, host: ref.host, owner: ref.owner, repo: ref.repo, defaultBranch, stack, stopped: yield* reviewer.isStopped(ref) }
       }),
 
       GetFilePatch: ({ ref, mergeBase, headSha, path, previous }) =>
@@ -341,6 +343,10 @@ export const HandlersLive = ReviewRpcs.toLayer(
           yield* reviewer.prepare(ref, pr.headSha)
           return true
         }).pipe(Effect.catch((e) => Effect.as(Effect.logDebug(e), false))),
+
+      StopReview: ({ ref }) => reviewer.stop(ref),
+
+      ResumeReview: ({ ref }) => reviewer.resume(ref),
 
       Opinion: ({ ref, headSha, run }) => {
         const done = (opinion: PrOpinion) => Effect.map(findingStatesFor(ref, headSha), (states): OpinionEvent => ({ _tag: 'Done', opinion, states }))
