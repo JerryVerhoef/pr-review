@@ -1,6 +1,6 @@
 import { exec, execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import { userInfo } from 'node:os'
+import { homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
@@ -49,3 +49,5 @@ export async function directCommand(command: string, env: NodeJS.ProcessEnv): Pr
     return command
   }
 }
+
+export const expandHome = (v: string) => (v === '~' || v.startsWith('~/') ? homedir() + v.slice(1) : v)

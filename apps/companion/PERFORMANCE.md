@@ -42,7 +42,7 @@ Only short tokens get logged: numbers, booleans, and strings of up to 80 charact
 
 | Phase | Where | Metadata |
 | --- | --- | --- |
-| `operation` | A whole review (`Reviewer`), sort run, opinion run, overview, stack opinion, stack walk | `concurrentOperations` (operations running at its start, nested ones included). A review adds `sortCached`, `opinionCached`, `sortJoined`, `quick`, `reviewLines`, `files`, `decisions`, `highDecisions`, `streamed` (decisions queued for judging while the sort was still writing), `sideSessions` (judging sessions started on free slots), `slowTicket` (the ticket is checked in a turn of its own), `retried` (decisions retried after a failed turn), `specRetried`. |
+| `operation` | A whole review (`Reviewer`), sort run, opinion run, overview, stack opinion, stack walk | `concurrentOperations` (operations running at its start, nested ones included). A review adds `sortCached`, `opinionCached`, `sortJoined`, `quick`, `reviewLines`, `files`, `decisions`, `highDecisions`, `streamed` (decisions queued for judging while the sort was still writing), `sideSessions` (judging sessions started on free slots), `slowTicket` (the ticket is checked in a turn of its own), `retried` (decisions retried after a failed turn), `specRetried`, `since` (sorted from the previous push's sort), `carried` (decisions that kept their opinion from it). |
 | `git.clone` | First use of a repo | |
 | `git.fetch` | `fetchPr`: ensuring the clone, refs, fetching when needed, merge base. In-memory hits aren't logged. | `network` (false = head already local) |
 | `git.numstat`, `git.diff`, `git.show`, `git.lsTree` | Each git call | `files`, `additions`, `deletions` / `bytes`, `paths` / `entries` |
@@ -52,6 +52,7 @@ Only short tokens get logged: numbers, booleans, and strings of up to 80 charact
 | `context.prompt` | One opinion prompt for a group of decisions | `decisions`, `continued`, `diffBytes`, `promptBytes` |
 | `context.wait` | A review waiting on the ticket or opinion context it forked earlier | `on` |
 | `sort.join` | Waiting on a sort of the same head that another caller started | |
+| `sort.since` | Comparing a new head with the last reviewed one, change by change | `changedFiles`, `interdiffLines` |
 | `agent.acquire` | Waiting for a free account slot | `account`, `waited`, `busySlots`, `slots`, `tickets` |
 | `agent.turn` | One agent turn: what `usage.jsonl` times, plus `ask`/`chat` streams | `account`, `modelChoice` (`fast`/`main`), `schemaRetry`, `timedOut` |
 | `agent.spawn` | Starting the agent process | |

@@ -9,6 +9,7 @@ import { Acp } from '../src/Acp.ts'
 import { Agent } from '../src/Agent.ts'
 import { Config } from '../src/Config.ts'
 import { makeTracer, type PerformanceEvent } from '../src/Perf.ts'
+import { Skills } from '../src/Skills.ts'
 import { tmp } from './helpers.ts'
 
 const log = { kind: 'sort' as const, owner: 'o', repo: 'r', number: 7, headSha: 'abc' }
@@ -43,7 +44,7 @@ const setup = (answer: Answer, accounts = [account('a'), account('b')]) => {
   )
   const cacheRoot = tmp()
   const config = Config.layerTest({ cacheRoot, settings: { ...defaultSettings, accounts } })
-  const layer = Agent.layer.pipe(Layer.provide([acp, config, NodeServices.layer]))
+  const layer = Agent.layer.pipe(Layer.provide([acp, config, Skills.layerTest(), NodeServices.layer]))
   return { layer, opened, prompts, models, usagePath: join(cacheRoot, 'usage.jsonl') }
 }
 

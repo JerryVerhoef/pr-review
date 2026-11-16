@@ -34,6 +34,7 @@ export function DecisionFindings(props: { prRef: PrRef; headSha: string; prNumbe
     <section aria-label="Claude's opinion" className="mb-3 flex flex-col gap-2">
       <div className="flex items-center gap-2 text-sm text-dim">
         <span>{opinion?.deep ? 'Deeper look' : "Claude's opinion"}</span>
+        {opinion?.carriedFrom !== undefined && <span title={`Judged on ${opinion.carriedFrom.slice(0, 7)}; this decision's change is the same since`}>· from the previous push</span>}
         {digging && !opinion?.deep ? (
           <Deeper {...props} />
         ) : (

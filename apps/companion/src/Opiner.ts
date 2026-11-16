@@ -90,6 +90,7 @@ export const judged = (sort: SortResult): ReadonlyArray<Decision> => (sort.quick
 /** What opinion turns on one head share; see `Opiner.context`. */
 export type OpinionContext = {
   cwd: string
+  repo: string
   related: ReadonlyArray<string>
   /** The PR names a ticket only an agent can read, so it can come later than the rest. */
   slowTicket: boolean
@@ -216,6 +217,7 @@ export class Opiner extends Context.Service<
 
         return {
           cwd: git.dir(repoKey),
+          repo: repoKey,
           related: related.map((r) => r.repo),
           /** `continued`: the turn follows the sort in its session, which already has the diff. */
           slowTicket,
@@ -234,12 +236,12 @@ export class Opiner extends Context.Service<
                   ? ['Now these decisions, the same way.']
                   : [
                       skill,
-                      `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`,
-                      guidanceSection(master, guidance),
+                      // A continued turn has the refs, guidance and PR from the sort prompt above it.
+                      ...(o.continued ? [] : [`# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`, guidanceSection(master, guidance)]),
                       relatedSection(related),
                       ticketText,
                       `# Stack (bottom first; compare a PR with the one below it using git diff <head below> <its head>)\n${stackText.join('\n\n') || '(not stacked)'}`,
-                      `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
+                      ...(o.continued ? [] : [`# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`]),
                     ]),
                 `# Decisions\n${JSON.stringify(decisions)}`,
                 // Here, not in the skill: a repo's own skill must still show which decision is being judged.
@@ -288,6 +290,7 @@ export class Opiner extends Context.Service<
           prompt: yield* c.prompt(decisions, { deep: only !== undefined }),
           schema: AgentOpinion,
           cwd: c.cwd,
+          repo: c.repo,
           related: c.related,
           ...(only ? { prefer: 'deep' as const } : {}),
           log: { kind: only ? 'deeper' : 'opinion', owner, repo, number, headSha },

@@ -3,14 +3,18 @@ import { createHash } from 'node:crypto'
 import { Effect } from 'effect'
 import type { Git } from './Git.ts'
 import type { GitHub } from './GitHub.ts'
+import { REPO_SKILL } from './repoSkills.ts'
 import type { TicketSummary } from './Tickets.ts'
 
+/** The repo's skills reach the agent through the Skill tool (see `Skills`), so the list leaves their files out. */
+export const guidanceFiles = (guidance: ReadonlyArray<string>) => guidance.filter((p) => !REPO_SKILL.test(p))
+
 export const guidanceSection = (master: string, guidance: ReadonlyArray<string>) =>
-  `# Review guidance (the repo's own rules; read the ones that apply with git show ${master}:<path>)\n${guidance.join('\n') || '(none)'}`
+  `# Review guidance (the repo's own rules; read the ones that apply with git show ${master}:<path>)\n${guidanceFiles(guidance).join('\n') || '(none)'}`
 
 export const relatedSection = (related: ReadonlyArray<RelatedRepo>) =>
   related.length
-    ? `# Related repos (services this team owns; read-only through gh api, default branch only, never clone)\n${related.map((r) => `${r.repo}: ${r.note}`).join('\n')}\nRead with: gh api --hostname <host> -H 'Accept: application/vnd.github.raw' repos/<owner>/<repo>/contents/<file>\nList with: gh api --hostname <host> repos/<owner>/<repo>/git/trees/HEAD?recursive=1\nSearch with: gh api --hostname <host> 'search/code?q=<terms>+repo:<owner>/<repo>' (terms: letters, digits, _ . - joined by +)\nAlways pass --hostname, github.com included. Cite what you read as ref "related" with the repo set.`
+    ? `# Related repos (services this team owns; read-only through gh api, default branch only, never clone)\n${related.map((r) => `${r.repo}: ${r.note}`).join('\n')}\nRead with: gh api --hostname <host> -H 'Accept: application/vnd.github.raw' repos/<owner>/<repo>/contents/<file>\nList with: gh api --hostname <host> 'repos/<owner>/<repo>/git/trees/HEAD?recursive=1'\nSearch with: gh api --hostname <host> 'search/code?q=<terms>+repo:<owner>/<repo>' (terms: letters, digits, _ . - joined by +)\nAlways pass --hostname, github.com included. Cite what you read as ref "related" with the repo set.`
     : '# Related repos\n(none)'
 
 export const ticketSection = (ticket: TicketSummary, without: string) =>

@@ -19,6 +19,7 @@ import { parseLog, parseSince, summarize } from './perfSummary.ts'
 import { Overview } from './Overview.ts'
 import { Reviewer } from './Reviewer.ts'
 import { loginPath } from './shellPath.ts'
+import { Skills } from './Skills.ts'
 import { Sorter } from './Sorter.ts'
 import { StackOpiner } from './StackOpiner.ts'
 import { Store } from './Store.ts'
@@ -28,7 +29,7 @@ const services = Layer.mergeAll(StackOpiner.layer, Asker.layer, Overview.layer, 
   Layer.provideMerge(Opiner.layer),
   Layer.provideMerge(Layer.mergeAll(Sorter.layer, Tickets.layer)),
   Layer.provideMerge(Layer.mergeAll(Git.layer, GitHub.layer, Store.layer)),
-  Layer.provideMerge(Agent.layer.pipe(Layer.provide(Acp.layer))),
+  Layer.provideMerge(Agent.layer.pipe(Layer.provide([Acp.layer, Skills.layer]))),
   Layer.provideMerge(Git.layer),
 )
 

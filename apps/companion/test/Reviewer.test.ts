@@ -1,5 +1,5 @@
 import { assert, describe, it } from '@effect/vitest'
-import { type AgentAccount, AgentError, type AgentFinding, type AgentQuick, type FileStat, type AgentOpinion, type AgentSort, type Decision, type Phase, type SortResult } from '@pr-review/domain'
+import { type AgentAccount, AgentError, type AgentFinding, type AgentQuick, type FileStat, type AgentOpinion, type AgentSort, type Decision, GitError, type Phase, type SortResult } from '@pr-review/domain'
 import { Deferred, Effect, Fiber, Layer, Option, Stream } from 'effect'
 import { KeyValueStore } from 'effect/persistence'
 import { Opiner } from '../src/Opiner.ts'
@@ -39,6 +39,7 @@ const setup = (
     sort?: (call: AgentCall) => Effect.Effect<unknown, AgentError>
     ticket?: Effect.Effect<TicketSummary>
     github?: Partial<GitHubClient>
+    diff?: (from: string, to: string, paths: ReadonlyArray<string>) => string | GitError
   } = {},
 ) => {
   const agent = fakeAgent(
@@ -47,7 +48,7 @@ const setup = (
     o.pool,
   )
   const files = o.stats ?? (o.decisions ?? many).map((d) => ({ path: d.files[0]!.path, additions: 100, deletions: 1 }))
-  const deps = Layer.mergeAll(agent.layer, fakeGit({ files, diff: 'THE DIFF' }).layer, fakeGitHub(o.github), configLayer(), Layer.succeed(Tickets, Tickets.of({ summary: () => o.ticket ?? Effect.succeed({ text: null, note: 'none' }) })))
+  const deps = Layer.mergeAll(agent.layer, fakeGit({ files, diff: o.diff ?? 'THE DIFF' }).layer, fakeGitHub(o.github), configLayer(), Layer.succeed(Tickets, Tickets.of({ summary: () => o.ticket ?? Effect.succeed({ text: null, note: 'none' }) })))
   const layer = Reviewer.layer.pipe(Layer.provideMerge(Opiner.layer), Layer.provideMerge(Sorter.layer), Layer.provideMerge(Store.layerWith(KeyValueStore.layerMemory)), Layer.provideMerge(deps))
   return { agent, layer }
 }
@@ -528,4 +529,79 @@ describe('Reviewer', () => {
       const e = yield* Effect.flip(review.pipe(Effect.provide(layer)))
       assert.strictEqual(e.message, 'no')
     }))
+
+  describe('after a push', () => {
+    const patch = (path: string, line: string, at = 1) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +${at} @@\n-old\n+${line}\n`
+    /** h1 changes the same way at both heads, two lines lower at HEAD2; l1 changes differently, by an interdiff of `lines` lines. */
+    const pushed = (lines: number) => (from: string, to: string, paths: ReadonlyArray<string>) => {
+      if (from === 'HEAD1' && to === 'HEAD2') return `diff --git a/src/l1.ts b/src/l1.ts\n--- a/src/l1.ts\n+++ b/src/l1.ts\n@@ -0,0 +1,${lines} @@\n${'+x\n'.repeat(lines)}`
+      if (from !== 'MB1') return 'THE DIFF'
+      if (paths.length > 2) return 'THE DIFF'
+      const at2 = to === 'HEAD2'
+      return [...(paths.includes('src/h1.ts') ? [patch('src/h1.ts', 'one', at2 ? 3 : 1)] : []), ...(paths.includes('src/l1.ts') ? [patch('src/l1.ts', at2 ? 'two' : 'one')] : [])].join('')
+    }
+    const atLine = (d: Decision): Decision => ({ ...d, files: d.files.map((f) => ({ ...f, ranges: [{ start: 1, end: 1 }] })) })
+    const finding = { severity: 'should', axis: 'standards', kind: 'design', title: 'T', take: 'x', evidence: [], alternative: null, comment: null, anchor: null, handledIn: null } as const
+    // At HEAD2 the agent returns only what changed; h1 is kept by the sort itself.
+    const sort = (call: AgentCall) => Effect.succeed(sortOf(call.prompt.includes('# Kept decisions') ? [atLine(few[1]!)] : few.map(atLine)))
+    const opinion = (call: AgentCall) => Effect.succeed({ decisions: opinionOn(call.prompt).decisions.map((d) => (d.decisionId === 'h1' ? { ...d, findings: [finding] } : d)) })
+    const twice = Effect.gen(function* () {
+      const reviewer = yield* Reviewer
+      const store = yield* Store
+      const first = yield* reviewer.result(ref, 'HEAD1')
+      const id = first.opinion!.decisions.find((d) => d.decisionId === 'h1')!.findings[0]!.id
+      yield* Effect.orDie(store.findings.set('h/o/r#7@HEAD1', { [id]: 'posted' }))
+      return { r: yield* reviewer.result(ref, 'HEAD2'), id, states: yield* Effect.orDie(store.findings.get('h/o/r#7@HEAD2')) }
+    })
+
+    it.effect('a small push sorts from the previous sort and judges only decisions whose change differs', () =>
+      Effect.gen(function* () {
+        const { agent, layer } = setup({ decisions: few, diff: pushed(3), sort, opinion })
+        const { r, id, states } = yield* twice.pipe(Effect.provide(layer))
+        const second = agent.calls.filter((c) => c.log.headSha === 'HEAD2')
+        const prompt = second.find((c) => c.log.kind === 'sort')!.prompt
+        assert.include(prompt, '# Previous sort (head HEAD1)')
+        assert.include(prompt, '# Kept decisions\nTheir files change as they did at HEAD1, so they stay as they are and are not yours to return:\nh1: Decision h1 (src/h1.ts)')
+        assert.match(prompt, /# Decisions to revise\n\[\{"id":"l1"/)
+        assert.match(prompt, /# Changed since then\n.*\nsrc\/l1\.ts\n/)
+        assert.notInclude(prompt, 'THE DIFF')
+        // h1 is in the sort though the agent left it out, at the lines its change moved to.
+        assert.deepStrictEqual(r.sort.decisions.find((d) => d.id === 'h1')?.files[0]?.ranges, [{ start: 3, end: 3 }])
+        assert.deepStrictEqual(opinionTurns(second).flatMap((c) => c.ids), ['l1'])
+        const byId = new Map(r.opinion!.decisions.map((d) => [d.decisionId, d]))
+        assert.strictEqual(byId.get('h1')?.carriedFrom, 'HEAD1')
+        assert.strictEqual(byId.get('h1')?.authorCase, 'case h1')
+        assert.isUndefined(byId.get('l1')?.carriedFrom)
+        // Its finding keeps its id, and with it what the reviewer did with it.
+        assert.strictEqual(byId.get('h1')?.findings[0]?.id, id)
+        assert.deepStrictEqual(Option.getOrUndefined(states), { [id]: 'posted' })
+      }))
+
+    it.effect('a kept decision whose opinion fails to carry is judged again', () =>
+      Effect.gen(function* () {
+        let failed = false
+        const diff = pushed(3)
+        const { agent, layer } = setup({
+          decisions: few,
+          sort,
+          opinion,
+          // Anchoring h1's carried findings at HEAD2 fails once.
+          diff: (from, to, paths) => (to === 'HEAD2' && from === 'MB1' && paths.join() === 'src/h1.ts' && !failed ? ((failed = true), new GitError({ message: 'gone' })) : diff(from, to, paths)),
+        })
+        const { r } = yield* twice.pipe(Effect.provide(layer))
+        assert.isTrue(failed)
+        assert.sameMembers(opinionTurns(agent.calls.filter((c) => c.log.headSha === 'HEAD2')).flatMap((c) => c.ids), ['h1', 'l1'])
+        assert.isUndefined(r.opinion!.decisions.find((d) => d.decisionId === 'h1')?.carriedFrom)
+      }))
+
+    it.effect('a push of 400 lines or more sorts and judges from scratch', () =>
+      Effect.gen(function* () {
+        const { agent, layer } = setup({ decisions: few, diff: pushed(400), opinion })
+        const { r } = yield* twice.pipe(Effect.provide(layer))
+        const second = agent.calls.filter((c) => c.log.headSha === 'HEAD2')
+        assert.notInclude(second.find((c) => c.log.kind === 'sort')!.prompt, '# Previous sort')
+        assert.sameMembers(opinionTurns(second).flatMap((c) => c.ids), ['h1', 'l1'])
+        assert.isTrue(r.opinion!.decisions.every((d) => d.carriedFrom === undefined))
+      }))
+  })
 })

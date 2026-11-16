@@ -31,7 +31,7 @@ const sortOf = (id: string, summary: string): SortResult => ({
 const sorts: Record<number, SortResult> = { 6: sortOf('model', 'Adds the model.'), 7: sortOf('api', 'Adds the API.') }
 
 /** Any sort or PR opinion would be a paid run per PR and fails the test. */
-const fakeSorter = Layer.succeed(Sorter, Sorter.of({ sort: (r) => Effect.die(`sorted #${r.number}`), cached: (r) => Effect.succeed(sorts[r.number]), steps: () => Stream.never, prepare: () => Effect.die('prepared'), claim: () => Effect.die('claimed'), remember: () => Effect.void }))
+const fakeSorter = Layer.succeed(Sorter, Sorter.of({ sort: (r) => Effect.die(`sorted #${r.number}`), cached: (r) => Effect.succeed(sorts[r.number]), steps: () => Stream.never, prepare: () => Effect.die('prepared'), since: () => Effect.undefined, claim: () => Effect.die('claimed'), remember: () => Effect.void }))
 
 const prOpinion = (title: string): PrOpinion => ({
   headSha: 'sha6',
@@ -70,7 +70,7 @@ function finding(o: Partial<AgentFinding> = {}): AgentFinding {
 
 const setup = (o: { reply?: AgentStackOpinion; prs?: () => StackEntry[]; show?: Record<string, string> } = {}) => {
   const agent = fakeAgent((call) => Effect.succeed(call.log.kind === 'overview' ? overviewReply : (o.reply ?? { findings: [] })))
-  const git = fakeGit({ files: [{ path: 'src/a.ts', additions: 3, deletions: 1 }], diff: 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n+x', rules: ['AGENTS.md'], show: o.show ?? {} })
+  const git = fakeGit({ files: [{ path: 'src/a.ts', additions: 3, deletions: 1 }], diff: 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n a\n+x\n b\n', rules: ['AGENTS.md'], show: o.show ?? {} })
   const config = Config.layerTest({ cacheRoot: '/cache', settings: { ...defaultSettings, hosts: [ref.host], repos: { 'h/o/r': { related: [{ repo: 'h/o/svc', note: 'permissions' }] } } } })
   const layer = Layer.mergeAll(StackOpiner.layer, Overview.layer).pipe(
     Layer.provide([

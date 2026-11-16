@@ -2,10 +2,9 @@ import * as acp from '@agentclientprotocol/sdk'
 import { AgentError, type AgentAccount } from '@pr-review/domain'
 import { Clock, Context, Effect, Exit, Fiber, Layer, Option, Queue, Schema, type Scope, Stream, type Tracer } from 'effect'
 import { spawn } from 'node:child_process'
-import { homedir } from 'node:os'
 import { Readable, Writable } from 'node:stream'
-import { safeGhCommand, safeGitCommand } from './gitOnly.ts'
-import { directCommand, loginPath } from './shellPath.ts'
+import { safeGhCommand, safeGitCommand, words } from './gitOnly.ts'
+import { directCommand, expandHome, loginPath } from './shellPath.ts'
 import { annotate, elapsedMs, measure, type Meta, round, startSpan } from './Perf.ts'
 import { ticketPermission } from './permissions.ts'
 import { describeTool } from './steps.ts'
@@ -26,7 +25,19 @@ export type Launch = (account: AgentAccount, cwd: string) => Effect.Effect<{ tar
 
 // Claude Code's own settings could allow tools past the gate; its ACP adapter takes SDK options here.
 const disallowedTools = ['Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Task']
-const claudeOptions = { claudeCode: { options: { settingSources: [], disallowedTools } } }
+// Only what a review uses: git through Bash, and skills with the files they name. claude.ai connectors stay off; the
+// ticket session reads tickets, and an agent reading untrusted PR content gets no tools beyond read-only git.
+const claudeOptions = (plugins: ReadonlyArray<string>) => ({
+  claudeCode: {
+    options: {
+      settingSources: [],
+      disallowedTools,
+      tools: ['Bash', 'Skill', 'Read'],
+      plugins: plugins.map((path) => ({ type: 'local', path, skipMcpDiscovery: true })),
+      env: { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' },
+    },
+  },
+})
 // The ticket session loads the user's own config so their tracker MCP servers are there; it never sees PR code, and can't read files or fetch URLs.
 // Residual risk: tools the user auto-allows in that config are approved by Claude Code itself and never reach ticketPermission.
 const ticketOptions = { claudeCode: { options: { settingSources: ['user'], disallowedTools: [...disallowedTools, 'Read', 'Glob', 'Grep', 'Bash'] } } }
@@ -36,6 +47,8 @@ const agentError = (e: unknown, output = '') =>
   new AgentError({ message: [e instanceof Error ? e.message : typeof e === 'object' && e && 'message' in e ? String(e.message) : String(e), output.trim().split('\n').slice(-3).join(' ')].filter(Boolean).join(': ') })
 
 const ShellInput = Schema.Struct({ command: Schema.String })
+const SkillInput = Schema.Struct({ skill: Schema.String })
+const ReadInput = Schema.Struct({ file_path: Schema.String })
 /** The shell command a tool call runs, when it is one. */
 const commandOf = (rawInput: unknown) => Option.getOrUndefined(Schema.decodeUnknownOption(ShellInput)(rawInput))?.command
 
@@ -63,17 +76,16 @@ const toUpdate = (u: acp.SessionUpdate, seen: Set<string>): AcpUpdate | undefine
   return { _tag: 'Step', step: describeTool('Bash', { command }) }
 }
 
-const SHELL = /^\s*(git|gh)\s+([a-z][a-z-]*)/
-
 /** What a tool call is, without its arguments: the agent's tool name and kind, and for git or gh the subcommand. */
 const toolMeta = (u: acp.ToolCall | acp.ToolCallUpdate): Meta => {
   const command = commandOf(u.rawInput)
-  const shell = command === undefined ? null : SHELL.exec(command)
+  const w = command === undefined ? undefined : words(command)
+  const shell = w?.[0] === 'git' || w?.[0] === 'gh' ? w : undefined
   return {
     tool: Option.getOrUndefined(Schema.decodeUnknownOption(ClaudeCodeMeta)(u._meta))?.claudeCode.toolName,
     toolKind: u.kind ?? undefined,
-    command: shell?.[1],
-    subcommand: shell?.[2],
+    command: shell?.[0],
+    subcommand: shell?.[1],
   }
 }
 
@@ -160,8 +172,6 @@ const promptTimer = (clock: Clock.Clock, tracer: Tracer.Tracer, parent: Tracer.A
   }
 }
 
-const expandHome = (v: string) => (v === '~' || v.startsWith('~/') ? homedir() + v.slice(1) : v)
-
 const direct = new Map<string, Promise<string>>()
 
 /** Starts `account.command` through the shell, on the user's own PATH. Keys that would bill an API instead of the login are left out. */
@@ -184,7 +194,7 @@ export const spawnAgent: Launch = (account, cwd) =>
     return { target, output: () => output }
   })
 
-export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd: string, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; /** A `thought_level` value, set when the agent offers it. */ effort?: string | undefined }): Effect.Effect<AcpSession, AgentError, Scope.Scope> }>()(
+export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd: string, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; /** A `thought_level` value, set when the agent offers it. */ effort?: string | undefined; /** Skill-only plugin folders, and the files a Read may open. */ plugins?: ReadonlyArray<string>; readable?: (path: string) => boolean }): Effect.Effect<AcpSession, AgentError, Scope.Scope> }>()(
   'pr-review/Acp',
 ) {
   static readonly layerWith = (launch: Launch) =>
@@ -207,10 +217,15 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
                 timer?.update(ctx.params.update)
               })
               .onRequest(acp.methods.client.session.requestPermission, (ctx) => {
-                const command = commandOf(ctx.params.toolCall.rawInput)
+                const tool = ctx.params.toolCall
+                const command = commandOf(tool.rawInput)
+                const raw = tool.rawInput
+                // Non-MCP requests carry no tool name; the adapter's kind and title for each tool stand in for it.
                 const allowed = o?.tickets
-                  ? ticketPermission(ctx.params.toolCall)
-                  : ctx.params.toolCall.kind === 'execute' && command !== undefined && (safeGitCommand(command) || safeGhCommand(command, o?.related ?? []))
+                  ? ticketPermission(tool)
+                  : (tool.kind === 'execute' && command !== undefined && (safeGitCommand(command) || safeGhCommand(command, o?.related ?? []))) ||
+                    (tool.kind === 'other' && tool.title?.startsWith('Load skill') === true && Schema.is(SkillInput)(raw)) ||
+                    (tool.kind === 'read' && tool.title?.startsWith('Read ') === true && Schema.is(ReadInput)(raw) && o?.readable?.(raw.file_path) === true)
                 timer?.permission(ctx.params.toolCall.toolCallId, Boolean(allowed))
                 const option = ctx.params.options.find((o) => o.kind === (allowed ? 'allow_once' : 'reject_once')) ?? ctx.params.options.find((o) => o.kind.startsWith(allowed ? 'allow' : 'reject'))
                 return option ? { outcome: { outcome: 'selected', optionId: option.optionId } } : { outcome: { outcome: 'cancelled' } }
@@ -226,7 +241,7 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
               measure('acp.initialize'),
             )
             const caps = init.agentCapabilities
-            const _meta = o?.tickets ? ticketOptions : claudeOptions
+            const _meta = o?.tickets ? ticketOptions : claudeOptions(o?.plugins ?? [])
             const start = () =>
               resume
                 ? caps?.sessionCapabilities?.resume
