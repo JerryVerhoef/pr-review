@@ -42,7 +42,7 @@ Only short tokens get logged: numbers, booleans, and strings of up to 80 charact
 
 | Phase | Where | Metadata |
 | --- | --- | --- |
-| `operation` | A whole review (`Reviewer`), sort run, opinion run, overview, stack opinion, stack walk | `concurrentOperations` (operations running at its start, nested ones included). A review adds `sortCached`, `opinionCached`, `sortJoined`, `quick`, `reviewLines`, `files`, `decisions`, `highDecisions`, `lowDecisions`, `splitAccounts`. |
+| `operation` | A whole review (`Reviewer`), sort run, opinion run, overview, stack opinion, stack walk | `concurrentOperations` (operations running at its start, nested ones included). A review adds `sortCached`, `opinionCached`, `sortJoined`, `quick`, `reviewLines`, `files`, `decisions`, `highDecisions`, `lowDecisions`, `opinionGroups` (turns the opinion is split into), `freeSlots` (account slots free when it was split). |
 | `git.clone` | First use of a repo | |
 | `git.fetch` | `fetchPr`: ensuring the clone, refs, fetching when needed, merge base. In-memory hits aren't logged. | `network` (false = head already local) |
 | `git.numstat`, `git.diff`, `git.show`, `git.lsTree` | Each git call | `files`, `additions`, `deletions` / `bytes`, `paths` / `entries` |
@@ -57,7 +57,7 @@ Only short tokens get logged: numbers, booleans, and strings of up to 80 charact
 | `agent.spawn` | Starting the agent process | |
 | `acp.initialize` | ACP `initialize`: the process's first answer | `protocolVersion` |
 | `acp.session` | `session/new`, `resume` or `load`, with a login retry | `method`, `authenticated` |
-| `acp.setMode`, `acp.setModel` | Session configuration | |
+| `acp.setMode`, `acp.setModel`, `acp.setEffort` | Session configuration | |
 | `agent.prompt` | One ACP prompt: request sent, answer received | See below |
 | `agent.tool` | One tool call, from the agent announcing it to its final status | `tool`, `toolKind`, `command`/`subcommand` (git or gh only, e.g. `git` `show`), `permission`, `sincePreviousToolMs` |
 | `agent.response` | `decode`: parsing and validating the JSON answer. `finish`: anchors and citation checks. | `responseBytes` / `findings`, `citations` |
