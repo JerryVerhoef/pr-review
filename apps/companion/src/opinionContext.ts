@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { Effect } from 'effect'
 import type { Git } from './Git.ts'
 import type { GitHub } from './GitHub.ts'
-import { REPO_SKILL } from './Skills.ts'
+import { REPO_SKILL } from './repoSkills.ts'
 import type { TicketSummary } from './Tickets.ts'
 
 /** The repo's skills reach the agent through the Skill tool (see `Skills`), so the list leaves their files out. */

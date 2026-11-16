@@ -61,6 +61,7 @@ export class Asker extends Context.Service<
               return agent.streaming({
                 prompt,
                 cwd: git.dir(repoKey),
+                repo: repoKey,
                 ...(sessionId ? { resume: sessionId } : {}),
                 log: { kind: target._tag === 'Decision' ? 'chat' : 'ask', owner: ref.owner, repo: ref.repo, number: ref.number, headSha },
               })

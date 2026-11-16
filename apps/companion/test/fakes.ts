@@ -114,6 +114,8 @@ export const fakeGit = (o: { files?: FileStat[]; diff?: string | ((from: string,
           return text === undefined ? Effect.fail(new GitError({ message: `no ${ref}:${path}` })) : Effect.succeed(text)
         }),
       lsTree: (_k, _ref, paths) => Effect.sync(() => (listed.push(paths), o.rules ?? [])),
+      // A file's text stands in for its blob id.
+      blobs: (_k, ref) => Effect.sync(() => (o.rules ?? []).map((path) => ({ path, id: typeof o.show === 'object' ? `${o.show[`${ref}:${path}`]}` : path }))),
       defaultBranch: () => Effect.succeed('master'),
       revParse: (_k, ref) => Effect.succeed(ref),
     }),

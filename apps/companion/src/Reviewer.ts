@@ -115,6 +115,7 @@ export class Reviewer extends Context.Service<
         const prompt = `${yield* c.prompt([changes])}\n\n${quickInstructions}`
         const options: SessionOptions = {
           cwd: c.cwd,
+          repo: c.repo,
           related: c.related,
           log: { kind: 'sort', owner: ref.owner, repo: ref.repo, number: ref.number, headSha },
           onStep: (s) => Effect.suspend(() => t.worker('quick', 0, (w) => ({ ...w, step: s, recent: w.step ? [...w.recent, w.step].slice(-4) : w.recent }))),
@@ -307,6 +308,7 @@ export class Reviewer extends Context.Service<
         const step = (w: Worker, s: string): Worker => ({ ...w, step: s, recent: w.step ? [...w.recent, w.step].slice(-4) : w.recent })
         const options = (slot: Slot): SessionOptions => ({
           cwd: git.dir(repoKey),
+          repo: repoKey,
           ...(wantOpinion ? { related: repoSettings(settings, repoKey).related.map((r) => r.repo) } : {}),
           log: { kind: 'sort', owner: ref.owner, repo: ref.repo, number: ref.number, headSha },
           onStep: (s) => Effect.suspend(() => t.worker(slot.phase, slot.worker, (w) => step(w, s))),

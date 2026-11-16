@@ -2,12 +2,11 @@ import * as acp from '@agentclientprotocol/sdk'
 import { AgentError, type AgentAccount } from '@pr-review/domain'
 import { Clock, Context, Effect, Exit, Fiber, Layer, Option, Queue, Schema, type Scope, Stream, type Tracer } from 'effect'
 import { spawn } from 'node:child_process'
-import { homedir } from 'node:os'
 import { Readable, Writable } from 'node:stream'
 import { safeGhCommand, safeGitCommand } from './gitOnly.ts'
-import { directCommand, loginPath } from './shellPath.ts'
+import { directCommand, expandHome, loginPath } from './shellPath.ts'
 import { annotate, elapsedMs, measure, type Meta, round, startSpan } from './Perf.ts'
-import { readsUnder, ticketPermission } from './permissions.ts'
+import { ticketPermission } from './permissions.ts'
 import { describeTool } from './steps.ts'
 
 export type AcpUpdate = { readonly _tag: 'Text'; readonly delta: string } | { readonly _tag: 'Step'; readonly step: string }
@@ -174,8 +173,6 @@ const promptTimer = (clock: Clock.Clock, tracer: Tracer.Tracer, parent: Tracer.A
   }
 }
 
-export const expandHome = (v: string) => (v === '~' || v.startsWith('~/') ? homedir() + v.slice(1) : v)
-
 const direct = new Map<string, Promise<string>>()
 
 /** Starts `account.command` through the shell, on the user's own PATH. Keys that would bill an API instead of the login are left out. */
@@ -198,7 +195,7 @@ export const spawnAgent: Launch = (account, cwd) =>
     return { target, output: () => output }
   })
 
-export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd: string, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; /** A `thought_level` value, set when the agent offers it. */ effort?: string | undefined; /** Skill-only plugin folders; Read is allowed under `readable`. */ plugins?: ReadonlyArray<string>; readable?: string }): Effect.Effect<AcpSession, AgentError, Scope.Scope> }>()(
+export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd: string, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; /** A `thought_level` value, set when the agent offers it. */ effort?: string | undefined; /** Skill-only plugin folders, and the files a Read may open. */ plugins?: ReadonlyArray<string>; readable?: (path: string) => boolean }): Effect.Effect<AcpSession, AgentError, Scope.Scope> }>()(
   'pr-review/Acp',
 ) {
   static readonly layerWith = (launch: Launch) =>
@@ -221,13 +218,15 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
                 timer?.update(ctx.params.update)
               })
               .onRequest(acp.methods.client.session.requestPermission, (ctx) => {
-                const command = commandOf(ctx.params.toolCall.rawInput)
-                const raw = ctx.params.toolCall.rawInput
+                const tool = ctx.params.toolCall
+                const command = commandOf(tool.rawInput)
+                const raw = tool.rawInput
+                // Non-MCP requests carry no tool name; the adapter's kind and title for each tool stand in for it.
                 const allowed = o?.tickets
-                  ? ticketPermission(ctx.params.toolCall)
-                  : (ctx.params.toolCall.kind === 'execute' && command !== undefined && (safeGitCommand(command) || safeGhCommand(command, o?.related ?? []))) ||
-                    Schema.is(SkillInput)(raw) ||
-                    (o?.readable !== undefined && Schema.is(ReadInput)(raw) && readsUnder(o.readable, raw.file_path))
+                  ? ticketPermission(tool)
+                  : (tool.kind === 'execute' && command !== undefined && (safeGitCommand(command) || safeGhCommand(command, o?.related ?? []))) ||
+                    (tool.kind === 'other' && tool.title?.startsWith('Load skill') === true && Schema.is(SkillInput)(raw)) ||
+                    (tool.kind === 'read' && tool.title?.startsWith('Read ') === true && Schema.is(ReadInput)(raw) && o?.readable?.(raw.file_path) === true)
                 timer?.permission(ctx.params.toolCall.toolCallId, Boolean(allowed))
                 const option = ctx.params.options.find((o) => o.kind === (allowed ? 'allow_once' : 'reject_once')) ?? ctx.params.options.find((o) => o.kind.startsWith(allowed ? 'allow' : 'reject'))
                 return option ? { outcome: { outcome: 'selected', optionId: option.optionId } } : { outcome: { outcome: 'cancelled' } }

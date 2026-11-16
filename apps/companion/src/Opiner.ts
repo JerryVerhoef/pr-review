@@ -90,6 +90,7 @@ export const judged = (sort: SortResult): ReadonlyArray<Decision> => (sort.quick
 /** What opinion turns on one head share; see `Opiner.context`. */
 export type OpinionContext = {
   cwd: string
+  repo: string
   related: ReadonlyArray<string>
   /** The PR names a ticket only an agent can read, so it can come later than the rest. */
   slowTicket: boolean
@@ -216,6 +217,7 @@ export class Opiner extends Context.Service<
 
         return {
           cwd: git.dir(repoKey),
+          repo: repoKey,
           related: related.map((r) => r.repo),
           /** `continued`: the turn follows the sort in its session, which already has the diff. */
           slowTicket,
@@ -288,6 +290,7 @@ export class Opiner extends Context.Service<
           prompt: yield* c.prompt(decisions, { deep: only !== undefined }),
           schema: AgentOpinion,
           cwd: c.cwd,
+          repo: c.repo,
           related: c.related,
           ...(only ? { prefer: 'deep' as const } : {}),
           log: { kind: only ? 'deeper' : 'opinion', owner, repo, number, headSha },

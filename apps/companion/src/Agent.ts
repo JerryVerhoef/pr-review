@@ -7,7 +7,7 @@ import { annotate, measure, measureStream } from './Perf.ts'
 import { Skills } from './Skills.ts'
 
 export type RunLog = { kind: 'sort' | 'ask' | 'chat' | 'overview' | 'opinion' | 'deeper' | 'stack-opinion' | 'ticket' | 'rule'; owner: string; repo: string; number: number; headSha: string }
-type Opts = { cwd: string; related?: ReadonlyArray<string>; /** Only `deep` accounts when the pool has any, else the whole pool. */ prefer?: 'deep'; log: RunLog; onStep?: (step: string) => Effect.Effect<void> }
+type Opts = { cwd: string; /** The repo key of the clone at `cwd`, for its skills. */ repo?: string; related?: ReadonlyArray<string>; /** Only `deep` accounts when the pool has any, else the whole pool. */ prefer?: 'deep'; log: RunLog; onStep?: (step: string) => Effect.Effect<void> }
 type Run = Opts & { prompt: string }
 export type SessionOptions = Opts & {
   avoid?: ReadonlySet<string>
@@ -205,8 +205,8 @@ export class Agent extends Context.Service<
               const scope = yield* Effect.scope
               // Opened in the first turn, so a one-turn run's time limit and usage line cover the open as before.
               const open = yield* Effect.cached(
-                Effect.flatMap(skills.plugins(a, o.cwd), (plugins) =>
-                  acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind), plugins, readable: skills.root }),
+                Effect.flatMap(skills.plugins(a, o.repo), (plugins) =>
+                  acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind), plugins, readable: skills.readable }),
                 ).pipe(Effect.tap(() => step(o, `${a.name} is reading the PR`)), Scope.provide(scope)),
               )
               let onFast = false
@@ -286,7 +286,7 @@ export class Agent extends Context.Service<
           return Stream.unwrap(
             Effect.gen(function* () {
               const a = yield* acquire(o, new Set(), owner)
-              const session = yield* acp.open(a, o.cwd, sessionId, { plugins: yield* skills.plugins(a, o.cwd), readable: skills.root })
+              const session = yield* acp.open(a, o.cwd, sessionId, { plugins: yield* skills.plugins(a, o.repo), readable: skills.readable })
               yield* annotate({ agent: a.agent, account: a.id, model: a.model || session.defaultModel })
               const startedAt = yield* Clock.currentTimeMillis
               return session.prompt(o.prompt).pipe(

@@ -36,7 +36,7 @@ export const writtenDecisions = (text: string): ReadonlyArray<Decision> => {
 }
 
 /** A sort ready to run: the prompt, and what makes the agent's answer a `SortResult`. */
-export type SortPrompt = { prompt: string; cwd: string; files: ReadonlyArray<FileStat>; finish(answer: AgentSort): SortResult }
+export type SortPrompt = { prompt: string; cwd: string; repo: string; files: ReadonlyArray<FileStat>; finish(answer: AgentSort): SortResult }
 
 /** A push smaller than this, in interdiff lines, is sorted from the previous sort; a larger one from scratch. */
 export const RESORT_LINES = 400
@@ -148,14 +148,14 @@ export class Sorter extends Context.Service<
           promptBytes: Buffer.byteLength(prompt),
           ...(previous ? { since: true, changedFiles: previous.changed.length } : {}),
         })
-        return { prompt, cwd: git.dir(repoKey), files, finish: (answer) => normalize(answer, files, groups, head, review.neverTrust, mergeBase) } satisfies SortPrompt
+        return { prompt, cwd: git.dir(repoKey), repo: repoKey, files, finish: (answer) => normalize(answer, files, groups, head, review.neverTrust, mergeBase) } satisfies SortPrompt
       }, measure('context.prepare'))
 
       const run = Effect.fn('Sorter.run')(function* (key: SortKey) {
         const { owner, repo, number, headSha } = key
         const report = steps.report(keyOf(key))
         const p = yield* prepare(key, headSha, report)
-        const sorted = yield* agent.structured({ prompt: p.prompt, schema: AgentSort, cwd: p.cwd, log: { kind: 'sort', owner, repo, number, headSha }, onStep: report })
+        const sorted = yield* agent.structured({ prompt: p.prompt, schema: AgentSort, cwd: p.cwd, repo: p.repo, log: { kind: 'sort', owner, repo, number, headSha }, onStep: report })
         yield* report('Checking the answer')
         return p.finish(sorted)
       }, (effect, key) => measure('operation', { kind: 'sort', owner: key.owner, repo: key.repo, prNumber: key.number, headSha: key.headSha })(effect))

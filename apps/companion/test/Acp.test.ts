@@ -74,7 +74,7 @@ const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp
   return { app, seen }
 }
 
-const run = <A>(agent: ReturnType<typeof fakeAgent>, f: (s: AcpSession) => Effect.Effect<A, AgentError>, a: AgentAccount = account, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; effort?: string; plugins?: ReadonlyArray<string>; readable?: string }) =>
+const run = <A>(agent: ReturnType<typeof fakeAgent>, f: (s: AcpSession) => Effect.Effect<A, AgentError>, a: AgentAccount = account, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; effort?: string; plugins?: ReadonlyArray<string>; readable?: (path: string) => boolean }) =>
   Effect.gen(function* () {
     const session = yield* (yield* Acp).open(a, '/repo', resume, o)
     return yield* f(session)
@@ -156,16 +156,19 @@ describe('Acp', () => {
       const agent = fakeAgent({
         turn: async (_say, ask) => {
           answers.push(
-            await ask('Skill', 'other', { skill: 'repo:api-design' }),
-            await ask('Read', 'read', { file_path: '/skills/repo/x/api-design/RULES.md' }),
-            await ask('Read', 'read', { file_path: '/skills/../etc/passwd' }),
-            await ask('Read', 'read', { file_path: '/repo/config' }),
+            await ask('Load skill: repo:api-design', 'other', { skill: 'repo:api-design' }),
+            await ask('Read /skills/repo/x/api-design/RULES.md', 'read', { file_path: '/skills/repo/x/api-design/RULES.md' }),
+            await ask('Read /repo/config', 'read', { file_path: '/repo/config' }),
+            // Another tool whose input happens to look like a skill's or a read's.
+            await ask('rm -rf /', 'execute', { skill: 'x', command: 'rm -rf /' }),
+            await ask('Write /skills/repo/x/a', 'edit', { file_path: '/skills/repo/x/a', content: '' }),
+            await ask('Load skill: x', 'read', { skill: 'x' }),
           )
           return 'end_turn'
         },
       })
-      yield* run(agent, (s) => collect(s.prompt('go')), account, undefined, { plugins: ['/skills/own/1', '/skills/repo/x'], readable: '/skills' })
-      assert.deepStrictEqual(answers, [true, true, false, false])
+      yield* run(agent, (s) => collect(s.prompt('go')), account, undefined, { plugins: ['/skills/own/1', '/skills/repo/x'], readable: (p) => p.startsWith('/skills/') })
+      assert.deepStrictEqual(answers, [true, true, false, false, false, false])
       const options = (agent.seen.meta[0] as { claudeCode: { options: { tools: string[]; plugins: unknown[]; env: Record<string, string> } } }).claudeCode.options
       assert.deepStrictEqual(options.tools, ['Bash', 'Skill', 'Read'])
       assert.deepStrictEqual(options.plugins, [

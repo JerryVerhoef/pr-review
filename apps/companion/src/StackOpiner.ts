@@ -129,6 +129,7 @@ export class StackOpiner extends Context.Service<
           prompt,
           schema: AgentStackOpinion,
           cwd: git.dir(repoKey),
+          repo: repoKey,
           related: related.map((r) => r.repo),
           log: { kind: 'stack-opinion', owner, repo, number: first.number, headSha: top.headSha },
           onStep: report,

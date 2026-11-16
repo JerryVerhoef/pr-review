@@ -41,6 +41,8 @@ export class Git extends Context.Service<
     diff(key: string, from: string, to: string, paths?: ReadonlyArray<string>): Effect.Effect<string, GitError>
     show(key: string, sha: string, path: string): Effect.Effect<string, GitError>
     lsTree(key: string, ref: string, paths: ReadonlyArray<string>): Effect.Effect<ReadonlyArray<string>, GitError>
+    /** Every file at `ref`, with its blob id. */
+    blobs(key: string, ref: string): Effect.Effect<ReadonlyArray<{ path: string; id: string }>, GitError>
     revParse(key: string, ref: string): Effect.Effect<string, GitError>
   }
 >()('pr-review/Git') {
@@ -130,6 +132,17 @@ export class Git extends Context.Service<
           inRepo(key, 'diff', '--no-color', '--no-ext-diff', '-M', from, to, '--', ...paths).pipe(measure('git.diff', { paths: paths.length }, (d: string) => ({ bytes: Buffer.byteLength(d) }))),
         revParse: (key, ref) => Effect.map(inRepo(key, 'rev-parse', '--verify', `${ref}^{commit}`), (s) => s.trim()),
         show: (key, sha, path) => inRepo(key, 'show', `${sha}:${path}`).pipe(measure('git.show', {}, (t: string) => ({ bytes: Buffer.byteLength(t) }))),
+        blobs: (key, ref) =>
+          inRepo(key, 'ls-tree', '-r', '-z', ref).pipe(
+            // `<mode> <type> <id>\t<path>`, NUL-terminated.
+            Effect.map((out) =>
+              out.split('\0').flatMap((l) => {
+                const m = /^\d+ blob ([0-9a-f]+)\t(.+)$/s.exec(l)
+                return m ? [{ id: m[1]!, path: m[2]! }] : []
+              }),
+            ),
+            measure('git.blobs'),
+          ),
         lsTree: (key, ref, paths) =>
           inRepo(key, 'ls-tree', '-r', '--name-only', ref, '--', ...paths).pipe(
             Effect.map((out) => out.split('\n').filter(Boolean)),

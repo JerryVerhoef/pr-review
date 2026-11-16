@@ -29,6 +29,7 @@ export class Overview extends Context.Service<
           prompt,
           schema: StackOverview,
           cwd: git.dir(`${host}/${owner}/${repo}`),
+          repo: `${host}/${owner}/${repo}`,
           log: { kind: 'overview', owner, repo, number: entries[0]?.number ?? 0, headSha: entries.at(-1)?.headSha ?? '' },
         })
       }, (effect, k) => measure('operation', { kind: 'overview', owner: k.owner, repo: k.repo, prNumber: k.entries[0]?.number, headSha: k.entries.at(-1)?.headSha })(effect))

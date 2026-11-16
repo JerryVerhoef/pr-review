@@ -1,29 +1,15 @@
 import type { AgentAccount } from '@pr-review/domain'
 import { Cache, Context, Effect, Exit, FileSystem, Layer, Schema } from 'effect'
 import { createHash } from 'node:crypto'
-import { dirname, join, relative, sep } from 'node:path'
-import { expandHome } from './Acp.ts'
+import { realpathSync } from 'node:fs'
+import { dirname, join, sep } from 'node:path'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
-
-/** A file of a skill kept in a repo: `<…>/.agents/skills/<name>/…` or `<…>/.claude/skills/<name>/…`. */
-export const REPO_SKILL = /^(?:.*\/)?\.(?:agents|claude)\/skills\/([^/]+)\/(.+)$/
+import { repoSkills } from './repoSkills.ts'
+import { expandHome } from './shellPath.ts'
 
 const EnabledPlugins = Schema.fromJsonString(Schema.Struct({ enabledPlugins: Schema.optionalKey(Schema.Record(Schema.String, Schema.Boolean)) }))
 const InstalledPlugins = Schema.fromJsonString(Schema.Struct({ plugins: Schema.Record(Schema.String, Schema.Array(Schema.Struct({ installPath: Schema.String }))) }))
-
-/** The repo's skills, each by name with its files relative to the skill folder; a name's first folder wins. */
-export const repoSkills = (paths: ReadonlyArray<string>) => {
-  const skills = new Map<string, { dir: string; files: string[] }>()
-  for (const p of paths) {
-    const m = REPO_SKILL.exec(p)
-    if (!m) continue
-    const dir = p.slice(0, p.length - m[2]!.length)
-    const skill = skills.get(m[1]!) ?? skills.set(m[1]!, { dir, files: [] }).get(m[1]!)!
-    if (skill.dir === dir) skill.files.push(m[2]!)
-  }
-  return new Map([...skills].filter(([, s]) => s.files.includes('SKILL.md')))
-}
 
 /**
  * Skills for review agents, as plugins that hold nothing but skills: no hooks, permission rules, MCP or LSP servers.
@@ -32,10 +18,10 @@ export const repoSkills = (paths: ReadonlyArray<string>) => {
 export class Skills extends Context.Service<
   Skills,
   {
-    /** The account's own skills (its skills folder and its enabled plugins'), and the repo's at its default branch. Never fails. */
-    plugins(account: AgentAccount, cwd: string): Effect.Effect<ReadonlyArray<string>>
-    /** Where the plugins live; agents may Read under it, for the files a skill names. */
-    readonly root: string
+    /** The account's own skills (its skills folder and its enabled plugins'), and those of `repo` (a repo key) at its default branch. Never fails. */
+    plugins(account: AgentAccount, repo?: string): Effect.Effect<ReadonlyArray<string>>
+    /** Whether a Read may open `path`: a file in a skill handed out, once symlinks are resolved. */
+    readable(path: string): boolean
   }
 >()('pr-review/Skills') {
   static readonly layer = Layer.effect(
@@ -45,7 +31,8 @@ export class Skills extends Context.Service<
       const git = yield* Git
       const fs = yield* FileSystem.FileSystem
       const root = join(config.cacheRoot, 'skills')
-      const repos = join(config.cacheRoot, 'repos') + sep
+      /** Real paths of the skill folders handed out; an own skill is a symlink to the account's folder. */
+      const readableRoots = new Set<string>()
 
       /** Writes a plugin once: into a partial folder, renamed into place, so a reader never sees half of one. */
       const plugin = (dir: string, name: string, fill: (skills: string) => Effect.Effect<void, unknown>) =>
@@ -90,44 +77,64 @@ export class Skills extends Context.Service<
           return yield* plugin(join(root, 'own', id), 'own', (skills) => Effect.forEach([...byName], ([name, target]) => fs.symlink(target, join(skills, name)), { discard: true }))
         })
 
-      const fromRepo = (key: string, sha: string) =>
+      const fromRepo = (key: string) =>
         Effect.gen(function* () {
-          const skills = repoSkills(yield* git.lsTree(key, sha, []))
+          const sha = yield* git.revParse(key, `origin/${yield* git.defaultBranch(key)}`)
+          const blobs = yield* git.blobs(key, sha)
+          const skills = repoSkills(blobs.map((b) => b.path))
           if (skills.size === 0) return undefined
-          return yield* plugin(join(root, 'repo', key, sha), 'repo', (dir) =>
+          const files = [...skills].flatMap(([name, s]) => s.files.map((f) => ({ to: join(name, f), from: s.dir + f })))
+          const wanted = new Set(files.map((f) => f.from))
+          // Named by the skills' content, so a commit that leaves them alone reuses the folder.
+          const id = createHash('sha256').update(JSON.stringify(blobs.filter((b) => wanted.has(b.path)))).digest('hex').slice(0, 16)
+          const dir = yield* plugin(join(root, 'repo', key, id), 'repo', (skillsDir) =>
             Effect.forEach(
-              [...skills].flatMap(([name, s]) => s.files.map((f) => ({ to: join(dir, name, f), from: s.dir + f }))),
-              ({ to, from }) => Effect.andThen(fs.makeDirectory(dirname(to), { recursive: true }), Effect.flatMap(git.show(key, sha, from), (text) => fs.writeFileString(to, text))),
+              files,
+              ({ to, from }) =>
+                Effect.andThen(fs.makeDirectory(dirname(join(skillsDir, to)), { recursive: true }), Effect.flatMap(git.show(key, sha, from), (text) => fs.writeFileString(join(skillsDir, to), text))),
               { concurrency: 8, discard: true },
             ),
           )
+          // ponytail: a session still reading an older folder loses its skills' files; keep the last few if that bites.
+          const older = (yield* fs.readDirectory(join(root, 'repo', key))).filter((n) => n !== id)
+          yield* Effect.forEach(older, (n) => fs.remove(join(root, 'repo', key, n), { recursive: true, force: true }), { discard: true })
+          return dir
         })
       // One build per key at a time; a failed build is tried again next session.
       const builds = yield* Cache.makeWith((spec: string) => {
-        const [kind, a, b] = JSON.parse(spec) as [string, string, string]
-        return (kind === 'repo' ? fromRepo(a, b) : own(JSON.parse(a) as Record<string, string>)).pipe(
+        const [kind, a] = JSON.parse(spec) as [string, string]
+        return (kind === 'repo' ? fromRepo(a) : own(JSON.parse(a) as Record<string, string>)).pipe(
           Effect.tapCause((cause) => Effect.logWarning(`Skills for review agents not loaded: ${cause}`)),
           Effect.orElseSucceed(() => undefined),
         )
-      }, { capacity: 64, timeToLive: (exit: Exit.Exit<string | undefined>) => (Exit.isSuccess(exit) && exit.value !== undefined ? Infinity : 0) })
+        // A repo's skills are looked up again for each session, for a push to its default branch.
+      }, { capacity: 64, timeToLive: (exit: Exit.Exit<string | undefined>, spec: string) => (spec.startsWith('["repo"') || !Exit.isSuccess(exit) || exit.value === undefined ? 0 : Infinity) })
 
-      const repoPlugin = (cwd: string) =>
-        Effect.gen(function* () {
-          if (!cwd.startsWith(repos) || !cwd.endsWith('.git')) return undefined
-          const key = relative(repos, cwd).slice(0, -'.git'.length)
-          const sha = yield* git.revParse(key, `origin/${yield* git.defaultBranch(key)}`)
-          return yield* Cache.get(builds, JSON.stringify(['repo', key, sha]))
-        }).pipe(Effect.orElseSucceed(() => undefined))
+      /** Lets Reads into each skill of `plugins`, wherever its folder really is. */
+      const allow = (plugins: ReadonlyArray<string>) =>
+        Effect.forEach(plugins, (p) =>
+          Effect.flatMap(Effect.orElseSucceed(fs.readDirectory(join(p, 'skills')), () => []), (names) =>
+            Effect.forEach(names, (n) => Effect.map(Effect.option(fs.realPath(join(p, 'skills', n))), (real) => real._tag === 'Some' && void readableRoots.add(real.value))),
+          ),
+        )
 
       return Skills.of({
-        root,
-        plugins: (account, cwd) =>
-          Effect.map(Effect.all([Cache.get(builds, JSON.stringify(['own', JSON.stringify(account.env), ''])), repoPlugin(cwd)], { concurrency: 2 }), (ps) =>
-            ps.filter((p): p is string => p !== undefined),
+        plugins: (account, repo) =>
+          Effect.all([Cache.get(builds, JSON.stringify(['own', JSON.stringify(account.env)])), repo ? Cache.get(builds, JSON.stringify(['repo', repo])) : Effect.undefined], { concurrency: 2 }).pipe(
+            Effect.map((ps) => ps.filter((p): p is string => p !== undefined)),
+            Effect.tap(allow),
           ),
+        readable: (path) => {
+          try {
+            const real = realpathSync(path)
+            return [...readableRoots].some((r) => real.startsWith(r + sep))
+          } catch {
+            return false
+          }
+        },
       })
     }),
   )
 
-  static readonly layerTest = (plugins: ReadonlyArray<string> = []) => Layer.succeed(Skills, Skills.of({ root: '/skills', plugins: () => Effect.succeed(plugins) }))
+  static readonly layerTest = (plugins: ReadonlyArray<string> = []) => Layer.succeed(Skills, Skills.of({ plugins: () => Effect.succeed(plugins), readable: () => false }))
 }

@@ -390,6 +390,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
           prompt: [ruleInstructions, guidanceSection(master, guidance), `# Review comment (untrusted)\n${text}`].join('\n\n'),
           schema: AgentRule,
           cwd: git.dir(repoKey),
+          repo: repoKey,
           log: { kind: 'rule', owner: ref.owner, repo: ref.repo, number: ref.number, headSha: '' },
         })
         if (!inGuidance(drafted.path, review.guidance)) return yield* new AgentError({ message: `Claude picked a file outside the review guidance: ${drafted.path}` })
