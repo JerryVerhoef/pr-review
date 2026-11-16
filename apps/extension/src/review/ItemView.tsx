@@ -1,7 +1,7 @@
 import type { Decision, DecisionState, FindingStates, PrOpinion, PrRef, PrView, Rereview } from '@pr-review/domain'
 import { useState } from 'react'
 import { Streamdown } from 'streamdown'
-import { Button, Kbd, Pill } from '../ui/index.tsx'
+import { Button, Kbd, Pill, Working } from '../ui/index.tsx'
 import { CommentBox } from './CommentBox.tsx'
 import { Description } from './Description.tsx'
 import { DecisionFindings, VerdictPill } from './Findings.tsx'
@@ -80,6 +80,8 @@ export function ItemView(props: {
   onNext?: () => void
   /** Claude's finished opinion on the PR, with what the reviewer did with each finding. */
   opinion?: { opinion: PrOpinion; states: FindingStates } | undefined
+  /** The opinion is still coming in; decisions it doesn't have yet are being judged. */
+  judging?: boolean
 }) {
   const { item, pr } = props
   // Sorts from before renames were detected list a moved file under both paths.
@@ -167,8 +169,11 @@ export function ItemView(props: {
         </div>
       )}
       {item.kind === 'skim' && <p className="mb-3 text-muted-foreground">{item.area.summary}</p>}
-      {opinionId !== undefined && props.opinion && (
-        <DecisionFindings prRef={props.prRef} headSha={pr.headSha} prNumber={pr.number} decisionId={opinionId} opinion={take} states={props.opinion.states} />
+      {opinionId !== undefined && !take && props.judging ? (
+        <Working className="mb-3" step="Claude is judging this decision" />
+      ) : (
+        opinionId !== undefined &&
+        props.opinion && <DecisionFindings prRef={props.prRef} headSha={pr.headSha} prNumber={pr.number} decisionId={opinionId} opinion={take} states={props.opinion.states} />
       )}
       {item.kind === 'trusted' && <p className="mb-3 text-muted-foreground">{item.group.why}</p>}
       {item.kind === 'description' && <Description prRef={props.prRef} />}

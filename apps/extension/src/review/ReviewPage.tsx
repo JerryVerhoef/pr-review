@@ -2,7 +2,7 @@ import { RegistryContext, useAtomSet, useAtomValue } from '@effect/atom-react'
 import type { DecisionState, DecisionStates, OpinionEvent, PrRef, PrView, ReviewEvent } from '@pr-review/domain'
 import { useHotkeys } from '@tanstack/react-hotkeys'
 import { AsyncResult } from 'effect/reactivity'
-import { useContext, useEffect, useMemo, useState } from 'react'
+import { useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useAtoms } from '../atoms.ts'
 import { useRemembered } from '../remembered.ts'
 import { failureOf, isUnavailable } from '../result.ts'
@@ -13,7 +13,7 @@ import { Sidebar } from '../shell/Sidebar.tsx'
 import { TopBar } from '../shell/TopBar.tsx'
 import { Button, Spinner } from '../ui/index.tsx'
 import { ChatPanel } from './ChatPanel.tsx'
-import { buildItems, isOpen, itemId, nextOpen, stackMoved, startAt } from './items.ts'
+import { buildItems, isOpen, type Item, itemId, nextOpen, stackMoved, startAt } from './items.ts'
 import { ItemView } from './ItemView.tsx'
 import { Preparing } from './Preparing.tsx'
 
@@ -71,11 +71,19 @@ function Ready({ prRef, pr, review, sortError, focus, onProgress }: { prRef: PrR
   const cached = AsyncResult.isSuccess(cachedResult) && cachedResult.value._tag === 'Done' ? cachedResult.value : undefined
   const done = cached ?? (review?.opinion ? { opinion: review.opinion, states: review.findingStates } : undefined)
   const opinionError = review?.opinionError
+  const judging = review?.judging === true
   // Idle offers the run: on demand, or when only a carried opinion is here. A failed opinion has its own retry line.
-  const opinion: OpinionEvent | undefined = opinionError || !review ? undefined : done ? { _tag: 'Done', ...done } : { _tag: 'Idle' }
+  const opinion: OpinionEvent | undefined = opinionError || !review || judging ? undefined : done ? { _tag: 'Done', ...done } : { _tag: 'Idle' }
   const [runningOpinion, setRunningOpinion] = useState(false)
   const [retrying, setRetrying] = useState(false)
-  const items = useMemo(() => buildItems(pr, review), [pr, review])
+  // Opinions that come in while the page is open fill in; they don't reorder what the reviewer is already reading.
+  const built = useRef<{ review: ReviewDone | undefined; items: ReadonlyArray<Item> }>(undefined)
+  const items = useMemo(() => {
+    const before = built.current
+    const next = before?.review?.judging && review && before.review.sort.headSha === review.sort.headSha ? before.items : buildItems(pr, review)
+    built.current = { review, items: next }
+    return next
+  }, [pr, review])
   const openFindings = done ? done.opinion.decisions.flatMap((d) => d.findings).filter((f) => isOpen(f, done.states)) : []
 
   const [selectedKey, setSelectedKey] = useRemembered<string | undefined>(`at:${prRef.host}/${prRef.owner}/${prRef.repo}#${prRef.number}`, undefined)
@@ -164,6 +172,7 @@ function Ready({ prRef, pr, review, sortError, focus, onProgress }: { prRef: PrR
         onReviewOpenChange={setReviewOpen}
         opinion={opinion}
         running={runningOpinion}
+        judging={judging ? { judged: done?.opinion.decisions.length ?? 0, total: review!.sort.quick ? 1 : review!.sort.decisions.length } : undefined}
         onRunOpinion={() => setRunningOpinion(true)}
         onOpinionDone={() => {
           setRunningOpinion(false)
@@ -241,6 +250,7 @@ function Ready({ prRef, pr, review, sortError, focus, onProgress }: { prRef: PrR
             onCommentDone={() => setCommentingOn(undefined)}
             {...(index < items.length - 1 ? { onNext: () => select(index + 1) } : {})}
             opinion={done}
+            judging={judging}
           />
         </main>
         {chatOpen && decision && <ChatPanel key={decision.id} prRef={prRef} headSha={pr.headSha} decision={decision} focus={chatFocus} />}
