@@ -7,14 +7,15 @@ const decodeLine = Schema.decodeUnknownOption(Schema.fromJsonString(PerformanceE
 export const parseLog = (text: string, since = 0): PerformanceEvent[] =>
   text.split('\n').flatMap((line) => Option.toArray(Option.filter(decodeLine(line), (e) => Date.parse(e.timestamp) >= since)))
 
-/** `7d`, `24h`, `30m` before `now`, or a date; 0 (everything) when empty. */
-export const parseSince = (since: string, now = Date.now()): number => {
-  if (!since) return 0
+const UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 }
+
+/** `7d`, `24h`, `30m` before `now`, or a date; 0 (everything) when empty. None when it is neither. */
+export const parseSince = (since: string, now = Date.now()): Option.Option<number> => {
+  if (!since) return Option.some(0)
   const rel = /^(\d+)([mhd])$/.exec(since)
-  if (rel) return now - Number(rel[1]) * { m: 60_000, h: 3_600_000, d: 86_400_000 }[rel[2] as 'm' | 'h' | 'd']
+  if (rel) return Option.some(now - Number(rel[1]) * UNIT_MS[rel[2] as keyof typeof UNIT_MS])
   const at = Date.parse(since)
-  if (Number.isNaN(at)) throw new Error(`--since takes 7d, 24h, 30m or a date, not ${since}`)
-  return at
+  return Number.isNaN(at) ? Option.none() : Option.some(at)
 }
 
 export type Stats = { n: number; total: number; avg: number; p50: number; p95: number; max: number }
@@ -44,11 +45,7 @@ export const correlation = (pairs: ReadonlyArray<readonly [number, number]>): nu
   return sxx && syy ? sxy / Math.sqrt(sxx * syy) : undefined
 }
 
-const childrenOf = (events: ReadonlyArray<PerformanceEvent>) => {
-  const children = new Map<string, PerformanceEvent[]>()
-  for (const e of events) if (e.parentId) children.set(e.parentId, [...(children.get(e.parentId) ?? []), e])
-  return children
-}
+const childrenOf = (events: ReadonlyArray<PerformanceEvent>) => Map.groupBy(events, (e) => e.parentId)
 
 /**
  * Each event's own time: its duration less the union of its direct children's intervals, so nested phases are
@@ -73,7 +70,7 @@ export const selfTimes = (events: ReadonlyArray<PerformanceEvent>): Map<string, 
   return self
 }
 
-const subtree = (root: PerformanceEvent, children: Map<string, PerformanceEvent[]>) => {
+const subtree = (root: PerformanceEvent, children: ReturnType<typeof childrenOf>) => {
   const out: PerformanceEvent[] = []
   const walk = (e: PerformanceEvent) => {
     out.push(e)
@@ -116,12 +113,6 @@ const table = (head: ReadonlyArray<string>, rows: ReadonlyArray<ReadonlyArray<st
   return cells.map((r) => '  ' + r.map((c, i) => (i === 0 ? c.padEnd(widths[i]!) : c.padStart(widths[i]!))).join('  ')).join('\n')
 }
 
-const groupBy = <K>(xs: ReadonlyArray<PerformanceEvent>, key: (e: PerformanceEvent) => K) => {
-  const out = new Map<K, PerformanceEvent[]>()
-  for (const e of xs) out.set(key(e), [...(out.get(key(e)) ?? []), e])
-  return out
-}
-
 const durationRow = (name: string, es: ReadonlyArray<PerformanceEvent>) => {
   const s = stats(es.map((e) => e.durationMs))
   const failed = es.filter((e) => e.status === 'error').length
@@ -130,7 +121,7 @@ const durationRow = (name: string, es: ReadonlyArray<PerformanceEvent>) => {
 }
 const durationHead = ['', 'n', 'err', 'cancel', 'avg', 'p50', 'p95', 'max']
 
-const byKind = (es: ReadonlyArray<PerformanceEvent>) => [...groupBy(es, (e) => e.kind)].sort(([a], [b]) => a.localeCompare(b)).map(([k, xs]) => durationRow(k, xs))
+const byKind = (es: ReadonlyArray<PerformanceEvent>) => [...Map.groupBy(es, (e) => e.kind)].sort(([a], [b]) => a.localeCompare(b)).map(([k, xs]) => durationRow(k, xs))
 
 /** The report `pr-review perf` prints. */
 export const summarize = (events: ReadonlyArray<PerformanceEvent>, o: { top?: number } = {}): string => {
@@ -148,7 +139,7 @@ export const summarize = (events: ReadonlyArray<PerformanceEvent>, o: { top?: nu
   out.push('', 'Operations, end to end (a nested operation also counts toward the one it runs in)', table(durationHead, byKind(operations)))
   out.push('', 'Agent turns by kind (the runs usage.jsonl times)', table(durationHead, byKind(phase('agent.turn'))))
 
-  const phases = [...groupBy(events, (e) => e.phase)].map(([p, es]) => {
+  const phases = [...Map.groupBy(events, (e) => e.phase)].map(([p, es]) => {
     const own = es.map((e) => self.get(e.spanId) ?? 0)
     const s = stats(es.map((e) => e.durationMs))
     return { p, n: es.length, wall: s.total, own: own.reduce((a, b) => a + b, 0), avg: s.avg, p95: s.p95, max: s.max }
@@ -169,7 +160,7 @@ export const summarize = (events: ReadonlyArray<PerformanceEvent>, o: { top?: nu
     'Agent prompts: tool time vs everything else (unclassified = model, the agent itself and the protocol; not told apart)',
     table(
       ['kind', 'n', 'prompt total', 'tools', 'unclassified', 'tools %', 'avg tools', 'first activity', 'first text', 'avg in tok', 'avg out tok'],
-      [...groupBy(prompts, (e) => e.kind)].map(([k, es]) => {
+      [...Map.groupBy(prompts, (e) => e.kind)].map(([k, es]) => {
         const total = es.reduce((s, e) => s + e.durationMs, 0)
         const tools = es.reduce((s, e) => s + (num(e, 'toolMs') ?? 0), 0)
         const avg = (key: string) => {
@@ -204,7 +195,7 @@ export const summarize = (events: ReadonlyArray<PerformanceEvent>, o: { top?: nu
     'Tool calls (from the agent announcing a call to its last status)',
     table(
       ['tool', 'n', 'total', 'avg', 'p95', 'max', 'failed', 'rejected'],
-      [...groupBy(tools, toolName)]
+      [...Map.groupBy(tools, toolName)]
         .map(([name, es]) => ({ name, es, s: stats(es.map((e) => e.durationMs)) }))
         .sort((a, b) => b.s.total - a.s.total)
         .map(({ name, es, s }) => [name, s.n, ms(s.total), ms(s.avg), ms(s.p95), ms(s.max), es.filter((e) => e.status === 'error').length, es.filter((e) => e.metadata?.permission === 'rejected').length]),
@@ -217,7 +208,7 @@ export const summarize = (events: ReadonlyArray<PerformanceEvent>, o: { top?: nu
     'Cache reads',
     table(
       ['store', 'reads', 'hits', 'hit rate'],
-      [...groupBy(reads, (e) => String(e.metadata?.store ?? '?'))].map(([store, es]) => {
+      [...Map.groupBy(reads, (e) => String(e.metadata?.store ?? '?'))].map(([store, es]) => {
         const hits = es.filter((e) => e.metadata?.hit === true).length
         return [store, es.length, hits, pct(hits / es.length)]
       }),
@@ -235,7 +226,7 @@ export const summarize = (events: ReadonlyArray<PerformanceEvent>, o: { top?: nu
 
   const MIN = 5
   const rows: Array<Array<string | number>> = []
-  for (const [kind, es] of groupBy(operations, (e) => e.kind)) {
+  for (const [kind, es] of Map.groupBy(operations, (e) => e.kind)) {
     if (es.length < MIN) continue
     const loads = es.map((e) => ({ d: e.durationMs, w: workload(subtree(e, children)) }))
     for (const metric of Object.keys(loads[0]!.w) as Array<keyof (typeof loads)[number]['w']>) {

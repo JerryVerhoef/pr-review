@@ -82,15 +82,18 @@ const perfCommand = Command.make(
   'perf',
   {
     file: Flag.String('file').pipe(Flag.withDefault(performanceFile(defaultCacheRoot)), Flag.withDescription('The performance log to read')),
-    since: Flag.String('since').pipe(Flag.withDefault(''), Flag.withDescription('Only events since then: 7d, 24h, 30m or a date')),
+    since: Flag.String('since').pipe(
+      Flag.withDefault(''),
+      Flag.filterMap((s) => parseSince(s), (s) => `--since takes 7d, 24h, 30m or a date, not ${s}`),
+      Flag.withDescription('Only events since then: 7d, 24h, 30m or a date'),
+    ),
     top: Flag.Int('top').pipe(Flag.withDefault(10), Flag.withDescription('How many of the slowest operations to list')),
   },
   ({ file, since, top }) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const text = yield* fs.readFileString(file).pipe(Effect.orElseSucceed(() => ''))
-      const from = yield* Effect.try({ try: () => parseSince(since), catch: (e) => (e as Error).message })
-      yield* Console.log(summarize(parseLog(text, from), { top }))
+      yield* Console.log(summarize(parseLog(text, since), { top }))
     }),
 ).pipe(Command.withDescription('Summarize the performance log: durations per operation and phase, tool calls, cache hits'))
 

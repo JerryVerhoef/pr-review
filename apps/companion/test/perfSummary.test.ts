@@ -1,4 +1,5 @@
 import { assert, describe, it } from '@effect/vitest'
+import { Option } from 'effect'
 import type { PerformanceEvent } from '../src/Perf.ts'
 import { correlation, parseLog, parseSince, selfTimes, stats, summarize } from '../src/perfSummary.ts'
 
@@ -35,9 +36,9 @@ describe('perfSummary', () => {
     const text = [JSON.stringify(ev({ phase: 'a', durationMs: 1 })), 'not json', '', JSON.stringify(ev({ phase: 'b', durationMs: 1, timestamp: '2020-01-01T00:00:00.000Z' }))].join('\n')
     assert.deepStrictEqual(parseLog(text).map((e) => e.phase), ['a', 'b'])
     assert.deepStrictEqual(parseLog(text, Date.parse('2025-01-01')).map((e) => e.phase), ['a'])
-    assert.strictEqual(parseSince('2d', 10 * 86_400_000), 8 * 86_400_000)
-    assert.strictEqual(parseSince(''), 0)
-    assert.throws(() => parseSince('soon'))
+    assert.deepStrictEqual(parseSince('2d', 10 * 86_400_000), Option.some(8 * 86_400_000))
+    assert.deepStrictEqual(parseSince(''), Option.some(0))
+    assert.isTrue(Option.isNone(parseSince('soon')))
   })
 
   it('reports operations, phases, prompts, tools, cache hits and the slowest runs', () => {

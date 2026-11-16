@@ -1,5 +1,4 @@
-import { Cause, Context, Duration, Effect, Exit, Layer, Option, Predicate, Schema, Stream, Tracer } from 'effect'
-import { appendFile, mkdir, rename, stat } from 'node:fs/promises'
+import { Cause, Context, Duration, Effect, Exit, Fiber, FileSystem, Layer, Option, Predicate, Queue, Schema, Stream, Tracer } from 'effect'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { Config } from './Config.ts'
@@ -203,49 +202,36 @@ export const makeTracer = (write: (e: PerformanceEvent) => void): Tracer.Tracer 
 }
 
 /**
- * Appends events to `path` off the hot path: lines are batched and written after the current tick. At most
- * `maxPending` lines wait (more are dropped), and a file past `maxBytes` is moved to `<path>.1` first. Write
- * errors drop the batch.
+ * Appends events to `path` from a fiber in the current scope, in batches. At most `maxPending` wait (more are
+ * dropped), a file past `maxBytes` is moved to `<path>.1` first, and a failed write drops its batch. What is queued
+ * when the scope closes is still written. Returns the tracer's `write`.
  */
-export const fileSink = (path: string, o: { maxBytes?: number; maxPending?: number } = {}) => {
-  const maxBytes = o.maxBytes ?? 20_000_000
-  const maxPending = o.maxPending ?? 2_000
-  let pending: string[] = []
-  let flushing: Promise<void> | undefined
-  let dirMade = false
-  const flush = async () => {
-    while (pending.length) {
-      const batch = pending.join('')
-      pending = []
-      try {
-        if (!dirMade) await mkdir(dirname(path), { recursive: true })
-        dirMade = true
-        if ((await stat(path).then((s) => s.size, () => 0)) > maxBytes) await rename(path, `${path}.1`)
-        await appendFile(path, batch)
-      } catch {
-        // Dropped: the log is best effort.
-      }
-    }
-  }
-  return {
-    write: (e: PerformanceEvent) => {
-      if (pending.length >= maxPending) return
-      pending.push(JSON.stringify(e) + '\n')
-      flushing ??= new Promise<void>((resolve) => setImmediate(resolve)).then(flush).finally(() => (flushing = undefined))
-    },
-    /** Resolves when everything written so far is on disk (or dropped). */
-    drain: async () => {
-      while (flushing) await flushing
-    },
-  }
-}
+export const fileSink = Effect.fnUntraced(function* (path: string, o: { maxBytes?: number; maxPending?: number } = {}) {
+  const fs = yield* FileSystem.FileSystem
+  const maxBytes = BigInt(o.maxBytes ?? 20_000_000)
+  const queue = yield* Queue.dropping<PerformanceEvent, Cause.Done>(o.maxPending ?? 2_000)
+  const append = (batch: ReadonlyArray<PerformanceEvent>) =>
+    Effect.gen(function* () {
+      yield* fs.makeDirectory(dirname(path), { recursive: true })
+      const size = yield* fs.stat(path).pipe(
+        Effect.map((s) => s.size),
+        Effect.orElseSucceed(() => 0n),
+      )
+      if (size > maxBytes) yield* fs.rename(path, `${path}.1`)
+      yield* fs.writeFileString(path, batch.map((e) => JSON.stringify(e) + '\n').join(''), { flag: 'a' })
+    }).pipe(Effect.ignore)
+  const writer = yield* Queue.takeAll(queue).pipe(Effect.flatMap(append), Effect.forever, Effect.ignore, Effect.forkScoped)
+  yield* Effect.addFinalizer(() => Effect.andThen(Queue.end(queue), Fiber.join(writer)))
+  return (e: PerformanceEvent) => void Queue.offerUnsafe(queue, e)
+})
 
 export const performanceFile = (cacheRoot: string) => join(cacheRoot, 'performance.jsonl')
 
 /** The tracer writing to `performance.jsonl` in the cache root. */
-export const PerfLive = Layer.unwrap(
+export const PerfLive = Layer.effect(
+  Tracer.Tracer,
   Effect.gen(function* () {
     const { cacheRoot } = yield* Config
-    return Layer.succeed(Tracer.Tracer, makeTracer(fileSink(performanceFile(cacheRoot)).write))
+    return makeTracer(yield* fileSink(performanceFile(cacheRoot)))
   }),
 )

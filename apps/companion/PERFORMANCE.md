@@ -14,7 +14,7 @@ node apps/companion/src/main.ts perf --file /path/to/performance.jsonl   # from 
 
 How writing works:
 
-- Events are batched and appended after the current tick. Nothing in a review waits on the disk.
+- Events go on a bounded queue that a background fiber appends to the file in batches. Nothing in a review waits on the disk, and what is queued when the companion stops is still written.
 - At most 2,000 lines wait to be written; anything more is dropped.
 - When the file passes 20 MB it is moved to `performance.jsonl.1`, replacing the previous one. Disk use stays under about 40 MB.
 - A failed write drops that batch. Logging can never fail or slow a review, and the tests cover this.

@@ -5,6 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { annotate, fileSink, makeTracer, measure, type PerformanceEvent } from '../src/Perf.ts'
 import { tmp } from './helpers.ts'
+import { NodeServices } from '@effect/platform-node'
 import { TestClock } from 'effect/testing'
 
 /** A tracer collecting events; under `it.effect` the clock only moves when `tick` says. */
@@ -152,36 +153,37 @@ describe('Perf tracer', () => {
 describe('fileSink', () => {
   const event = (n: number): PerformanceEvent => ({ timestamp: 't', operationId: 'o', spanId: `s${n}`, offsetMs: 0, kind: 'k', phase: 'p', durationMs: n, status: 'success' })
 
+  // Closing the scope writes what is queued.
+  const sunk = (path: string, use: (write: (e: PerformanceEvent) => void) => Effect.Effect<void>, o?: { maxBytes?: number; maxPending?: number }) =>
+    Effect.scoped(Effect.flatMap(fileSink(path, o), use)).pipe(Effect.provide(NodeServices.layer))
+
   it.live('appends one JSON line per event', () =>
-    Effect.promise(async () => {
+    Effect.gen(function* () {
       const path = join(tmp(), 'nested', 'performance.jsonl')
-      writeFileSync(join(path, '..', '..', 'keep'), '')
-      const sink = fileSink(path)
-      sink.write(event(1))
-      sink.write(event(2))
-      await sink.drain()
-      sink.write(event(3))
-      await sink.drain()
+      yield* sunk(path, (write) =>
+        Effect.gen(function* () {
+          write(event(1))
+          write(event(2))
+          yield* Effect.sleep('20 millis')
+          write(event(3))
+        }),
+      )
       const lines = readFileSync(path, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as PerformanceEvent)
       assert.deepStrictEqual(lines.map((l) => l.durationMs), [1, 2, 3])
     }))
 
   it.live('drops what does not fit the buffer instead of growing it', () =>
-    Effect.promise(async () => {
+    Effect.gen(function* () {
       const path = join(tmp(), 'performance.jsonl')
-      const sink = fileSink(path, { maxPending: 2 })
-      for (let i = 1; i <= 5; i++) sink.write(event(i))
-      await sink.drain()
+      yield* sunk(path, (write) => Effect.sync(() => { for (let i = 1; i <= 5; i++) write(event(i)) }), { maxPending: 2 })
       assert.strictEqual(readFileSync(path, 'utf8').trim().split('\n').length, 2)
     }))
 
   it.live('moves a full file aside before appending', () =>
-    Effect.promise(async () => {
+    Effect.gen(function* () {
       const path = join(tmp(), 'performance.jsonl')
       writeFileSync(path, 'x'.repeat(100))
-      const sink = fileSink(path, { maxBytes: 50 })
-      sink.write(event(1))
-      await sink.drain()
+      yield* sunk(path, (write) => Effect.sync(() => write(event(1))), { maxBytes: 50 })
       assert.strictEqual(readFileSync(`${path}.1`, 'utf8'), 'x'.repeat(100))
       assert.strictEqual(JSON.parse(readFileSync(path, 'utf8')).spanId, 's1')
     }))
@@ -191,10 +193,10 @@ describe('fileSink', () => {
       const dir = tmp()
       writeFileSync(join(dir, 'file'), '')
       // A directory under a regular file can't be made.
-      const sink = fileSink(join(dir, 'file', 'performance.jsonl'))
-      const result = yield* Effect.succeed('sorted').pipe(measure('operation', op), Effect.withTracer(makeTracer(sink.write)))
-      yield* Effect.promise(sink.drain)
+      const path = join(dir, 'file', 'performance.jsonl')
+      let result = ''
+      yield* sunk(path, (write) => Effect.succeed('sorted').pipe(measure('operation', op), Effect.withTracer(makeTracer(write)), Effect.map((r) => void (result = r))))
       assert.strictEqual(result, 'sorted')
-      assert.isFalse(existsSync(join(dir, 'file', 'performance.jsonl')))
+      assert.isFalse(existsSync(path))
     }))
 })
