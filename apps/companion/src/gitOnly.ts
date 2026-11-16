@@ -1,47 +1,48 @@
+import { type Command, parse, type Word } from 'unbash'
+
 const SAFE_GIT = new Set(['show', 'grep', 'log', 'diff', 'ls-tree', 'cat-file'])
-// Outside quotes: anything that lets a shell run a second command, redirect, expand or escape.
-const SHELL_META = /[;&|<>`$\\]/
 // Agents reach for `| head` constantly; refusing it costs a whole round trip.
-const PAGER = /^\s*(head|tail)(\s+-n\s*\d+|\s+-\d+)?\s*$/
+const PAGER_ARGS = /^(?:|-\d+|-n ?\d+)$/
 
 /**
- * The words bash would pass, or undefined when the command is anything but words and quotes, one trailing
- * `| head`/`| tail` aside. Quoted text is literal (`"a\|b"`, `'$x'`, `"->x("`), except `$` and backquotes in double quotes.
+ * A word's text as bash passes it, or undefined when bash would expand it (variables, commands, globs, braces) or it
+ * has an escape outside quotes.
  */
-const words = (command: string): ReadonlyArray<string> | undefined => {
-  if (/[\n\r]/.test(command)) return undefined
-  const out: string[] = []
-  // `started`: an empty quoted word ('') is still a word.
-  let word = ''
-  let started = false
-  let quote: string | undefined
-  for (let i = 0; i < command.length; i++) {
-    const c = command[i]!
-    if (quote === "'") {
-      if (c === "'") quote = undefined
-      else word += c
-    } else if (quote === '"') {
-      if (c === '"') quote = undefined
-      else if (c === '$' || c === '`') return undefined
-      else if (c === '\\' && '$`"\\'.includes(command[i + 1] ?? '')) word += command[++i]!
-      else word += c
-    } else if (c === "'" || c === '"') {
-      quote = c
-      started = true
-    } else if (c === ' ' || c === '\t') {
-      if (started) out.push(word)
-      word = ''
-      started = false
-    } else if (c === '|' && PAGER.test(command.slice(i + 1))) break
-    else if (SHELL_META.test(c)) return undefined
-    else {
-      word += c
-      started = true
-    }
+const literal = (w: Word): string | undefined => {
+  if (!w.parts) return w.text === w.value ? w.value : undefined
+  let out = ''
+  for (const p of w.parts) {
+    if ((p.type === 'Literal' && p.text === p.value) || p.type === 'SingleQuoted') out += p.value
+    else if (p.type === 'DoubleQuoted' && p.parts.every((c) => c.type === 'Literal')) out += p.parts.map((c) => c.value).join('')
+    else return undefined
   }
-  if (quote) return undefined
-  if (started) out.push(word)
   return out
+}
+
+/** A plain command's words, or undefined when it assigns, redirects or expands anything. */
+const commandWords = (c: Command) => {
+  if (c.prefix.length || !c.name) return undefined
+  const out: string[] = []
+  for (const w of [c.name, ...c.suffix]) {
+    const text = w.type === 'Word' ? literal(w) : undefined
+    if (text === undefined) return undefined
+    out.push(text)
+  }
+  return out
+}
+
+/** The words of a single plain command, one trailing `| head`/`| tail` aside; undefined for any other shell. */
+const words = (command: string): ReadonlyArray<string> | undefined => {
+  // Bash reads a CR as part of a word; refused anyway, since no read needs one.
+  if (/[\0-\x08\n-\x1f]/.test(command)) return undefined
+  const script = parse(command)
+  const node = script.commands.length === 1 && !script.errors?.length && !script.commands[0]!.background ? script.commands[0]!.command : undefined
+  if (node?.type === 'Command') return commandWords(node)
+  if (node?.type !== 'Pipeline' || node.prefixes.length || node.operators.join() !== '|') return undefined
+  const [first, pager] = node.commands
+  const tail = pager?.type === 'Command' ? commandWords(pager) : undefined
+  if (first?.type !== 'Command' || !tail || !['head', 'tail'].includes(tail[0]!) || !PAGER_ARGS.test(tail.slice(1).join(' '))) return undefined
+  return commandWords(first)
 }
 
 // Git accepts any unambiguous prefix of a long option, so `--outp` means `--output`.
@@ -89,6 +90,3 @@ export const safeGhCommand = (raw: string, related: ReadonlyArray<string>) => {
   const repo = GH_PATHS.map((r) => r.exec(path!)?.[1]).find(Boolean)
   return repo !== undefined && related.some((r) => r.toLowerCase() === `${host}/${repo}`.toLowerCase())
 }
-
-export const gitOnlyMessage =
-  'Only read-only git commands (show, grep, log, diff, ls-tree, cat-file) are allowed, optionally piped into head or tail; no other shell syntax, --output, --no-index or -O. Do not cd; you are already in the repo.'

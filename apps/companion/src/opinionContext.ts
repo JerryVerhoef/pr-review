@@ -14,7 +14,7 @@ export const guidanceSection = (master: string, guidance: ReadonlyArray<string>)
 
 export const relatedSection = (related: ReadonlyArray<RelatedRepo>) =>
   related.length
-    ? `# Related repos (services this team owns; read-only through gh api, default branch only, never clone)\n${related.map((r) => `${r.repo}: ${r.note}`).join('\n')}\nRead with: gh api --hostname <host> -H 'Accept: application/vnd.github.raw' repos/<owner>/<repo>/contents/<file>\nList with: gh api --hostname <host> repos/<owner>/<repo>/git/trees/HEAD?recursive=1\nSearch with: gh api --hostname <host> 'search/code?q=<terms>+repo:<owner>/<repo>' (terms: letters, digits, _ . - joined by +)\nAlways pass --hostname, github.com included. Cite what you read as ref "related" with the repo set.`
+    ? `# Related repos (services this team owns; read-only through gh api, default branch only, never clone)\n${related.map((r) => `${r.repo}: ${r.note}`).join('\n')}\nRead with: gh api --hostname <host> -H 'Accept: application/vnd.github.raw' repos/<owner>/<repo>/contents/<file>\nList with: gh api --hostname <host> 'repos/<owner>/<repo>/git/trees/HEAD?recursive=1'\nSearch with: gh api --hostname <host> 'search/code?q=<terms>+repo:<owner>/<repo>' (terms: letters, digits, _ . - joined by +)\nAlways pass --hostname, github.com included. Cite what you read as ref "related" with the repo set.`
     : '# Related repos\n(none)'
 
 export const ticketSection = (ticket: TicketSummary, without: string) =>
