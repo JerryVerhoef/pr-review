@@ -1,7 +1,7 @@
 import { assert, describe, it } from '@effect/vitest'
 import { AgentError, type AgentOpinion, type AgentSort, type Decision, type FileStat, ReviewRejected, ReviewRpcs, RepoNotConfigured, type StackEntry } from '@pr-review/domain'
 import { NodeServices } from '@effect/platform-node'
-import { Effect, Fiber, Layer, Logger, Stream } from 'effect'
+import { Effect, Fiber, Layer, Logger, Stream, Tracer } from 'effect'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { KeyValueStore } from 'effect/persistence'
@@ -11,6 +11,7 @@ import { Config } from '../src/Config.ts'
 import { Git } from '../src/Git.ts'
 import { CompanionRpcs, HandlersLive, LoggedLive } from '../src/handlers.ts'
 import { Opiner } from '../src/Opiner.ts'
+import { makeTracer, type PerformanceEvent } from '../src/Perf.ts'
 import { contentIds } from '../src/opinionContext.ts'
 import { Overview } from '../src/Overview.ts'
 import { Reviewer } from '../src/Reviewer.ts'
@@ -154,6 +155,24 @@ describe('handlers', () => {
       assert.deepStrictEqual(last.entries.map((e) => [e.pr.number, e.status]), [[7, 'done'], [8, 'done']])
       assert.deepStrictEqual(last.overview, overviewReply)
     }).pipe(Effect.scoped))
+
+  it.live('a tracer provided around the server measures what the handlers run, stack work nested under the stack', () =>
+    Effect.gen(function* () {
+      const events: PerformanceEvent[] = []
+      yield* Effect.gen(function* () {
+        const { client } = setup({ github: { listOpenPrs: () => Effect.succeed([entry(8, 'feat', 'feat2'), entry(7, 'master', 'feat')]) } })
+        const c = yield* client
+        yield* Stream.runCollect(c.Stack({ ref: { ...ref, number: 8 } }))
+      }).pipe(Effect.scoped, Effect.provide(Layer.succeed(Tracer.Tracer, makeTracer((e) => void events.push(e)))))
+      const stack = events.find((e) => e.phase === 'operation' && e.kind === 'stack')!
+      const nested = events.filter((e) => e.phase === 'operation' && e.kind !== 'stack')
+      // The bottom PR's review is prepared too, under the stack.
+      assert.deepStrictEqual(nested.map((e) => e.kind).sort(), ['overview', 'review', 'sort', 'sort', 'stack-opinion'])
+      for (const e of nested) assert.strictEqual(e.operationId, stack.spanId)
+      assert.deepStrictEqual(nested.filter((e) => e.kind === 'sort').map((e) => e.prNumber).sort(), [7, 8])
+      assert.isTrue(events.some((e) => e.phase === 'cache.read' && e.metadata?.store === 'sort' && e.metadata.hit === false))
+      assert.isTrue(events.some((e) => e.phase === 'context.prepare' && e.kind === 'stack-opinion'))
+    }))
 
   it.live('stack opinion starts after every PR is sorted, once', () =>
     Effect.gen(function* () {

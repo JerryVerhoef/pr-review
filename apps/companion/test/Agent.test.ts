@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { Acp } from '../src/Acp.ts'
 import { Agent } from '../src/Agent.ts'
 import { Config } from '../src/Config.ts'
+import { makeTracer, type PerformanceEvent } from '../src/Perf.ts'
 import { tmp } from './helpers.ts'
 
 const log = { kind: 'sort' as const, owner: 'o', repo: 'r', number: 7, headSha: 'abc' }
@@ -175,6 +176,33 @@ describe('Agent.structured', () => {
       const line = JSON.parse(readFileSync(usagePath, 'utf8').trim())
       assert.strictEqual(line.account, 'Agent a')
       assert.strictEqual(line.kind, 'sort')
+    }))
+
+  it.live('measures the slot wait, the turn and the decode, and keeps the usage line as it was', () =>
+    Effect.gen(function* () {
+      const { layer, usagePath } = setup((_a, p) => Effect.succeed(p.startsWith('That answer') ? '{"ok": true}' : '{"ok": 1}'))
+      const events: PerformanceEvent[] = []
+      yield* structured().pipe(Effect.provide(layer), Effect.withTracer(makeTracer((e) => void events.push(e))))
+      const acquire = events.find((e) => e.phase === 'agent.acquire')!
+      const turn = events.find((e) => e.phase === 'agent.turn')!
+      const decodes = events.filter((e) => e.phase === 'agent.response')
+      assert.deepInclude(acquire.metadata!, { account: 'a', waited: false, busySlots: 0, slots: 2 })
+      assert.deepInclude(turn, { kind: 'sort', owner: 'o', repo: 'r', prNumber: 7, headSha: 'abc', agent: 'custom', model: 'default', status: 'success' })
+      assert.deepInclude(turn.metadata!, { account: 'a', modelChoice: 'main', schemaRetry: true })
+      assert.deepStrictEqual(decodes.map((d) => [d.parentId, d.status]), [
+        [turn.spanId, 'error'],
+        [turn.spanId, 'success'],
+      ])
+      assert.deepStrictEqual(Object.keys(JSON.parse(readFileSync(usagePath, 'utf8').trim())), ['at', 'kind', 'owner', 'repo', 'number', 'headSha', 'account', 'agent', 'durationMs'])
+    }))
+
+  it.live('a performance log that throws never fails the run', () =>
+    Effect.gen(function* () {
+      const { layer } = setup(() => Effect.succeed('{"ok": true}'))
+      const broken = makeTracer(() => {
+        throw new Error('disk full')
+      })
+      assert.deepStrictEqual(yield* structured().pipe(Effect.provide(layer), Effect.withTracer(broken)), { ok: true })
     }))
 })
 

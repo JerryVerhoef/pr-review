@@ -1,14 +1,14 @@
 import { AgentSort, type AgentError, type FileStat, type GitError, type GitHubError, type PrRef, type RepoNotConfigured, type SortResult } from '@pr-review/domain'
 import { Context, Deferred, Effect, Exit, Fiber, Layer, type Stream } from 'effect'
-import { PersistedCache } from 'effect/persistence'
 import { readFileSync } from 'node:fs'
 import { Agent } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { normalize } from './normalize.ts'
+import { annotate, measure } from './Perf.ts'
 import { makeSteps } from './steps.ts'
-import { cacheOptions, peek, poke, SortKey, storeFailuresDie } from './Store.ts'
+import { cacheOptions, measuredCache, peek, poke, SortKey, storeFailuresDie } from './Store.ts'
 import { buildTrusted } from './trusted.ts'
 
 const instructions = readFileSync(new URL('../prompts/sort.md', import.meta.url), 'utf8')
@@ -78,8 +78,18 @@ export class Sorter extends Context.Service<
             ? `# Diff\nDiff too large; read files with git show ${head}:<path> and compare with git diff ${mergeBase} ${head} -- <path>`
             : `# Diff\n${diff}`,
         ].join('\n\n')
+        yield* annotate({
+          files: files.length,
+          additions: files.reduce((n, f) => n + f.additions, 0),
+          deletions: files.reduce((n, f) => n + f.deletions, 0),
+          trustedFiles: files.length - rest.length,
+          diffBytes: Buffer.byteLength(diff),
+          diffInlined: diff.length <= review.maxDiffKb * 1000,
+          guidanceFiles: guidance.length,
+          promptBytes: Buffer.byteLength(prompt),
+        })
         return { prompt, cwd: git.dir(repoKey), files, finish: (answer) => normalize(answer, files, groups, head, review.neverTrust, mergeBase) } satisfies SortPrompt
-      })
+      }, measure('context.prepare'))
 
       const run = Effect.fn('Sorter.run')(function* (key: SortKey) {
         const { owner, repo, number, headSha } = key
@@ -88,9 +98,9 @@ export class Sorter extends Context.Service<
         const sorted = yield* agent.structured({ prompt: p.prompt, schema: AgentSort, cwd: p.cwd, log: { kind: 'sort', owner, repo, number, headSha }, onStep: report })
         yield* report('Checking the answer')
         return p.finish(sorted)
-      })
+      }, (effect, key) => measure('operation', { kind: 'sort', owner: key.owner, repo: key.repo, prNumber: key.number, headSha: key.headSha })(effect))
 
-      const cache = yield* PersistedCache.make(run, { storeId: 'sort', ...cacheOptions })
+      const cache = yield* measuredCache(run, { storeId: 'sort', ...cacheOptions })
       const read = yield* peek('sort')
       const write = yield* poke('sort')
       const scope = yield* Effect.scope
@@ -120,7 +130,7 @@ export class Sorter extends Context.Service<
         sort: (ref, headSha) =>
           Effect.flatMap(claim(ref, headSha), (c) =>
             'running' in c
-              ? c.running
+              ? c.running.pipe(measure('sort.join'))
               : // In the layer's scope, so a closed page never interrupts a sort someone else is waiting on.
                 Effect.flatMap(Effect.forkIn(storeFailuresDie(cache.get(new SortKey({ ...ref, headSha }))).pipe(Effect.onExit(c.done)), scope), Fiber.join),
           ),

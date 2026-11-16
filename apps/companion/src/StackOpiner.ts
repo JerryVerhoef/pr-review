@@ -1,6 +1,5 @@
 import { AgentError, AgentStackOpinion, type Evidence, type Finding, type PrRef, repoSettings, type StackOpinion, type StackOverview } from '@pr-review/domain'
 import { Context, Effect, Layer, Stream } from 'effect'
-import { PersistedCache } from 'effect/persistence'
 import { readFileSync } from 'node:fs'
 import { Agent } from './Agent.ts'
 import { checkFinding } from './citations.ts'
@@ -8,11 +7,12 @@ import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { anchorHunks, anchorIn, Opiner } from './Opiner.ts'
+import { annotate, measure } from './Perf.ts'
 import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection } from './opinionContext.ts'
 import { type SortError, Sorter } from './Sorter.ts'
 import { buildStack } from './stack.ts'
 import { makeSteps } from './steps.ts'
-import { cacheOptions, OverviewKey, peek, StackOpinionKey, storeFailuresDie } from './Store.ts'
+import { cacheOptions, measuredCache, OverviewKey, peek, StackOpinionKey, storeFailuresDie } from './Store.ts'
 import { Tickets } from './Tickets.ts'
 
 const instructions = readFileSync(new URL('../prompts/stack-opinion.md', import.meta.url), 'utf8')
@@ -62,100 +62,117 @@ export class StackOpiner extends Context.Service<
         const repoKey = `${host}/${owner}/${repo}`
         const report = steps.report(idOf(key))
         yield* report('Reading the stack')
-        const settings = yield* config.settings
-        const gh = yield* github.forHost(host)
-        const open = yield* gh.listOpenPrs(owner, repo)
-        const stack = heads.flatMap((h) => open.filter((p) => p.number === h.number).map((p) => ({ ...p, headSha: h.headSha })))
-        const top = stack.at(-1)
-        if (!top) return yield* new AgentError({ message: 'This stack has no open PRs' })
+        const { prs, related, prompt, first, top } = yield* Effect.gen(function* () {
+          const settings = yield* config.settings
+          const gh = yield* github.forHost(host)
+          const open = yield* gh.listOpenPrs(owner, repo)
+          const stack = heads.flatMap((h) => open.filter((p) => p.number === h.number).map((p) => ({ ...p, headSha: h.headSha })))
+          const top = stack.at(-1)
+          if (!top) return yield* new AgentError({ message: 'This stack has no open PRs' })
 
-        const prs = yield* Effect.forEach(
-          stack,
-          (entry) =>
-            Effect.gen(function* () {
-              const prRef = { host, owner, repo, number: entry.number }
-              const { mergeBase } = yield* git.fetchPr(repoKey, entry.number, entry.baseRef, entry.headSha)
-              const [files, sort, opinion] = yield* Effect.all([git.numstat(repoKey, mergeBase, entry.headSha), sorter.cached(prRef, entry.headSha), opiner.cached(prRef, entry.headSha)], {
-                concurrency: 3,
-              })
-              return { entry, mergeBase, files, sort, opinion }
-            }),
-          { concurrency: 4 },
-        )
-        const master = `origin/${yield* git.defaultBranch(repoKey)}`
-        const { related } = repoSettings(settings, repoKey)
-        const { review } = settings
-        const [guidance, ticket, overview] = yield* Effect.all(
-          [
-            review.guidance.length ? git.lsTree(repoKey, master, review.guidance) : Effect.succeed([]),
-            Effect.flatMap(gh.getPr(owner, repo, top.number), (pr) => tickets.summary({ host, owner, repo, number: top.number }, pr)),
-            // Keyed like the Stack handler keys it: the sorted PRs, bottom first; only their numbers and heads make the key.
-            readOverview(new OverviewKey({ host, owner, repo, entries: prs.flatMap((p) => (p.sort ? [{ number: p.entry.number, headSha: p.entry.headSha, sort: p.sort, files: p.files }] : [])) })),
-          ],
-          { concurrency: 3 },
-        )
+          const prs = yield* Effect.forEach(
+            stack,
+            (entry) =>
+              Effect.gen(function* () {
+                const prRef = { host, owner, repo, number: entry.number }
+                const { mergeBase } = yield* git.fetchPr(repoKey, entry.number, entry.baseRef, entry.headSha)
+                const [files, sort, opinion] = yield* Effect.all([git.numstat(repoKey, mergeBase, entry.headSha), sorter.cached(prRef, entry.headSha), opiner.cached(prRef, entry.headSha)], {
+                  concurrency: 3,
+                })
+                return { entry, mergeBase, files, sort, opinion }
+              }),
+            { concurrency: 4 },
+          )
+          const master = `origin/${yield* git.defaultBranch(repoKey)}`
+          const { related } = repoSettings(settings, repoKey)
+          const { review } = settings
+          const [guidance, ticket, overview] = yield* Effect.all(
+            [
+              review.guidance.length ? git.lsTree(repoKey, master, review.guidance) : Effect.succeed([]),
+              Effect.flatMap(gh.getPr(owner, repo, top.number), (pr) => tickets.summary({ host, owner, repo, number: top.number }, pr)),
+              // Keyed like the Stack handler keys it: the sorted PRs, bottom first; only their numbers and heads make the key.
+              readOverview(new OverviewKey({ host, owner, repo, entries: prs.flatMap((p) => (p.sort ? [{ number: p.entry.number, headSha: p.entry.headSha, sort: p.sort, files: p.files }] : [])) })),
+            ],
+            { concurrency: 3 },
+          )
 
-        const existing = prs.flatMap((p) => {
-          const findings = p.opinion?.decisions.flatMap((d) => d.findings) ?? []
-          return findings.length ? [[`#${p.entry.number}`, ...findings.map((f) => `- [${f.severity}] ${f.title}`)].join('\n')] : []
-        })
-        const prompt = [
-          instructions,
-          `# Refs\nDefault branch: ${master}\n${prs.map((p) => `#${p.entry.number} head ${p.entry.headSha}, merge base ${p.mergeBase}`).join('\n')}`,
-          guidanceSection(master, guidance),
-          relatedSection(related),
-          ticketSection(ticket, 'skip the Spec axis'),
-          `# Stack overview\n${overview ? overviewText(overview) : '(none)'}`,
-          `# PRs (bottom first)\n${prs.map((p) => describePr(p.entry, p.sort, p.files)).join('\n\n')}`,
-          `# Existing PR opinions (already reported; don't repeat them)\n${existing.join('\n\n') || '(none)'}`,
-        ].join('\n\n')
+          const existing = prs.flatMap((p) => {
+            const findings = p.opinion?.decisions.flatMap((d) => d.findings) ?? []
+            return findings.length ? [[`#${p.entry.number}`, ...findings.map((f) => `- [${f.severity}] ${f.title}`)].join('\n')] : []
+          })
+          const prompt = [
+            instructions,
+            `# Refs\nDefault branch: ${master}\n${prs.map((p) => `#${p.entry.number} head ${p.entry.headSha}, merge base ${p.mergeBase}`).join('\n')}`,
+            guidanceSection(master, guidance),
+            relatedSection(related),
+            ticketSection(ticket, 'skip the Spec axis'),
+            `# Stack overview\n${overview ? overviewText(overview) : '(none)'}`,
+            `# PRs (bottom first)\n${prs.map((p) => describePr(p.entry, p.sort, p.files)).join('\n\n')}`,
+            `# Existing PR opinions (already reported; don't repeat them)\n${existing.join('\n\n') || '(none)'}`,
+          ].join('\n\n')
+          yield* annotate({
+            prs: prs.length,
+            files: prs.reduce((n, p) => n + p.files.length, 0),
+            additions: prs.reduce((n, p) => n + p.files.reduce((m, f) => m + f.additions, 0), 0),
+            deletions: prs.reduce((n, p) => n + p.files.reduce((m, f) => m + f.deletions, 0), 0),
+            sortsCached: prs.filter((p) => p.sort).length,
+            opinionsCached: prs.filter((p) => p.opinion).length,
+            overviewCached: overview !== undefined,
+            ticket: ticket.text !== null,
+            guidanceFiles: guidance.length,
+            promptBytes: Buffer.byteLength(prompt),
+          })
+          return { prs, related, prompt, first: stack[0]!, top }
+        }).pipe(measure('context.prepare'))
 
         const answer = yield* agent.structured({
           prompt,
           schema: AgentStackOpinion,
           cwd: git.dir(repoKey),
           related: related.map((r) => r.repo),
-          log: { kind: 'stack-opinion', owner, repo, number: stack[0]!.number, headSha: top.headSha },
+          log: { kind: 'stack-opinion', owner, repo, number: first.number, headSha: top.headSha },
           onStep: report,
         })
 
         yield* report('Checking the citations')
-        const byPr = new Map(prs.map((p) => [p.entry.number, p]))
-        const order = prs.map((p) => p.entry.number)
-        const kept = answer.findings.filter((f) => byPr.has(f.pr))
-        const ids = contentIds('stack:', kept.map((f) => `${f.pr}\n${f.title}\n${f.take}`))
-        const hunks = new Map(
-          yield* Effect.forEach(prs, (p) =>
-            Effect.map(
-              anchorHunks(git, repoKey, p.mergeBase, p.entry.headSha, p.files, kept.flatMap((f) => (f.pr === p.entry.number && f.anchor ? [f.anchor.path] : []))),
-              (h) => [p.entry.number, h] as const,
+        const findings = yield* Effect.gen(function* () {
+          const byPr = new Map(prs.map((p) => [p.entry.number, p]))
+          const order = prs.map((p) => p.entry.number)
+          const kept = answer.findings.filter((f) => byPr.has(f.pr))
+          const ids = contentIds('stack:', kept.map((f) => `${f.pr}\n${f.title}\n${f.take}`))
+          const hunks = new Map(
+            yield* Effect.forEach(prs, (p) =>
+              Effect.map(
+                anchorHunks(git, repoKey, p.mergeBase, p.entry.headSha, p.files, kept.flatMap((f) => (f.pr === p.entry.number && f.anchor ? [f.anchor.path] : []))),
+                (h) => [p.entry.number, h] as const,
+              ),
             ),
-          ),
-        )
-        const findings = yield* Effect.forEach(
-          kept,
-          (f, i) => {
-            const at = (e: Evidence) => {
-              const p = byPr.get(e.pr ?? f.pr)
-              return p && (e.ref === 'head' ? p.entry.headSha : p.mergeBase)
-            }
-            return Effect.map(
-              checkFinding(f, citationReader(git, github, repoKey, related, at)),
-              (checked): Finding => ({
-                ...checked,
-                id: ids[i]!,
-                pr: f.pr,
-                decisionId: null,
-                anchor: anchorIn(hunks.get(f.pr)!, checked.anchor),
-                handledIn: checked.handledIn !== null && order.indexOf(checked.handledIn) > order.indexOf(f.pr) ? checked.handledIn : null,
-              }),
-            )
-          },
-        )
+          )
+          return yield* Effect.forEach(
+            kept,
+            (f, i) => {
+              const at = (e: Evidence) => {
+                const p = byPr.get(e.pr ?? f.pr)
+                return p && (e.ref === 'head' ? p.entry.headSha : p.mergeBase)
+              }
+              return Effect.map(
+                checkFinding(f, citationReader(git, github, repoKey, related, at)),
+                (checked): Finding => ({
+                  ...checked,
+                  id: ids[i]!,
+                  pr: f.pr,
+                  decisionId: null,
+                  anchor: anchorIn(hunks.get(f.pr)!, checked.anchor),
+                  handledIn: checked.handledIn !== null && order.indexOf(checked.handledIn) > order.indexOf(f.pr) ? checked.handledIn : null,
+                }),
+              )
+            },
+          )
+        }).pipe(measure('agent.response', { step: 'finish' }, (f: ReadonlyArray<Finding>) => ({ findings: f.length, citations: f.reduce((n, x) => n + x.evidence.length, 0) })))
         return { heads: Object.fromEntries(heads.map((h) => [h.number, h.headSha])), findings } satisfies StackOpinion
-      })
+      }, (effect, k) => measure('operation', { kind: 'stack-opinion', owner: k.owner, repo: k.repo, prNumber: k.heads[0]?.number, headSha: k.heads.at(-1)?.headSha })(effect))
 
-      const cache = yield* PersistedCache.make(run, { storeId: 'stack-opinion', ...cacheOptions })
+      const cache = yield* measuredCache(run, { storeId: 'stack-opinion', ...cacheOptions })
       const read = yield* peek('stack-opinion')
       return StackOpiner.of({
         cached: (ref) => keyFor(ref).pipe(Effect.flatMap(read), Effect.orElseSucceed(() => undefined)),

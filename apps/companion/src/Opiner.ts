@@ -1,19 +1,19 @@
 import { AgentError, AgentOpinion, type Decision, type DecisionOpinion, type Evidence, type FileStat, type GitError, type PrOpinion, type PrRef, repoSettings, type SortResult, type StackEntry } from '@pr-review/domain'
 import { Context, Effect, Layer, type Stream } from 'effect'
-import { PersistedCache } from 'effect/persistence'
 import { readFileSync } from 'node:fs'
 import { Agent } from './Agent.ts'
 import { checkFinding } from './citations.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
+import { annotate, measure } from './Perf.ts'
 import { type SortError, Sorter } from './Sorter.ts'
 import { hunkLines, nearestLine } from './interdiff.ts'
 import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection } from './opinionContext.ts'
 import { buildStack } from './stack.ts'
 import { Tickets } from './Tickets.ts'
 import { makeSteps } from './steps.ts'
-import { cacheOptions, DeeperKey, OpinionKey, peek, poke, storeFailuresDie } from './Store.ts'
+import { cacheOptions, DeeperKey, measuredCache, OpinionKey, peek, poke, storeFailuresDie } from './Store.ts'
 
 const bundledSkill = readFileSync(new URL('../prompts/review-skill/SKILL.md', import.meta.url), 'utf8')
 
@@ -175,6 +175,16 @@ export class Opiner extends Context.Service<
           [review.guidance.length ? git.lsTree(repoKey, master, review.guidance) : Effect.succeed([]), Effect.forEach(stack, describe, { concurrency: 4 })],
           { concurrency: 2 },
         )
+        yield* annotate({
+          files: files.length,
+          additions: files.reduce((n, f) => n + f.additions, 0),
+          deletions: files.reduce((n, f) => n + f.deletions, 0),
+          stackSize: stack.length,
+          above: above.length,
+          ticket: ticket.text !== null,
+          guidanceFiles: guidance.length,
+          customSkill: Boolean(skillPath),
+        })
 
         return {
           cwd: git.dir(repoKey),
@@ -186,7 +196,7 @@ export class Opiner extends Context.Service<
               const paths = files.filter((f) => inDecisions.has(f.path)).flatMap((f) => (f.previous ? [f.previous, f.path] : [f.path]))
               // A diff git can't make is left for the agent to read itself.
               const diff = o.continued || !paths.length ? '' : yield* git.diff(repoKey, mergeBase, head, paths).pipe(Effect.orElseSucceed(() => undefined))
-              return [
+              const text = [
                 skill,
                 `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`,
                 guidanceSection(master, guidance),
@@ -204,7 +214,13 @@ export class Opiner extends Context.Service<
                     : `# Diff\n${diff || '(no decision files)'}`,
                 ...(o.deep ? ['# Depth\nTake your time on this one decision; read every file it touches in full.'] : []),
               ].join('\n\n')
-            }),
+              yield* annotate({
+                diffBytes: diff === undefined ? undefined : Buffer.byteLength(diff),
+                diffInlined: !o.continued && diff !== undefined && diff.length <= review.maxDiffKb * 1000,
+                promptBytes: Buffer.byteLength(text),
+              })
+              return text
+            }).pipe(measure('context.prompt', { decisions: decisions.length, continued: Boolean(o.continued), deep: Boolean(o.deep) })),
           finish: (answer, decisions, deep = false) =>
             Effect.gen(function* () {
               const read = citationReader(git, github, repoKey, related, (e) => (e.ref === 'base' ? mergeBase : head))
@@ -212,9 +228,14 @@ export class Opiner extends Context.Service<
               const hunks = yield* anchorHunks(git, repoKey, mergeBase, head, files, anchorPaths)
               const normalized = yield* normalize(answer, { number, decisions, deep, hunks, above: above.map((e) => e.number), read })
               return { headSha: head, ticket: ticket.text, ticketNote: ticket.note, decisions: normalized, stackHeads: headsOf(above) } satisfies PrOpinion
-            }),
+            }).pipe(
+              measure('agent.response', { step: 'finish', decisions: decisions.length }, (o: PrOpinion) => ({
+                findings: o.decisions.reduce((n, d) => n + d.findings.length, 0),
+                citations: o.decisions.reduce((n, d) => n + d.findings.reduce((m, f) => m + f.evidence.length, 0), 0),
+              })),
+            ),
         } satisfies OpinionContext
-      })
+      }, measure('context.prepare'))
 
       const analyse = Effect.fn('Opiner.run')(function* (key: { host: string; owner: string; repo: string; number: number; headSha: string }, only?: string) {
         const { host, owner, repo, number, headSha } = key
@@ -238,14 +259,15 @@ export class Opiner extends Context.Service<
         return yield* c.finish(answer, decisions, only !== undefined)
       })
 
-      const run = (key: OpinionKey) => analyse(key)
+      const operation = (kind: string, key: OpinionKey | DeeperKey) => measure('operation', { kind, owner: key.owner, repo: key.repo, prNumber: key.number, headSha: key.headSha })
+      const run = (key: OpinionKey) => analyse(key).pipe(operation('opinion', key))
       const runDeeper = (key: DeeperKey) =>
         Effect.flatMap(analyse(key, key.decisionId), (o) => {
           const d = o.decisions.find((x) => x.decisionId === key.decisionId)
           return d ? Effect.succeed(d) : Effect.fail(new AgentError({ message: `The agent gave no opinion on decision ${key.decisionId}` }))
-        })
-      const cache = yield* PersistedCache.make(run, { storeId: 'opinion', ...cacheOptions })
-      const deeperCache = yield* PersistedCache.make(runDeeper, { storeId: 'deeper', ...cacheOptions })
+        }).pipe(operation('deeper', key))
+      const cache = yield* measuredCache(run, { storeId: 'opinion', ...cacheOptions })
+      const deeperCache = yield* measuredCache(runDeeper, { storeId: 'deeper', ...cacheOptions })
       const read = yield* peek('opinion')
       const readDeeper = yield* peek('deeper')
       const write = yield* poke('opinion')

@@ -6,6 +6,7 @@ import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { judged, type OpinionContext, Opiner, quickDecision } from './Opiner.ts'
+import { annotate, measure } from './Perf.ts'
 import { type SortError, Sorter } from './Sorter.ts'
 import { Store } from './Store.ts'
 import { type TicketSummary, Tickets } from './Tickets.ts'
@@ -85,14 +86,24 @@ export class Reviewer extends Context.Service<
         const [files, checks] = yield* Effect.all([git.numstat(repoKey, mergeBase, head), gh.getChecks(ref.owner, ref.repo, head)], { concurrency: 2 })
         const { groups, rest } = buildTrusted(files, checks, settings.review.likelyTrusted, settings.review.neverTrust)
         const lines = rest.reduce((n, f) => n + f.additions + f.deletions, 0)
+        yield* annotate({
+          files: files.length,
+          additions: files.reduce((n, f) => n + f.additions, 0),
+          deletions: files.reduce((n, f) => n + f.deletions, 0),
+          reviewLines: lines,
+          quick: lines < smallPrLines(settings),
+        })
         if (lines >= smallPrLines(settings)) return undefined
 
         const contextFiber = yield* Effect.forkChild(opiner.context(ref, headSha))
         yield* t.end('fetch', 'done')
         yield* t.begin('quick', `Reading the change: ${lines} lines in ${plural(rest.length, 'file')}`)
         if (!ticket.pollUnsafe()) yield* t.worker('quick', 0, (w) => ({ ...w, step: 'Reading the ticket' }))
-        yield* Fiber.join(ticket)
-        const c = yield* Fiber.join(contextFiber).pipe(Effect.onError(() => t.end('quick', 'failed')))
+        yield* Fiber.join(ticket).pipe(measure('context.wait', { on: 'ticket' }))
+        const c = yield* Fiber.join(contextFiber).pipe(
+          measure('context.wait', { on: 'context' }),
+          Effect.onError(() => t.end('quick', 'failed')),
+        )
         const changes = quickDecision({ skim: [{ area: 'Changes', summary: '', files: rest.map((f) => f.path) }] })
         const prompt = `${yield* c.prompt([changes])}\n\n${quickInstructions}`
         const options: SessionOptions = {
@@ -139,10 +150,12 @@ export class Reviewer extends Context.Service<
       const work = Effect.fnUntraced(function* (ref: PrRef, headSha: string, t: Tracker) {
         const automatic = opinionsMode(yield* config.settings) === 'automatic'
         const [cachedSort, cachedOpinion] = yield* Effect.all([sorter.cached(ref, headSha), opiner.cached(ref, headSha)])
+        yield* annotate({ automatic, sortCached: cachedSort !== undefined, opinionCached: cachedOpinion !== undefined })
         if (cachedSort && (cachedOpinion || !automatic)) return { sort: cachedSort, opinion: cachedOpinion ?? null } satisfies Review
         if (cachedSort) return yield* prepared(ref, headSha, t, cachedSort, cachedOpinion)
         // A sort started elsewhere (the stack page, say) is joined, so one head never has two sorts with different decision ids.
         const claim = yield* sorter.claim(ref, headSha)
+        yield* annotate({ sortJoined: 'running' in claim })
         if ('running' in claim) return yield* prepared(ref, headSha, t, undefined, cachedOpinion, claim.running)
         return yield* prepared(ref, headSha, t, undefined, cachedOpinion).pipe(Effect.onExit((exit) => claim.done(Exit.map(exit, (r) => r.sort))))
       })
@@ -168,7 +181,7 @@ export class Reviewer extends Context.Service<
         if (running) {
           yield* t.end('fetch', 'done')
           yield* t.begin('sort', `Sorting #${ref.number}: joining the sort already running`)
-          cachedSort = yield* running
+          cachedSort = yield* running.pipe(measure('sort.join'))
           yield* t.end('sort', 'done')
           if (cachedOpinion || !automatic) {
             yield* Fiber.interrupt(ticket)
@@ -243,7 +256,7 @@ export class Reviewer extends Context.Service<
             yield* named(main, account)
             if (!contextFiber.pollUnsafe())
               yield* t.worker('opinion', 0, (w) => step(w, ticket.pollUnsafe() ? 'Reading the stack and review guidance' : 'Reading the ticket'))
-            const got = yield* Effect.result(Fiber.join(contextFiber))
+            const got = yield* Effect.result(Fiber.join(contextFiber).pipe(measure('context.wait', { on: 'context' })))
             if (got._tag === 'Failure') return void (opinionError = got.failure.message)
             const c = (context = got.success)
             // A quick sort's one decision gets the main model, as on the quick path.
@@ -251,6 +264,7 @@ export class Reviewer extends Context.Service<
             const lo = sort.quick ? [] : decisions.filter((d) => impact(d) === 'low')
             const other = decisions.length > 4 && hi.length && lo.length ? (yield* agent.idle()).find((a) => a.id !== account.id) : undefined
             main.judging = other ? hi : [...hi, ...lo]
+            yield* annotate({ decisions: decisions.length, highDecisions: hi.length, lowDecisions: lo.length, splitAccounts: other !== undefined })
 
             const side: Slot = { phase: 'opinion', worker: 1, judging: lo }
             // Never waits for a slot; without one the low group runs here after the high one.
@@ -309,6 +323,7 @@ export class Reviewer extends Context.Service<
         const t = tracker(phases)
         yield* Effect.forkIn(
           work(ref, headSha, t).pipe(
+            measure('operation', { kind: 'review', owner: ref.owner, repo: ref.repo, prNumber: ref.number, headSha }),
             Effect.onError(() => t.failRunning),
             Effect.onExit((exit) => Effect.andThen(Deferred.done(done, exit), Effect.sync(() => void runs.delete(key)))),
           ),

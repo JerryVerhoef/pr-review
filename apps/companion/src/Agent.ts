@@ -3,6 +3,7 @@ import { Clock, Context, Effect, FileSystem, Layer, Result, Schema, Scope, Strea
 import { dirname, join } from 'node:path'
 import { Acp, type AcpSession } from './Acp.ts'
 import { Config } from './Config.ts'
+import { annotate, measure, measureStream } from './Perf.ts'
 
 export type RunLog = { kind: 'sort' | 'ask' | 'chat' | 'overview' | 'opinion' | 'deeper' | 'stack-opinion' | 'ticket' | 'rule'; owner: string; repo: string; number: number; headSha: string }
 type Opts = { cwd: string; related?: ReadonlyArray<string>; /** Only `deep` accounts when the pool has any, else the whole pool. */ prefer?: 'deep'; log: RunLog; onStep?: (step: string) => Effect.Effect<void> }
@@ -95,6 +96,13 @@ export class Agent extends Context.Service<
               const load = (a: AgentAccount) => stateOf(a.id).busy / Math.max(1, a.concurrency)
               const free = ready.filter((a) => tickets || stateOf(a.id).busy < a.concurrency).sort((a, b) => load(a) - load(b))[0]
               if (free) {
+                yield* annotate({
+                  account: free.id,
+                  waited: waiting,
+                  busySlots: pool.reduce((n, a) => n + stateOf(a.id).busy, 0),
+                  slots: pool.reduce((n, a) => n + a.concurrency, 0),
+                  tickets,
+                })
                 stateOf(free.id).busy++
                 return free
               }
@@ -103,7 +111,7 @@ export class Agent extends Context.Service<
               waiting = true
               yield* Effect.sleep('500 millis')
             }
-          }),
+          }).pipe(measure('agent.acquire')),
           (a) => Effect.sync(() => void stateOf(a.id).busy--),
         )
 
@@ -123,7 +131,7 @@ export class Agent extends Context.Service<
           effect.pipe(
             Effect.timeoutOrElse({
               duration: `${review.timeoutMinutes} minutes`,
-              orElse: () => Effect.fail(new AgentError({ message: `${a.name} took longer than ${review.timeoutMinutes} minutes` })),
+              orElse: () => Effect.andThen(annotate({ timedOut: true }), Effect.fail(new AgentError({ message: `${a.name} took longer than ${review.timeoutMinutes} minutes` }))),
             }),
           ),
         )
@@ -136,9 +144,19 @@ export class Agent extends Context.Service<
           yield* fs.writeFileString(usagePath, JSON.stringify(line) + '\n', { flag: 'a' })
         }).pipe(Effect.ignore)
 
+      const turnMeta = (log: RunLog, a: AgentAccount) => ({
+        kind: log.kind,
+        owner: log.owner,
+        repo: log.repo,
+        prNumber: log.number,
+        headSha: log.headSha || undefined,
+        agent: a.agent,
+        account: a.id,
+      })
+
       /** One turn on an account: under the time limit, with a usage line. */
       const turn = <A, R>(log: RunLog, a: AgentAccount, effect: Effect.Effect<A, AgentError, R>) =>
-        Effect.flatMap(Clock.currentTimeMillis, (startedAt) => timeLimit(a, effect).pipe(Effect.ensuring(logUsage(log, a, startedAt))))
+        Effect.flatMap(Clock.currentTimeMillis, (startedAt) => timeLimit(a, effect).pipe(Effect.ensuring(logUsage(log, a, startedAt)))).pipe(measure('agent.turn', turnMeta(log, a)))
 
       /** Runs on one account after another until one answers or none is left; an account that hits its limit sits out. */
       const withAccount = <A>(o: Opts & { noWait?: boolean }, use: (a: AgentAccount) => Effect.Effect<A, AgentError, Scope.Scope>, tickets = false, avoid: ReadonlySet<string> = new Set()) => {
@@ -212,12 +230,14 @@ export class Agent extends Context.Service<
                     Effect.gen(function* () {
                       const s = yield* open
                       yield* toModel(s, model)
-                      const decode = (text: string) => Schema.decodeUnknownEffect(Schema.fromJsonString(schema))(jsonIn(text))
+                      yield* annotate({ modelChoice: model, model: (model === 'fast' && a.fastModel) || a.model || s.defaultModel })
+                      const decode = (text: string) =>
+                        Schema.decodeUnknownEffect(Schema.fromJsonString(schema))(jsonIn(text)).pipe(measure('agent.response', { step: 'decode', responseBytes: Buffer.byteLength(text) }))
                       const first = yield* ask(s, prompt + jsonInstruction(schema))
                       return yield* decode(first).pipe(
                         // One chance to fix it, in the same session.
                         Effect.catch((e) =>
-                          Effect.flatMap(ask(s, `That answer does not match the schema: ${e.message}\nReply with only the corrected JSON object.`), (second) =>
+                          Effect.flatMap(Effect.andThen(annotate({ schemaRetry: true }), ask(s, `That answer does not match the schema: ${e.message}\nReply with only the corrected JSON object.`)), (second) =>
                             decode(second).pipe(Effect.mapError((e2) => new AgentError({ message: `${a.name} returned output that does not match the schema: ${e2.message}` }))),
                           ),
                         ),
@@ -249,6 +269,7 @@ export class Agent extends Context.Service<
             Effect.gen(function* () {
               const a = yield* acquire(o, new Set(), owner)
               const session = yield* acp.open(a, o.cwd, sessionId)
+              yield* annotate({ agent: a.agent, account: a.id, model: a.model || session.defaultModel })
               const startedAt = yield* Clock.currentTimeMillis
               return session.prompt(o.prompt).pipe(
                 Stream.filterMapEffect((u) =>
@@ -259,7 +280,7 @@ export class Agent extends Context.Service<
                 Stream.ensuring(logUsage(o.log, a, startedAt)),
               )
             }),
-          ).pipe(Stream.scoped)
+          ).pipe(Stream.scoped, measureStream('agent.turn', { kind: o.log.kind, owner: o.log.owner, repo: o.log.repo, prNumber: o.log.number, headSha: o.log.headSha || undefined, resumed: o.resume !== undefined }))
         },
 
         ticket: (o) =>
@@ -274,7 +295,10 @@ export class Agent extends Context.Service<
                     a,
                     Effect.flatMap(acp.open(a, cwd, undefined, { tickets: true }), (session) =>
                       Effect.andThen(
-                        o.model === 'fast' && a.fastModel ? session.setModel(a.fastModel) : Effect.void,
+                        Effect.andThen(
+                          annotate({ modelChoice: o.model ?? 'main', model: (o.model === 'fast' && a.fastModel) || a.model || session.defaultModel }),
+                          o.model === 'fast' && a.fastModel ? session.setModel(a.fastModel) : Effect.void,
+                        ),
                         session.prompt(o.prompt).pipe(Stream.runFold(() => '', (acc, u) => (u._tag === 'Text' ? acc + u.delta : acc))),
                       ),
                     ),

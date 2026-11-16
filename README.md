@@ -76,6 +76,7 @@ Keys: `j`/`k` move, `a` accepts, `p` pushes back, `⌘J` discusses, `⌘K` jumps
 | `~/.cache/pr-review/repos/<host>/<owner>/<repo>.git` | Bare clones |
 | `~/.cache/pr-review/store` | Cached sorts, overviews, patches, decision states, chat sessions |
 | `~/.cache/pr-review/usage.jsonl` | One line per agent run: account, agent, duration |
+| `~/.cache/pr-review/performance.jsonl` | Timings per phase of each review: git, context, slot waits, ACP, prompts, tool calls, cache hits. `pr-review perf` summarizes it; see [PERFORMANCE.md](apps/companion/PERFORMANCE.md) |
 | `~/.cache/pr-review/host.log` | Companion log |
 
 Sorts are cached per head commit, so a new push sorts again. To clear the cache, delete `~/.cache/pr-review/store` (this also clears decision states and chat sessions). Deleting a clone makes the next review clone it again.
