@@ -24,6 +24,10 @@ const LIMITED = /usage limit|rate.?limit|quota|too many requests|\b429\b|limit r
 const LOGIN = /not logged in|authenticat|log ?in/i
 // ponytail: a fixed sit-out; parse the agent's own "resets at" time if it proves too long or short
 const LIMITED_FOR = 30 * 60_000
+// Most of a turn is the model thinking; low effort halved sort and opinion time with the same decisions found.
+// Dig deeper, ask, chat and rule drafts keep the agent's own level.
+const LOW_EFFORT: ReadonlySet<RunLog['kind']> = new Set(['sort', 'opinion', 'overview', 'stack-opinion', 'ticket'])
+const effortFor = (kind: RunLog['kind']) => (LOW_EFFORT.has(kind) ? 'low' : undefined)
 const LOGIN_FOR = 5 * 60_000
 
 /** Agents get the schema in the prompt and answer with JSON; their own structured-output modes differ per agent. */
@@ -44,8 +48,8 @@ export class Agent extends Context.Service<
     structured<S extends Decodable>(o: Run & { schema: S }): Effect.Effect<S['Type'], AgentError>
     /** One account, one agent session, as many turns as `use` takes. A benched account reruns `use` on another. */
     session<A>(o: SessionOptions, use: (s: AgentTurns, account: AgentAccount) => Effect.Effect<A, AgentError>): Effect.Effect<A, AgentError>
-    /** Enabled accounts with free capacity that are not sitting out. */
-    idle(): Effect.Effect<ReadonlyArray<AgentAccount>>
+    /** Free slots across enabled accounts that are not sitting out. */
+    freeSlots(): Effect.Effect<number>
     /** `resume` is a Done event's sessionId; it names the account the conversation ran on. */
     streaming(o: Run & { resume?: string }): Stream.Stream<AskEvent, AgentError>
     /** One read-only turn on an account set to read tickets, in an empty temp dir; the answer text. `fast` as in session turns. */
@@ -193,7 +197,7 @@ export class Agent extends Context.Service<
               const scope = yield* Effect.scope
               // Opened in the first turn, so a one-turn run's time limit and usage line cover the open as before.
               const open = yield* Effect.cached(
-                acp.open(a, o.cwd, undefined, o.related ? { related: o.related } : undefined).pipe(Effect.tap(() => step(o, `${a.name} is reading the PR`)), Scope.provide(scope)),
+                acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind) }).pipe(Effect.tap(() => step(o, `${a.name} is reading the PR`)), Scope.provide(scope)),
               )
               let onFast = false
               const toModel = (s: AcpSession, model: 'fast' | 'main') => {
@@ -256,10 +260,10 @@ export class Agent extends Context.Service<
 
         session,
 
-        idle: () =>
+        freeSlots: () =>
           Effect.gen(function* () {
             const now = yield* Clock.currentTimeMillis
-            return (yield* config.settings).accounts.filter((a) => a.enabled && stateOf(a.id).busy < a.concurrency && stateOf(a.id).until <= now)
+            return (yield* config.settings).accounts.filter((a) => a.enabled && stateOf(a.id).until <= now).reduce((n, a) => n + Math.max(0, a.concurrency - stateOf(a.id).busy), 0)
           }),
 
         streaming: (o) => {
@@ -293,7 +297,7 @@ export class Agent extends Context.Service<
                   turn(
                     o.log,
                     a,
-                    Effect.flatMap(acp.open(a, cwd, undefined, { tickets: true }), (session) =>
+                    Effect.flatMap(acp.open(a, cwd, undefined, { tickets: true, effort: effortFor(o.log.kind) }), (session) =>
                       Effect.andThen(
                         Effect.andThen(
                           annotate({ modelChoice: o.model ?? 'main', model: (o.model === 'fast' && a.fastModel) || a.model || session.defaultModel }),

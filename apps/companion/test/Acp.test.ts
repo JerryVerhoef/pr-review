@@ -12,7 +12,7 @@ type Ask = (command: string, kind?: acp.ToolKind) => Promise<boolean>
 
 /** An ACP agent in-process: answers each prompt with `turn`, and records what the client asked of it. */
 const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp.StopReason | { stopReason: acp.StopReason; usage?: unknown }>; needsLogin?: boolean } = {}) => {
-  const seen = { modes: [] as string[], models: [] as string[], auth: [] as string[], resumed: [] as string[], prompts: [] as string[], meta: [] as unknown[] }
+  const seen = { modes: [] as string[], models: [] as string[], auth: [] as string[], resumed: [] as string[], prompts: [] as string[], meta: [] as unknown[], efforts: [] as string[] }
   let loggedIn = false
   const app = acp
     .agent({ name: 'fake' })
@@ -32,7 +32,10 @@ const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp
       return {
         sessionId: 'S1',
         modes: { currentModeId: 'agent', availableModes: [{ id: 'agent', name: 'Agent' }, { id: 'read-only', name: 'Read only' }] },
-        configOptions: [{ type: 'select', id: 'model', name: 'Model', currentValue: 'default', options: [{ value: 'default', name: 'Default' }] }],
+        configOptions: [
+          { type: 'select', id: 'model', name: 'Model', currentValue: 'default', options: [{ value: 'default', name: 'Default' }] },
+          { type: 'select', id: 'effort', name: 'Effort', category: 'thought_level', currentValue: 'high', options: [{ value: 'low', name: 'Low' }, { value: 'high', name: 'High' }] },
+        ],
       }
     })
     .onRequest(acp.methods.agent.session.resume, (ctx) => {
@@ -44,7 +47,7 @@ const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp
       return {}
     })
     .onRequest(acp.methods.agent.session.setConfigOption, (ctx) => {
-      seen.models.push(String(ctx.params.value))
+      ;(ctx.params.configId === 'effort' ? seen.efforts : seen.models).push(String(ctx.params.value))
       return { configOptions: [] }
     })
     .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
@@ -71,7 +74,7 @@ const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp
   return { app, seen }
 }
 
-const run = <A>(agent: ReturnType<typeof fakeAgent>, f: (s: AcpSession) => Effect.Effect<A, AgentError>, a: AgentAccount = account, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean }) =>
+const run = <A>(agent: ReturnType<typeof fakeAgent>, f: (s: AcpSession) => Effect.Effect<A, AgentError>, a: AgentAccount = account, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; effort?: string }) =>
   Effect.gen(function* () {
     const session = yield* (yield* Acp).open(a, '/repo', resume, o)
     return yield* f(session)
@@ -164,6 +167,15 @@ describe('Acp', () => {
       const defaults = yield* run(agent, (s) => Effect.as(Effect.all([s.setModel('big'), s.setModel('quick'), s.setModel('quick'), s.setModel('big')]), s.defaultModel), { ...account, model: 'big' })
       assert.strictEqual(defaults, 'default')
       assert.deepStrictEqual(agent.seen.models, ['big', 'quick', 'big'])
+    }))
+
+  it.live('sets the reasoning level the agent offers, and leaves it otherwise', () =>
+    Effect.gen(function* () {
+      for (const [effort, sent] of [['low', ['low']], ['high', []], ['turbo', []], [undefined, []]] as const) {
+        const agent = fakeAgent()
+        yield* run(agent, () => Effect.void, account, undefined, effort ? { effort } : {})
+        assert.deepStrictEqual(agent.seen.efforts, [...sent], String(effort))
+      }
     }))
 
   it.live('logs in with the agent’s own login when it asks, never with an API key', () =>
