@@ -90,7 +90,8 @@ export const judged = (sort: SortResult): ReadonlyArray<Decision> => (sort.quick
 export type OpinionContext = {
   cwd: string
   related: ReadonlyArray<string>
-  prompt(decisions: ReadonlyArray<Decision>, o?: { deep?: boolean; continued?: boolean }): Effect.Effect<string>
+  /** `brief`: a later turn in a session that already has the rest of the context. */
+  prompt(decisions: ReadonlyArray<Decision>, o?: { deep?: boolean; continued?: boolean; brief?: boolean }): Effect.Effect<string>
   /** Normalizes an answer on `decisions` (see `normalize`) into the PR's opinion. */
   finish(answer: AgentOpinion, decisions: ReadonlyArray<Decision>, deep?: boolean): Effect.Effect<PrOpinion, GitError>
 }
@@ -197,13 +198,17 @@ export class Opiner extends Context.Service<
               // A diff git can't make is left for the agent to read itself.
               const diff = o.continued || !paths.length ? '' : yield* git.diff(repoKey, mergeBase, head, paths).pipe(Effect.orElseSucceed(() => undefined))
               const text = [
-                skill,
-                `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`,
-                guidanceSection(master, guidance),
-                relatedSection(related),
-                ticketSection(ticket, 'judge the Spec axis from the PR description alone and say so'),
-                `# Stack (bottom first; compare a PR with the one below it using git diff <head below> <its head>)\n${stackText.join('\n\n') || '(not stacked)'}`,
-                `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
+                ...(o.brief
+                  ? ['Now these decisions, the same way.']
+                  : [
+                      skill,
+                      `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`,
+                      guidanceSection(master, guidance),
+                      relatedSection(related),
+                      ticketSection(ticket, 'judge the Spec axis from the PR description alone and say so'),
+                      `# Stack (bottom first; compare a PR with the one below it using git diff <head below> <its head>)\n${stackText.join('\n\n') || '(not stacked)'}`,
+                      `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
+                    ]),
                 `# Decisions\n${JSON.stringify(decisions)}`,
                 // Here, not in the skill: a repo's own skill must still show which decision is being judged.
                 '# Progress\nBefore you judge each decision, write a line `Judging: <decisionId>` on its own.',
@@ -220,7 +225,7 @@ export class Opiner extends Context.Service<
                 promptBytes: Buffer.byteLength(text),
               })
               return text
-            }).pipe(measure('context.prompt', { decisions: decisions.length, continued: Boolean(o.continued), deep: Boolean(o.deep) })),
+            }).pipe(measure('context.prompt', { decisions: decisions.length, continued: Boolean(o.continued), deep: Boolean(o.deep), brief: Boolean(o.brief) })),
           finish: (answer, decisions, deep = false) =>
             Effect.gen(function* () {
               const read = citationReader(git, github, repoKey, related, (e) => (e.ref === 'base' ? mergeBase : head))

@@ -12,12 +12,18 @@ export type SessionOptions = Opts & {
   avoid?: ReadonlySet<string>
   /** Each whole line of the agent's answer text as it streams. */
   onText?: (line: string) => Effect.Effect<void>
+  /** Each piece of the answer text as it streams. */
+  onDelta?: (delta: string) => Effect.Effect<void>
   /** Fail at once when no account has a free slot, instead of waiting for one. */
   noWait?: boolean
 }
 type Decodable = Schema.Top & { readonly DecodingServices: never }
 /** Turns in one agent session. `fast` runs on the account's fastModel when it has one; `main` (the default) on its main model. */
-export type AgentTurns = { structured<S extends Decodable>(prompt: string, schema: S, model?: 'fast' | 'main', turnKind?: RunLog['kind']): Effect.Effect<S['Type'], AgentError> }
+export type AgentTurns = {
+  structured<S extends Decodable>(prompt: string, schema: S, model?: 'fast' | 'main', turnKind?: RunLog['kind']): Effect.Effect<S['Type'], AgentError>
+  /** Starts the agent now, so the first turn doesn't wait for it. */
+  readonly ready: Effect.Effect<void, AgentError>
+}
 
 
 const LIMITED = /usage limit|rate.?limit|quota|too many requests|\b429\b|limit reached|hit your limit|resets? (at|in)/i
@@ -221,12 +227,16 @@ export class Agent extends Context.Service<
                     return Effect.forEach(parts, o.onText, { discard: true })
                   }
                   const answer = yield* s.prompt(text).pipe(
-                    Stream.runFoldEffect(() => '', (acc, u) => (u._tag === 'Text' ? Effect.as(lines(u.delta), acc + u.delta) : Effect.as(step(o, u.step), acc))),
+                    Stream.runFoldEffect(
+                      () => '',
+                      (acc, u) => (u._tag === 'Text' ? Effect.as(Effect.andThen(o.onDelta?.(u.delta) ?? Effect.void, lines(u.delta)), acc + u.delta) : Effect.as(step(o, u.step), acc)),
+                    ),
                   )
                   if (partial && o.onText) yield* o.onText(partial)
                   return answer
                 })
               const turns: AgentTurns = {
+                ready: Effect.asVoid(open),
                 structured: (prompt, schema, model = 'main', turnKind) =>
                   turn(
                     turnKind ? { ...o.log, kind: turnKind } : o.log,

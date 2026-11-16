@@ -42,7 +42,7 @@ Only short tokens get logged: numbers, booleans, and strings of up to 80 charact
 
 | Phase | Where | Metadata |
 | --- | --- | --- |
-| `operation` | A whole review (`Reviewer`), sort run, opinion run, overview, stack opinion, stack walk | `concurrentOperations` (operations running at its start, nested ones included). A review adds `sortCached`, `opinionCached`, `sortJoined`, `quick`, `reviewLines`, `files`, `decisions`, `highDecisions`, `lowDecisions`, `opinionGroups` (turns the opinion is split into), `freeSlots` (account slots free when it was split). |
+| `operation` | A whole review (`Reviewer`), sort run, opinion run, overview, stack opinion, stack walk | `concurrentOperations` (operations running at its start, nested ones included). A review adds `sortCached`, `opinionCached`, `sortJoined`, `quick`, `reviewLines`, `files`, `decisions`, `highDecisions`, `streamed` (decisions queued for judging while the sort was still writing), `freeSlots` (slots that got a judging session), `retried` (decisions retried after a failed turn). |
 | `git.clone` | First use of a repo | |
 | `git.fetch` | `fetchPr`: ensuring the clone, refs, fetching when needed, merge base. In-memory hits aren't logged. | `network` (false = head already local) |
 | `git.numstat`, `git.diff`, `git.show`, `git.lsTree` | Each git call | `files`, `additions`, `deletions` / `bytes`, `paths` / `entries` |

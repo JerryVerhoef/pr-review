@@ -23,6 +23,7 @@ export type AgentCall = {
   turn?: number
   model?: 'fast' | 'main'
   onText?: (line: string) => Effect.Effect<void>
+  onDelta?: (delta: string) => Effect.Effect<void>
 }
 
 export const fakeAccount: AgentAccount = { id: 'fake', name: 'Fake', agent: 'custom', command: 'x', env: {}, concurrency: 1, enabled: true }
@@ -66,6 +67,7 @@ export const fakeAgent = (
             let turn = 0
             return use(
               {
+                ready: Effect.void,
                 structured: (prompt, schema, model = 'main', turnKind) =>
                   answer({ ...o, prompt, session, account: account.id, turn: turn++, model, log: turnKind ? { ...o.log, kind: turnKind } : o.log }, o.onStep, schema) as never,
               },
