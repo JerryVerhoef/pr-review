@@ -5,13 +5,13 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { annotate, fileSink, makeTracer, measure, type PerformanceEvent } from '../src/Perf.ts'
 import { tmp } from './helpers.ts'
+import { TestClock } from 'effect/testing'
 
-/** A tracer collecting events, on a clock that only moves when `tick` says. */
+/** A tracer collecting events; under `it.effect` the clock only moves when `tick` says. */
 const collector = () => {
   const events: PerformanceEvent[] = []
-  let ns = 0n
-  const tracer = makeTracer((e) => void events.push(e), () => ns)
-  const tick = (ms: number) => Effect.sync(() => void (ns += BigInt(ms) * 1_000_000n))
+  const tracer = makeTracer((e) => void events.push(e))
+  const tick = (ms: number) => TestClock.adjust(`${ms} millis`)
   const traced = <A, E>(effect: Effect.Effect<A, E>) => Effect.withTracer(effect, tracer)
   const by = (phase: string) => events.filter((e) => e.phase === phase)
   return { events, tick, traced, by }
@@ -20,7 +20,7 @@ const collector = () => {
 const op = { kind: 'sort', owner: 'o', repo: 'r', prNumber: 7, headSha: 'abc' }
 
 describe('Perf tracer', () => {
-  it.effect('measures durations on the monotonic clock it is given', () =>
+  it.effect('measures durations on the Clock', () =>
     Effect.gen(function* () {
       const c = collector()
       yield* c.traced(c.tick(250).pipe(measure('git.fetch')))

@@ -1,16 +1,11 @@
-import type { PerformanceEvent } from './Perf.ts'
+import { Option, Schema } from 'effect'
+import { PerformanceEvent } from './Perf.ts'
+
+const decodeLine = Schema.decodeUnknownOption(Schema.fromJsonString(PerformanceEvent))
 
 /** Events from a `performance.jsonl`, skipping lines that don't parse and those before `since` (epoch ms). */
 export const parseLog = (text: string, since = 0): PerformanceEvent[] =>
-  text.split('\n').flatMap((line) => {
-    if (!line.trim()) return []
-    try {
-      const e = JSON.parse(line) as PerformanceEvent
-      return typeof e.phase === 'string' && typeof e.durationMs === 'number' && Date.parse(e.timestamp) >= since ? [e] : []
-    } catch {
-      return []
-    }
-  })
+  text.split('\n').flatMap((line) => Option.toArray(Option.filter(decodeLine(line), (e) => Date.parse(e.timestamp) >= since)))
 
 /** `7d`, `24h`, `30m` before `now`, or a date; 0 (everything) when empty. */
 export const parseSince = (since: string, now = Date.now()): number => {

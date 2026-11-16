@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Exit, Layer, Option, Stream, Tracer } from 'effect'
+import { Cause, Context, Duration, Effect, Exit, Layer, Option, Predicate, Schema, Stream, Tracer } from 'effect'
 import { appendFile, mkdir, rename, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
@@ -10,30 +10,32 @@ import { Config } from './Config.ts'
  * Only primitive metadata that passes `safe` is written: no prompts, diffs, paths, URLs, commands or error messages.
  */
 
-export type Status = 'success' | 'error' | 'cancelled'
+export const Status = Schema.Literals(['success', 'error', 'cancelled'])
+export type Status = typeof Status.Type
 export type Meta = Record<string, string | number | boolean | undefined>
 
-export interface PerformanceEvent {
-  timestamp: string
+export const PerformanceEvent = Schema.Struct({
+  timestamp: Schema.String,
   /** The outermost measured span this one runs under (its own id when it is the outermost). */
-  operationId: string
-  spanId: string
+  operationId: Schema.String,
+  spanId: Schema.String,
   /** The nearest measured span this one runs under. */
-  parentId?: string
-  /** Start, in ms after the operation's start (monotonic), so nested and concurrent phases can be laid out. */
-  offsetMs: number
-  kind: string
-  phase: string
-  owner?: string
-  repo?: string
-  prNumber?: number
-  headSha?: string
-  agent?: string
-  model?: string
-  durationMs: number
-  status: Status
-  metadata?: Record<string, string | number | boolean>
-}
+  parentId: Schema.optionalKey(Schema.String),
+  /** Start, in ms after the operation's start, so nested and concurrent phases can be laid out. */
+  offsetMs: Schema.Number,
+  kind: Schema.String,
+  phase: Schema.String,
+  owner: Schema.optionalKey(Schema.String),
+  repo: Schema.optionalKey(Schema.String),
+  prNumber: Schema.optionalKey(Schema.Number),
+  headSha: Schema.optionalKey(Schema.String),
+  agent: Schema.optionalKey(Schema.String),
+  model: Schema.optionalKey(Schema.String),
+  durationMs: Schema.Number,
+  status: Status,
+  metadata: Schema.optionalKey(Schema.Record(Schema.String, Schema.Union([Schema.String, Schema.Number, Schema.Boolean]))),
+})
+export type PerformanceEvent = typeof PerformanceEvent.Type
 
 const P = 'perf.'
 const PHASE = `${P}phase`
@@ -82,9 +84,9 @@ export const annotate = (meta: Meta): Effect.Effect<void> =>
     }),
   )
 
-/** Starts a measured span by hand, for work that isn't an Effect (an agent's tool call). End it with `end`. */
-export const startSpan = (tracer: Tracer.Tracer, parent: Tracer.AnySpan, phase: string, meta: Meta = {}): Tracer.Span => {
-  const span = tracer.span({ name: `perf ${phase}`, parent: Option.some(parent), annotations: Context.empty(), links: [], startTime: process.hrtime.bigint(), kind: 'internal', root: false, sampled: true })
+/** Starts a measured span by hand at `startTime` (Clock nanos), for work that isn't an Effect (an agent's tool call). End it with `end`. */
+export const startSpan = (tracer: Tracer.Tracer, parent: Tracer.AnySpan, startTime: bigint, phase: string, meta: Meta = {}): Tracer.Span => {
+  const span = tracer.span({ name: `perf ${phase}`, parent: Option.some(parent), annotations: Context.empty(), links: [], startTime, kind: 'internal', root: false, sampled: true })
   for (const [k, v] of Object.entries(attributes({ ...meta, phase }))) span.attribute(k, v)
   return span
 }
@@ -93,17 +95,19 @@ const statusOf = (exit: Exit.Exit<unknown, unknown>): { status: Status; errorTag
   if (Exit.isSuccess(exit)) return { status: 'success' }
   if (Cause.hasInterruptsOnly(exit.cause)) return { status: 'cancelled' }
   const e = Cause.squash(exit.cause)
-  const tag = typeof e === 'object' && e !== null && '_tag' in e ? e._tag : e instanceof Error ? e.name : undefined
-  return { status: 'error', ...(safe(tag) && typeof tag === 'string' ? { errorTag: tag } : {}) }
+  const tag = Predicate.hasProperty(e, '_tag') ? e._tag : e instanceof Error ? e.name : undefined
+  return { status: 'error', ...(typeof tag === 'string' && safe(tag) ? { errorTag: tag } : {}) }
 }
 
-const round = (ms: number) => Math.round(ms * 10) / 10
+export const round = (ms: number) => Math.round(ms * 10) / 10
+/** Clock nanos between two instants, in ms to one decimal. */
+export const elapsedMs = (from: bigint, to: bigint) => round(Duration.toMillis(Duration.nanos(to - from)))
 
 /**
- * A tracer that hands each finished measured span to `write` as a PerformanceEvent. Durations come from `now`
- * (monotonic nanoseconds), never the wall clock. Nothing it does can fail the traced effect.
+ * A tracer that hands each finished measured span to `write` as a PerformanceEvent. Times are the span's own start
+ * and end, from Effect's Clock. Nothing it does can fail the traced effect.
  */
-export const makeTracer = (write: (e: PerformanceEvent) => void, now: () => bigint = () => process.hrtime.bigint()): Tracer.Tracer => {
+export const makeTracer = (write: (e: PerformanceEvent) => void): Tracer.Tracer => {
   let operations = 0
 
   type Options = Parameters<Tracer.Tracer['span']>[0]
@@ -118,8 +122,6 @@ export const makeTracer = (write: (e: PerformanceEvent) => void, now: () => bigi
     readonly attributes = new Map<string, unknown>()
     readonly links: Tracer.SpanLink[]
     status: Tracer.SpanStatus
-    readonly at = now()
-    readonly wall = Date.now()
     private id: string | undefined
     private trace: string | undefined
     constructor(o: Options) {
@@ -150,12 +152,13 @@ export const makeTracer = (write: (e: PerformanceEvent) => void, now: () => bigi
       if (!this.attributes.has(PHASE)) return
       if (this.attributes.get(PHASE) === 'operation') operations--
       try {
-        write(this.toEvent(exit))
+        write(this.toEvent(endTime, exit))
       } catch {
         // A broken log never touches the review.
       }
     }
-    private toEvent(exit: Exit.Exit<unknown, unknown>): PerformanceEvent {
+    private toEvent(endTime: bigint, exit: Exit.Exit<unknown, unknown>): PerformanceEvent {
+      const start = this.status.startTime
       const ancestors = measuredAncestors(this)
       const root = ancestors.at(-1) ?? this
       const context: Record<string, unknown> = {}
@@ -174,11 +177,11 @@ export const makeTracer = (write: (e: PerformanceEvent) => void, now: () => bigi
       if (errorTag) metadata.errorTag = errorTag
       const parent = ancestors[0]
       return {
-        timestamp: new Date(this.wall).toISOString(),
+        timestamp: new Date(Number(start / 1_000_000n)).toISOString(),
         operationId: root.spanId,
         spanId: this.spanId,
         ...(parent ? { parentId: parent.spanId } : {}),
-        offsetMs: root instanceof PerfSpan ? round(Number(this.at - root.at) / 1e6) : 0,
+        offsetMs: elapsedMs(root.status.startTime, start),
         kind: typeof context.kind === 'string' ? context.kind : 'other',
         phase: String(this.attributes.get(PHASE)),
         ...(typeof context.owner === 'string' ? { owner: context.owner } : {}),
@@ -187,7 +190,7 @@ export const makeTracer = (write: (e: PerformanceEvent) => void, now: () => bigi
         ...(typeof context.headSha === 'string' ? { headSha: context.headSha } : {}),
         ...(typeof context.agent === 'string' ? { agent: context.agent } : {}),
         ...(typeof context.model === 'string' ? { model: context.model } : {}),
-        durationMs: round(Number(now() - this.at) / 1e6),
+        durationMs: elapsedMs(start, endTime),
         status,
         ...(Object.keys(metadata).length ? { metadata } : {}),
       }

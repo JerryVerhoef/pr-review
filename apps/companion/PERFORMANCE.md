@@ -30,10 +30,10 @@ How writing works:
 | --- | --- |
 | `operationId` | The outermost measured span this event ran under. Everything from one review (or one stack walk) shares it. |
 | `spanId` / `parentId` | This event, and the nearest measured span it ran inside. Concurrent work has distinct `spanId`s under the same parent. |
-| `offsetMs` | Start time in ms after the operation started, on the monotonic clock, so overlapping (parallel) phases can be laid out. |
+| `offsetMs` | Start time in ms after the operation started, so overlapping (parallel) phases can be laid out. |
 | `kind` | The nearest operation or agent turn kind: `review`, `sort`, `opinion`, `deeper`, `overview`, `stack-opinion`, `stack`, `ask`, `chat`, `ticket`, `rule`. `other` is work outside any of them, like a page load's `GetPr`. |
 | `owner`, `repo`, `prNumber`, `headSha`, `agent`, `model` | Taken from the nearest enclosing span that has them. Left out when unknown. |
-| `durationMs` | From `process.hrtime`, never the wall clock. |
+| `durationMs` | The span's own start and end from Effect's `Clock` (high-resolution, monotonic between re-anchors to the wall clock). |
 | `status` | `success`, `error` (with `metadata.errorTag`, the error's type and never its message) or `cancelled` (interrupted). |
 
 Only short tokens get logged: numbers, booleans, and strings of up to 80 characters with no whitespace or slashes. Prompts, diffs, file contents, agent answers, paths, URLs, command lines, environment variables and error messages are never written. The tests check this.
@@ -88,7 +88,7 @@ jq -c 'select(.phase=="agent.tool" and .metadata.command=="git") | [.metadata.su
 ## What is measured, inferred, or missing
 
 Measured directly:
-- Every phase in the table above, on the monotonic clock.
+- Every phase in the table above.
 - How long the account slot wait takes.
 - The ACP handshake steps.
 - Prompt round trips.

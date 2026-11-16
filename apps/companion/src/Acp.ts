@@ -1,12 +1,12 @@
 import * as acp from '@agentclientprotocol/sdk'
 import { AgentError, type AgentAccount } from '@pr-review/domain'
-import { Context, Effect, Exit, Fiber, Layer, Queue, type Scope, Stream, type Tracer } from 'effect'
+import { Clock, Context, Effect, Exit, Fiber, Layer, Option, Queue, Schema, type Scope, Stream, type Tracer } from 'effect'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { Readable, Writable } from 'node:stream'
 import { safeGhCommand, safeGitCommand } from './gitOnly.ts'
 import { loginPath } from './shellPath.ts'
-import { annotate, measure, type Meta, startSpan } from './Perf.ts'
+import { annotate, elapsedMs, measure, type Meta, round, startSpan } from './Perf.ts'
 import { ticketPermission } from './permissions.ts'
 import { describeTool } from './steps.ts'
 
@@ -35,32 +35,53 @@ const READ_ONLY_MODES = [/read.?only/i, /^ask$/i, /^plan$/i, /^default$/i, /manu
 const agentError = (e: unknown, output = '') =>
   new AgentError({ message: [e instanceof Error ? e.message : typeof e === 'object' && e && 'message' in e ? String(e.message) : String(e), output.trim().split('\n').slice(-3).join(' ')].filter(Boolean).join(': ') })
 
+const ShellInput = Schema.Struct({ command: Schema.String })
+/** The shell command a tool call runs, when it is one. */
+const commandOf = (rawInput: unknown) => Option.getOrUndefined(Schema.decodeUnknownOption(ShellInput)(rawInput))?.command
+
+const ClaudeCodeMeta = Schema.Struct({ claudeCode: Schema.Struct({ toolName: Schema.String }) })
+const Count = Schema.optionalKey(Schema.NullOr(Schema.Number))
+/** ACP's unstable `Usage`; agents that send it put it on the prompt's answer. */
+const PromptUsage = Schema.Struct({
+  usage: Schema.Struct({
+    totalTokens: Schema.Number,
+    inputTokens: Schema.Number,
+    outputTokens: Schema.Number,
+    thoughtTokens: Count,
+    cachedReadTokens: Count,
+    cachedWriteTokens: Count,
+  }),
+})
+
 /** Answer text, and each shell command once as a step for the loading line. */
 const toUpdate = (u: acp.SessionUpdate, seen: Set<string>): AcpUpdate | undefined => {
   if (u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text') return { _tag: 'Text', delta: u.content.text }
   if (u.sessionUpdate !== 'tool_call' && u.sessionUpdate !== 'tool_call_update') return undefined
-  const command = (u.rawInput as { command?: unknown } | undefined)?.command
-  if (typeof command !== 'string' || seen.has(u.toolCallId)) return undefined
+  const command = commandOf(u.rawInput)
+  if (command === undefined || seen.has(u.toolCallId)) return undefined
   seen.add(u.toolCallId)
   return { _tag: 'Step', step: describeTool('Bash', { command }) }
 }
 
-const round = (ms: number) => Math.round(ms * 10) / 10
 const SHELL = /^\s*(git|gh)\s+([a-z][a-z-]*)/
 
 /** What a tool call is, without its arguments: the agent's tool name and kind, and for git or gh the subcommand. */
-const toolMeta = (u: { kind?: acp.ToolKind | null; rawInput?: unknown; _meta?: { [k: string]: unknown } | null }): Meta => {
-  const name = (u._meta?.claudeCode as { toolName?: unknown } | undefined)?.toolName
-  const command = (u.rawInput as { command?: unknown } | undefined)?.command
-  const shell = typeof command === 'string' ? SHELL.exec(command) : null
-  return { tool: typeof name === 'string' ? name : undefined, toolKind: u.kind ?? undefined, command: shell?.[1], subcommand: shell?.[2] }
+const toolMeta = (u: acp.ToolCall | acp.ToolCallUpdate): Meta => {
+  const command = commandOf(u.rawInput)
+  const shell = command === undefined ? null : SHELL.exec(command)
+  return {
+    tool: Option.getOrUndefined(Schema.decodeUnknownOption(ClaudeCodeMeta)(u._meta))?.claudeCode.toolName,
+    toolKind: u.kind ?? undefined,
+    command: shell?.[1],
+    subcommand: shell?.[2],
+  }
 }
 
-const tokens = (usage: unknown): Meta => {
-  if (typeof usage !== 'object' || usage === null) return {}
-  const u = usage as Record<string, unknown>
-  const n = (k: string) => (typeof u[k] === 'number' ? (u[k] as number) : undefined)
-  return { inputTokens: n('inputTokens'), outputTokens: n('outputTokens'), cachedReadTokens: n('cachedReadTokens'), cachedWriteTokens: n('cachedWriteTokens'), thoughtTokens: n('thoughtTokens'), totalTokens: n('totalTokens') }
+const tokens = (response: unknown): Meta => {
+  const usage = Option.getOrUndefined(Schema.decodeUnknownOption(PromptUsage)(response))?.usage
+  if (!usage) return {}
+  const { totalTokens, inputTokens, outputTokens, thoughtTokens, cachedReadTokens, cachedWriteTokens } = usage
+  return { totalTokens, inputTokens, outputTokens, thoughtTokens: thoughtTokens ?? undefined, cachedReadTokens: cachedReadTokens ?? undefined, cachedWriteTokens: cachedWriteTokens ?? undefined }
 }
 
 /**
@@ -68,12 +89,19 @@ const tokens = (usage: unknown): Meta => {
  * announcement to its last status, as an `agent.tool` span under `parent`. Time no tool covered is unclassified:
  * the model, the agent's own work and the protocol can't be told apart from here.
  */
-const promptTimer = (tracer: Tracer.Tracer, parent: Tracer.AnySpan) => {
-  const t0 = performance.now()
-  const since = () => performance.now() - t0
+const promptTimer = (clock: Clock.Clock, tracer: Tracer.Tracer, parent: Tracer.AnySpan) => {
+  const now = () => clock.currentTimeNanosUnsafe()
+  const t0 = now()
+  const since = () => elapsedMs(t0, now())
   const tools = new Map<string, { span: Tracer.Span; start: number; end?: number }>()
-  const m = { updates: 0, textChunks: 0, thoughtChunks: 0, rejectedTools: 0 } as Record<string, number>
-  const first = (k: string) => void (m[k] ??= round(since()))
+  const m: Record<'updates' | 'textChunks' | 'thoughtChunks' | 'rejectedTools', number> &
+    Partial<Record<'firstActivityMs' | 'firstTextMs' | 'firstThoughtMs' | 'firstToolMs' | 'contextTokens' | 'contextWindow' | 'cost', number>> = {
+    updates: 0,
+    textChunks: 0,
+    thoughtChunks: 0,
+    rejectedTools: 0,
+  }
+  const first = (k: 'firstActivityMs' | 'firstTextMs' | 'firstThoughtMs' | 'firstToolMs') => void (m[k] ??= since())
   let running = 0
   let lastEnd: number | undefined
   let maxGap = 0
@@ -82,7 +110,7 @@ const promptTimer = (tracer: Tracer.Tracer, parent: Tracer.AnySpan) => {
     if (!t || t.end !== undefined) return
     t.end = lastEnd = since()
     running--
-    t.span.end(process.hrtime.bigint(), exit)
+    t.span.end(now(), exit)
   }
   const tool = (u: acp.ToolCall | acp.ToolCallUpdate) => {
     let t = tools.get(u.toolCallId)
@@ -91,7 +119,8 @@ const promptTimer = (tracer: Tracer.Tracer, parent: Tracer.AnySpan) => {
       if (running === 0 && lastEnd !== undefined) maxGap = Math.max(maxGap, at - lastEnd)
       first('firstToolMs')
       running++
-      tools.set(u.toolCallId, (t = { span: startSpan(tracer, parent, 'agent.tool', { sincePreviousToolMs: lastEnd === undefined ? undefined : round(at - lastEnd) }), start: at }))
+      const span = startSpan(tracer, parent, now(), 'agent.tool', { sincePreviousToolMs: lastEnd === undefined ? undefined : round(at - lastEnd) })
+      tools.set(u.toolCallId, (t = { span, start: at }))
     }
     for (const [k, v] of Object.entries(toolMeta(u))) if (v !== undefined && !t.span.attributes.has(`perf.${k}`)) t.span.attribute(`perf.${k}`, v)
     if (u.status === 'completed') end(u.toolCallId, Exit.void)
@@ -99,10 +128,10 @@ const promptTimer = (tracer: Tracer.Tracer, parent: Tracer.AnySpan) => {
   }
   return {
     update: (u: acp.SessionUpdate) => {
-      m.updates!++
+      m.updates++
       first('firstActivityMs')
-      if (u.sessionUpdate === 'agent_message_chunk') (m.textChunks!++, first('firstTextMs'))
-      else if (u.sessionUpdate === 'agent_thought_chunk') (m.thoughtChunks!++, first('firstThoughtMs'))
+      if (u.sessionUpdate === 'agent_message_chunk') (m.textChunks++, first('firstTextMs'))
+      else if (u.sessionUpdate === 'agent_thought_chunk') (m.thoughtChunks++, first('firstThoughtMs'))
       else if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') tool(u)
       else if (u.sessionUpdate === 'usage_update') {
         m.contextTokens = u.used
@@ -111,7 +140,7 @@ const promptTimer = (tracer: Tracer.Tracer, parent: Tracer.AnySpan) => {
       }
     },
     permission: (id: string, allowed: boolean) => {
-      if (!allowed) m.rejectedTools!++
+      if (!allowed) m.rejectedTools++
       tools.get(id)?.span.attribute('perf.permission', allowed ? 'allowed' : 'rejected')
     },
     /** Ends tool calls still open as cancelled; the prompt's numbers. */
@@ -173,10 +202,10 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
                 timer?.update(ctx.params.update)
               })
               .onRequest(acp.methods.client.session.requestPermission, (ctx) => {
-                const raw = ctx.params.toolCall.rawInput as { command?: unknown } | undefined
+                const command = commandOf(ctx.params.toolCall.rawInput)
                 const allowed = o?.tickets
                   ? ticketPermission(ctx.params.toolCall)
-                  : ctx.params.toolCall.kind === 'execute' && typeof raw?.command === 'string' && (safeGitCommand(raw.command) || safeGhCommand(raw.command, o?.related ?? []))
+                  : ctx.params.toolCall.kind === 'execute' && command !== undefined && (safeGitCommand(command) || safeGhCommand(command, o?.related ?? []))
                 timer?.permission(ctx.params.toolCall.toolCallId, Boolean(allowed))
                 const option = ctx.params.options.find((o) => o.kind === (allowed ? 'allow_once' : 'reject_once')) ?? ctx.params.options.find((o) => o.kind.startsWith(allowed ? 'allow' : 'reject'))
                 return option ? { outcome: { outcome: 'selected', optionId: option.optionId } } : { outcome: { outcome: 'cancelled' } }
@@ -246,13 +275,12 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
                   Effect.gen(function* () {
                     const turn = yield* Effect.forkScoped(
                       Effect.gen(function* () {
-                        timer = promptTimer(yield* Effect.tracer, yield* Effect.orDie(Effect.currentSpan))
+                        timer = promptTimer(yield* Clock.Clock, yield* Effect.tracer, yield* Effect.orDie(Effect.currentSpan))
                         const r = yield* call(() => agent.request(acp.methods.agent.session.prompt, { sessionId, prompt: [{ type: 'text', text }] })).pipe(
                           Effect.onExit(() => Effect.suspend(() => (timer ? annotate(timer.finish()) : Effect.void))),
                           Effect.ensuring(Effect.sync(() => void (timer = undefined))),
                         )
-                        // Token counts are an unstable ACP field; agents that send them put them on the prompt's answer.
-                        yield* annotate({ stopReason: r.stopReason, ...tokens((r as { usage?: unknown }).usage) })
+                        yield* annotate({ stopReason: r.stopReason, ...tokens(r) })
                         if (r.stopReason !== 'end_turn') return yield* new AgentError({ message: `${account.name} stopped: ${r.stopReason}` })
                       }).pipe(measure('agent.prompt', { promptBytes: Buffer.byteLength(text) }), Effect.ensuring(Queue.offer(updates, 'stop'))),
                     )
