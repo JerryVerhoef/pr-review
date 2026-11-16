@@ -1,5 +1,5 @@
 import { assert, describe, it } from '@effect/vitest'
-import { type AgentAccount, AgentError, type AgentQuick, type FileStat, type AgentOpinion, type AgentSort, type Decision, type Phase, type SortResult } from '@pr-review/domain'
+import { type AgentAccount, AgentError, type AgentFinding, type AgentQuick, type FileStat, type AgentOpinion, type AgentSort, type Decision, type Phase, type SortResult } from '@pr-review/domain'
 import { Deferred, Effect, Fiber, Layer, Option, Stream } from 'effect'
 import { KeyValueStore } from 'effect/persistence'
 import { Opiner } from '../src/Opiner.ts'
@@ -8,7 +8,7 @@ import { Sorter } from '../src/Sorter.ts'
 import type { GitHubClient } from '../src/GitHub.ts'
 import { Store } from '../src/Store.ts'
 import { type TicketSummary, Tickets } from '../src/Tickets.ts'
-import { type AgentCall, configLayer, fakeAccount, fakeAccount2, fakeAgent, fakeGit, fakeGitHub, ref } from './fakes.ts'
+import { type AgentCall, configLayer, fakeAccount, fakeAccount2, fakeAgent, fakeGit, fakeGitHub, pr, ref } from './fakes.ts'
 
 const decision = (id: string, high: boolean): Decision => ({
   id,
@@ -425,6 +425,61 @@ describe('Reviewer', () => {
       assert.deepStrictEqual([...new Set(answeredBy)].sort(), ['h1', 'h2', 'l1', 'l2', 'l3'])
       assert.isUndefined(r.opinionError)
       assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
+    }))
+
+  it.effect('a Jira ticket is checked in a turn of its own, without holding up judging', () =>
+    Effect.gen(function* () {
+      const judgedOne = yield* Deferred.make<void>()
+      const spec: AgentFinding = {
+        severity: 'should',
+        axis: 'spec',
+        kind: 'spec',
+        title: 'Missing export',
+        take: 'The ticket asks for an export.',
+        evidence: [{ ref: 'docs', path: 'ticket', line: 0, quote: 'export' }],
+        alternative: null,
+        comment: null,
+        anchor: null,
+        handledIn: null,
+      }
+      const { agent, layer } = setup({
+        github: { getPr: () => Effect.succeed({ ...pr, title: 'CORE-1 Add a thing' }) },
+        // The ticket only arrives once a decision has been judged.
+        ticket: Effect.as(Deferred.await(judgedOne), { text: 'CORE-1: add an export', note: 'read' }),
+        opinion: (call) =>
+          call.prompt.includes('Only the Spec axis')
+            ? Effect.succeed({ decisions: [{ decisionId: 'h2', authorCase: 'c', checked: null, findings: [spec] }] })
+            : Effect.as(Deferred.succeed(judgedOne, undefined), opinionOn(call.prompt)),
+      })
+      const r = yield* review.pipe(Effect.provide(layer))
+      const turnsOf = agent.calls.filter((c) => c.log.kind === 'opinion')
+      const specTurns = turnsOf.filter((c) => c.prompt.includes('Only the Spec axis'))
+      assert.strictEqual(specTurns.length, 1)
+      assert.match(specTurns[0]!.prompt, /CORE-1: add an export/)
+      assert.deepStrictEqual(idsIn(specTurns[0]!), ['h1', 'l1', 'h2', 'l2', 'l3'])
+      // Decision turns are told to leave the Spec axis alone.
+      assert.isTrue(turnsOf.filter((c) => !specTurns.includes(c) && !c.prompt.startsWith('Now these decisions')).every((c) => c.prompt.includes('skip the Spec axis')))
+      assert.deepStrictEqual(
+        r.opinion?.decisions.map((d) => [d.decisionId, d.findings.map((f) => f.title)]),
+        [['h1', []], ['l1', []], ['h2', ['Missing export']], ['l2', []], ['l3', []]],
+      )
+      assert.strictEqual(r.opinion?.ticket, 'CORE-1: add an export')
+    }))
+
+  it.effect('the review shows from the sort on, and grows with each decision judged', () =>
+    Effect.gen(function* () {
+      const { layer } = setup()
+      const seen = yield* Effect.gen(function* () {
+        const reviewer = yield* Reviewer
+        yield* reviewer.prepare(ref, 'HEAD1')
+        const fiber = yield* Effect.forkChild(Stream.runCollect(reviewer.partial(ref, 'HEAD1').pipe(Stream.takeUntil((p) => p.opinion?.decisions.length === 5))))
+        yield* reviewer.result(ref, 'HEAD1')
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(layer))
+      const counts = seen.map((p) => p.opinion?.decisions.length ?? -1)
+      assert.strictEqual(counts[0], -1)
+      assert.deepStrictEqual(counts.slice(-5), [1, 2, 3, 4, 5])
+      assert.deepStrictEqual(seen[0]!.sort.decisions.map((d) => d.id), many.map((d) => d.id))
     }))
 
   it.effect('the opinion phase shows "Reading the ticket" while the ticket holds it up', () =>

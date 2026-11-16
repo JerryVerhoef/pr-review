@@ -256,9 +256,12 @@ export const ReviewEvent = Schema.Union([
     sort: SortResult,
     state: DecisionStates,
     rereview: Schema.optionalKey(Rereview),
+    /** While `judging`, the decisions judged so far. */
     opinion: Schema.NullOr(PrOpinion),
     opinionError: Schema.optionalKey(Schema.String),
     findingStates: FindingStates,
+    /** The sort is done and decisions are still being judged; another Done follows. */
+    judging: Schema.optionalKey(Schema.Boolean),
   }),
 ])
 export type ReviewEvent = typeof ReviewEvent.Type

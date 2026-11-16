@@ -34,3 +34,7 @@ export const ticketRefs = (text: string, host: string): TicketRef[] => {
   const others = other.filter((r) => r.includes('://') || !segments.has(r))
   return [...github.slice(0, MAX_GITHUB), ...others.slice(0, MAX).map((ref): TicketRef => ({ kind: 'other', ref }))]
 }
+
+/** Whether the PR names a ticket only an agent can read: GitHub issues come straight from the API. */
+export const needsTicketAgent = (pr: { title: string; headRef: string; body: string }, host: string) =>
+  ticketRefs([pr.title, pr.headRef, pr.body].join('\n'), host).some((r) => r.kind === 'other')

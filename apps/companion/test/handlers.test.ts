@@ -485,6 +485,10 @@ describe('handlers', () => {
       const done = events.at(-1)!
       assert.strictEqual(done._tag, 'Done')
       if (done._tag !== 'Done') return
+      // The sort shows while its decision is still being judged.
+      const early = events.find((e) => e._tag === 'Done' && e.judging)
+      assert.deepStrictEqual(early?._tag === 'Done' && [early.sort.decisions.map((d) => d.id), early.opinion], [['d1'], null])
+      assert.isUndefined(done.judging)
       assert.deepStrictEqual(done.sort.decisions.map((d) => d.id), ['d1'])
       assert.deepStrictEqual(done.opinion?.decisions.map((d) => d.decisionId), ['d1'])
       assert.deepStrictEqual(done.findingStates, {})

@@ -322,12 +322,20 @@ export const HandlersLive = ReviewRpcs.toLayer(
               }),
             )
             if (cached) return end
-            return reviewer.progress(ref, headSha).pipe(
+            const preparing = reviewer.progress(ref, headSha).pipe(
               Stream.changesWith((a, b) => JSON.stringify(a) === JSON.stringify(b)),
               Stream.map((phases): ReviewEvent => ({ _tag: 'Preparing', phases })),
-              Stream.interruptWhen(Fiber.await(fiber)),
-              Stream.concat(end),
             )
+            // The sort as soon as it is done, then again with each decision judged.
+            const judging = reviewer.partial(ref, headSha).pipe(
+              Stream.mapEffect((r) =>
+                Effect.gen(function* () {
+                  const verdicts = yield* verdictsFor(ref, headSha, r.sort)
+                  return { _tag: 'Done', sort: r.sort, ...verdicts, opinion: r.opinion, findingStates: yield* findingStatesFor(ref, headSha), judging: true } satisfies ReviewEvent
+                }),
+              ),
+            )
+            return Stream.merge(preparing, judging).pipe(Stream.interruptWhen(Fiber.await(fiber)), Stream.concat(end))
           }),
         ),
 

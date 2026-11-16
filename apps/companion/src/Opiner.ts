@@ -1,5 +1,5 @@
-import { AgentError, AgentOpinion, type Decision, type DecisionOpinion, type Evidence, type FileStat, type GitError, type PrOpinion, type PrRef, repoSettings, type SortResult, type StackEntry } from '@pr-review/domain'
-import { Context, Effect, Layer, type Stream } from 'effect'
+import { type AgentDecisionOpinion, AgentError, AgentOpinion, type Decision, type DecisionOpinion, type Evidence, type FileStat, type GitError, type PrOpinion, type PrRef, repoSettings, type SortResult, type StackEntry } from '@pr-review/domain'
+import { Context, Effect, Fiber, Layer, type Stream } from 'effect'
 import { readFileSync } from 'node:fs'
 import { Agent } from './Agent.ts'
 import { checkFinding } from './citations.ts'
@@ -11,7 +11,8 @@ import { type SortError, Sorter } from './Sorter.ts'
 import { hunkLines, nearestLine } from './interdiff.ts'
 import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection } from './opinionContext.ts'
 import { buildStack } from './stack.ts'
-import { Tickets } from './Tickets.ts'
+import { type TicketSummary, Tickets } from './Tickets.ts'
+import { needsTicketAgent } from './ticketRefs.ts'
 import { makeSteps } from './steps.ts'
 import { cacheOptions, DeeperKey, measuredCache, OpinionKey, peek, poke, storeFailuresDie } from './Store.ts'
 
@@ -90,8 +91,17 @@ export const judged = (sort: SortResult): ReadonlyArray<Decision> => (sort.quick
 export type OpinionContext = {
   cwd: string
   related: ReadonlyArray<string>
-  /** `brief`: a later turn in a session that already has the rest of the context. */
-  prompt(decisions: ReadonlyArray<Decision>, o?: { deep?: boolean; continued?: boolean; brief?: boolean }): Effect.Effect<string>
+  /** The PR names a ticket only an agent can read, so it can come later than the rest. */
+  slowTicket: boolean
+  /**
+   * `brief`: a later turn in a session that already has the rest of the context.
+   * `spec`: `skip` leaves the Spec axis to a turn of its own without waiting for the ticket; `only` is that turn.
+   */
+  prompt(decisions: ReadonlyArray<Decision>, o?: { deep?: boolean; continued?: boolean; brief?: boolean; spec?: 'skip' | 'only' }): Effect.Effect<string>
+  /** One decision's answer, normalized (see `normalize`); undefined when the answer isn't on it. */
+  decide(answer: AgentDecisionOpinion, decision: Decision, deep?: boolean): Effect.Effect<DecisionOpinion | undefined, GitError>
+  /** The PR's opinion from decided decisions; `partial` doesn't wait for the ticket. */
+  opinion(decisions: ReadonlyArray<DecisionOpinion>, partial?: boolean): Effect.Effect<PrOpinion>
   /** Normalizes an answer on `decisions` (see `normalize`) into the PR's opinion. */
   finish(answer: AgentOpinion, decisions: ReadonlyArray<Decision>, deep?: boolean): Effect.Effect<PrOpinion, GitError>
 }
@@ -146,10 +156,14 @@ export class Opiner extends Context.Service<
         const gh = yield* github.forHost(host)
         const pr = yield* gh.getPr(owner, repo, number)
         const { headSha: head, mergeBase } = yield* git.fetchPr(repoKey, number, pr.baseRef, headSha)
-        const [files, { stack, above }, defaultBranch, ticket] = yield* Effect.all(
-          [git.numstat(repoKey, mergeBase, head), stackOf(ref), git.defaultBranch(repoKey), tickets.summary(ref, pr)],
-          { concurrency: 4 },
-        )
+        const [files, { stack, above }, defaultBranch] = yield* Effect.all([git.numstat(repoKey, mergeBase, head), stackOf(ref), git.defaultBranch(repoKey)], { concurrency: 3 })
+        // Waited for only by what needs it.
+        // Detached so a late caller still joins this lookup: a summary without text isn't cached, and asking again would rerun it.
+        let ticketRead: TicketSummary | undefined
+        const ticketFiber = yield* Effect.forkDetach(tickets.summary(ref, pr).pipe(Effect.tap((t) => Effect.sync(() => void (ticketRead = t)))))
+        const ticketOf = Fiber.join(ticketFiber)
+        const slowTicket = needsTicketAgent(pr, host)
+        if (!slowTicket) yield* ticketOf
         const master = `origin/${defaultBranch}`
         const { related, reviewSkill: skillPath } = repoSettings(settings, repoKey)
         const skill = skillPath
@@ -182,17 +196,35 @@ export class Opiner extends Context.Service<
           deletions: files.reduce((n, f) => n + f.deletions, 0),
           stackSize: stack.length,
           above: above.length,
-          ticket: ticket.text !== null,
+          slowTicket,
           guidanceFiles: guidance.length,
           customSkill: Boolean(skillPath),
         })
+
+        const read = citationReader(git, github, repoKey, related, (e) => (e.ref === 'base' ? mergeBase : head))
+        const decide = (answer: AgentOpinion, decisions: ReadonlyArray<Decision>, deep: boolean) =>
+          Effect.gen(function* () {
+            const anchorPaths = [...answer.decisions.flatMap((a) => a.findings.flatMap((f) => (f.anchor ? [f.anchor.path] : []))), ...decisions.flatMap((d) => d.files.slice(0, 1).map((f) => f.path))]
+            const hunks = yield* anchorHunks(git, repoKey, mergeBase, head, files, anchorPaths)
+            return yield* normalize(answer, { number, decisions, deep, hunks, above: above.map((e) => e.number), read })
+          })
+        const opinionOf = (decisions: ReadonlyArray<DecisionOpinion>, partial: boolean) =>
+          Effect.gen(function* () {
+            const ticket = partial ? (ticketRead ?? { text: null, note: 'Reading the ticket' }) : yield* ticketOf
+            return { headSha: head, ticket: ticket.text, ticketNote: ticket.note, decisions, stackHeads: headsOf(above) } satisfies PrOpinion
+          })
 
         return {
           cwd: git.dir(repoKey),
           related: related.map((r) => r.repo),
           /** `continued`: the turn follows the sort in its session, which already has the diff. */
+          slowTicket,
           prompt: (decisions, o = {}) =>
             Effect.gen(function* () {
+              const ticketText =
+                o.spec === 'skip'
+                  ? '# Ticket\nChecked against the ticket in a turn of its own: skip the Spec axis.'
+                  : ticketSection(yield* ticketOf, 'judge the Spec axis from the PR description alone and say so')
               const inDecisions = new Set(decisions.flatMap((d) => d.files.map((f) => f.path)))
               const paths = files.filter((f) => inDecisions.has(f.path)).flatMap((f) => (f.previous ? [f.previous, f.path] : [f.path]))
               // A diff git can't make is left for the agent to read itself.
@@ -205,7 +237,7 @@ export class Opiner extends Context.Service<
                       `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`,
                       guidanceSection(master, guidance),
                       relatedSection(related),
-                      ticketSection(ticket, 'judge the Spec axis from the PR description alone and say so'),
+                      ticketText,
                       `# Stack (bottom first; compare a PR with the one below it using git diff <head below> <its head>)\n${stackText.join('\n\n') || '(not stacked)'}`,
                       `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
                     ]),
@@ -218,6 +250,11 @@ export class Opiner extends Context.Service<
                     ? `# Diff\nDiff too large; read files with git show ${head}:<path> and compare with git diff ${mergeBase} ${head} -- <path>`
                     : `# Diff\n${diff || '(no decision files)'}`,
                 ...(o.deep ? ['# Depth\nTake your time on this one decision; read every file it touches in full.'] : []),
+                ...(o.spec === 'only'
+                  ? [
+                      '# This turn\nOnly the Spec axis: another turn covers the Standards axis. For each decision, report requirements of the ticket it misses, does only in part, gets wrong, or behaviour nobody asked for. A missing requirement no decision covers goes on the decision closest to it. List only decisions that have a Spec finding and leave the rest out; keep `authorCase` to a few words and `checked` null. No Spec finding at all is a fine answer: an empty `decisions` list.',
+                    ]
+                  : []),
               ].join('\n\n')
               yield* annotate({
                 diffBytes: diff === undefined ? undefined : Buffer.byteLength(diff),
@@ -226,14 +263,10 @@ export class Opiner extends Context.Service<
               })
               return text
             }).pipe(measure('context.prompt', { decisions: decisions.length, continued: Boolean(o.continued), deep: Boolean(o.deep), brief: Boolean(o.brief) })),
+          decide: (answer, decision, deep = false) => Effect.map(decide({ decisions: [answer] }, [decision], deep), (ds) => ds[0]),
+          opinion: (decisions, partial = false) => opinionOf(decisions, partial),
           finish: (answer, decisions, deep = false) =>
-            Effect.gen(function* () {
-              const read = citationReader(git, github, repoKey, related, (e) => (e.ref === 'base' ? mergeBase : head))
-              const anchorPaths = [...answer.decisions.flatMap((a) => a.findings.flatMap((f) => (f.anchor ? [f.anchor.path] : []))), ...decisions.flatMap((d) => d.files.slice(0, 1).map((f) => f.path))]
-              const hunks = yield* anchorHunks(git, repoKey, mergeBase, head, files, anchorPaths)
-              const normalized = yield* normalize(answer, { number, decisions, deep, hunks, above: above.map((e) => e.number), read })
-              return { headSha: head, ticket: ticket.text, ticketNote: ticket.note, decisions: normalized, stackHeads: headsOf(above) } satisfies PrOpinion
-            }).pipe(
+            Effect.flatMap(decide(answer, decisions, deep), (ds) => opinionOf(ds, false)).pipe(
               measure('agent.response', { step: 'finish', decisions: decisions.length }, (o: PrOpinion) => ({
                 findings: o.decisions.reduce((n, d) => n + d.findings.length, 0),
                 citations: o.decisions.reduce((n, d) => n + d.findings.reduce((m, f) => m + f.evidence.length, 0), 0),
