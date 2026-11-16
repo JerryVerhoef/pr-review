@@ -76,6 +76,9 @@ const setup = (
 
 const tags = <A extends { _tag: string }>(xs: ReadonlyArray<A>) => xs.map((x) => x._tag)
 
+/** A one-line patch of `path` adding `line`. */
+const filePatch = (path: string, line: string) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1,2 @@\n+${line}\n`
+
 describe('handlers', () => {
   it.effect('GetPr carries files and stack but no diff', () =>
     Effect.gen(function* () {
@@ -330,7 +333,7 @@ describe('handlers', () => {
       const c = yield* setup({
         files: [{ path: 'src/a.ts', additions: 1, deletions: 0 }, { path: 'src/b.ts', additions: 1, deletions: 0 }, { path: 'src/c.ts', additions: 1, deletions: 0 }],
         // Between the two heads only b.ts changed.
-        diff: (_from, to, paths) => (to === 'HEAD2' && paths.includes('src/b.ts') ? 'changed' : 'd'),
+        diff: (_from, to, paths) => paths.map((p) => filePatch(p, to === 'HEAD2' && p === 'src/b.ts' ? 'changed' : 'd')).join(''),
         sorts: [
           { decisions: [decision('a', 'src/a.ts'), decision('b', 'src/b.ts')], skim: [{ area: 'Wiring', summary: 's', files: ['src/c.ts'] }], claims: [] },
           // The new sort names a's decision differently; it still covers the same file.
@@ -359,7 +362,7 @@ describe('handlers', () => {
       const { agent, client } = setup({
         files: [{ path: 'src/a.ts', additions: 1, deletions: 0 }, { path: 'src/b.ts', additions: 1, deletions: 0 }],
         // Between the two heads only b.ts changed.
-        diff: (_from, to, paths) => (to === 'HEAD2' && paths.includes('src/b.ts') ? 'changed' : 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1,3 @@\n+x'),
+        diff: (_from, to, paths) => paths.map((p) => filePatch(p, to === 'HEAD2' && p === 'src/b.ts' ? 'changed' : 'x')).join(''),
         sorts: [
           { decisions: [decision('a', 'src/a.ts'), decision('b', 'src/b.ts')], skim: [], claims: [] },
           { decisions: [decision('a-renamed', 'src/a.ts'), decision('b', 'src/b.ts')], skim: [], claims: [] },

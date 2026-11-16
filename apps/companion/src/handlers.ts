@@ -1,4 +1,4 @@
-import { AgentError, AgentRule, appendPatch, inGuidance, opinionsMode, ruleBranch, ruleTitle, type DecisionState, type DeeperEvent, type DecisionOpinion, type DecisionStates, type Draft, type FindingStates, type OpinionEvent, type PrOpinion, type PrRef, type Rereview, type ReviewEvent, ReviewRejected, ReviewRpcs, type SortResult, type SortEvent, type StackEntry, type StackEntryStatus, type StackEvent, type StackOpinion, type StackOpinionEvent, targetKey } from '@pr-review/domain'
+import { AgentError, AgentRule, appendPatch, inGuidance, opinionsMode, ruleBranch, ruleTitle, type Decision, type DecisionState, type DeeperEvent, type DecisionOpinion, type DecisionStates, type Draft, type FindingStates, type OpinionEvent, type PrOpinion, type PrRef, type Rereview, type ReviewEvent, ReviewRejected, ReviewRpcs, type SortResult, type SortEvent, type StackEntry, type StackEntryStatus, type StackEvent, type StackOpinion, type StackOpinionEvent, targetKey } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
 import { Cause, Clock, Effect, Exit, Fiber, Layer, Option, Queue, type Scope, Stream } from 'effect'
 import { RpcMiddleware } from 'effect/rpc'
@@ -8,7 +8,8 @@ import { Agent } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
-import { moveLine, sameChange } from './interdiff.ts'
+import { changedBetween, carryFindingStates, continues } from './carry.ts'
+import { moveLine } from './interdiff.ts'
 import { Opiner } from './Opiner.ts'
 import { guidanceSection } from './opinionContext.ts'
 import { Overview } from './Overview.ts'
@@ -127,20 +128,12 @@ export const HandlersLive = ReviewRpcs.toLayer(
         .set(prKey(ref), { headSha, ...(result.mergeBase ? { mergeBase: result.mergeBase } : {}), decisions: reviewables(result).flatMap((r) => (states[r.id] ? [{ ...r, state: states[r.id]! }] : [])) })
         .pipe(Effect.orDie)
 
-    const samePaths = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) => a.length === b.length && a.every((p) => b.includes(p))
-
-    /** Whether `paths` change the same way at both heads, each diffed from its own merge base when known. */
-    const unchangedBetween = (ref: PrRef, before: { headSha: string; mergeBase?: string | undefined }, after: { headSha: string; mergeBase?: string | undefined }, paths: ReadonlyArray<string>) => {
-      const repo = repoKeyOf(ref)
-      return (
-        before.mergeBase && after.mergeBase
-          ? Effect.map(Effect.all([git.diff(repo, before.mergeBase, before.headSha, paths), git.diff(repo, after.mergeBase, after.headSha, paths)]), ([a, b]) => sameChange(a, b))
-          : Effect.map(git.diff(repo, before.headSha, after.headSha, paths), (diff) => diff === '')
-      ).pipe(
-        // The old head may be gone from the clone; then nothing is carried.
-        Effect.orElseSucceed(() => false),
+    /** The files among `paths` whose change differs between the heads; all of them when the old head is gone from the clone. */
+    const changedFor = (ref: PrRef, before: { headSha: string; mergeBase?: string | undefined }, after: { headSha: string; mergeBase?: string | undefined }, paths: ReadonlyArray<string>) =>
+      changedBetween(git, repoKeyOf(ref), before, after, paths).pipe(
+        Effect.map((c) => c.changed),
+        Effect.orElseSucceed(() => new Set(paths)),
       )
-    }
 
     /**
      * The verdicts for a head. A head opened for the first time takes the verdicts of the head last worked on, for each
@@ -155,14 +148,17 @@ export const HandlersLive = ReviewRpcs.toLayer(
       const last = Option.getOrUndefined(yield* Effect.orDie(store.lastVerdicts.get(prKey(ref))))
       const carried: Record<string, DecisionState> = {}
       const rereview: Record<string, Rereview[string]> = {}
-      if (last && last.headSha !== headSha)
-        for (const { id, paths } of reviewables(result)) {
-          const before = last.decisions.find((e) => e.id === id || samePaths(e.paths, paths))
-          if (!before) continue
-          const unchanged = yield* unchangedBetween(ref, last, { headSha, mergeBase: result.mergeBase }, [...new Set([...paths, ...before.paths])])
-          if (unchanged) carried[id] = before.state
+      if (last && last.headSha !== headSha) {
+        const pairs = reviewables(result).flatMap((r) => {
+          const before = continues(r, r.paths, last.decisions, (e) => e.paths)
+          return before ? [{ ...r, before }] : []
+        })
+        const changed = yield* changedFor(ref, last, { headSha, mergeBase: result.mergeBase }, [...new Set(pairs.flatMap((p) => [...p.paths, ...p.before.paths]))])
+        for (const { id, paths, before } of pairs) {
+          if (![...paths, ...before.paths].some((p) => changed.has(p))) carried[id] = before.state
           else rereview[id] = { since: last.headSha, was: before.state }
         }
+      }
       const fromLast = Object.keys(carried).length > 0
       for (const g of result.trusted) {
         const id = `trusted:${g.group}`
@@ -190,23 +186,19 @@ export const HandlersLive = ReviewRpcs.toLayer(
       if (!last || last.headSha === headSha) return undefined
       const [sort, before] = yield* Effect.all([sorter.cached(ref, headSha), sorter.cached(ref, last.headSha)])
       if (!sort || !before) return undefined
-      const decisions: DecisionOpinion[] = []
-      for (const d of sort.decisions) {
-        const paths = d.files.map((f) => f.path)
-        const old = before.decisions.find((e) => e.id === d.id || samePaths(e.files.map((f) => f.path), paths))
+      const pathsOf = (d: Decision) => d.files.map((f) => f.path)
+      const pairs = sort.decisions.flatMap((d) => {
+        const old = continues(d, pathsOf(d), before.decisions, pathsOf)
         const o = old && last.opinion.decisions.find((x) => x.decisionId === old.id)
-        if (!o || !(yield* unchangedBetween(ref, last, { headSha, mergeBase: sort.mergeBase }, [...new Set([...paths, ...old!.files.map((f) => f.path)])]))) continue
+        return o ? [{ d, old: old!, o }] : []
+      })
+      const changed = yield* changedFor(ref, last, { headSha, mergeBase: sort.mergeBase }, [...new Set(pairs.flatMap((p) => [...pathsOf(p.d), ...pathsOf(p.old)]))])
+      const decisions: DecisionOpinion[] = pairs
+        .filter((p) => ![...pathsOf(p.d), ...pathsOf(p.old)].some((path) => changed.has(path)))
         // Lines may have moved since the old head, and an anchor off the diff fails the whole review.
-        decisions.push({ ...o, decisionId: d.id, carriedFrom: o.carriedFrom ?? last.headSha, findings: o.findings.map((f) => ({ ...f, decisionId: d.id, anchor: null })) })
-      }
+        .map(({ d, o }) => ({ ...o, decisionId: d.id, carriedFrom: o.carriedFrom ?? last.headSha, findings: o.findings.map((f) => ({ ...f, decisionId: d.id, anchor: null })) }))
       if (!decisions.length) return undefined
-      // Copied once, so a finding restored on this head stays restored.
-      const key = headKey(ref, headSha)
-      if (Option.isNone(yield* Effect.orDie(store.findings.get(key)))) {
-        const ids = new Set(decisions.flatMap((d) => d.findings.map((f) => f.id)))
-        const old = yield* findingStatesFor(ref, last.headSha)
-        yield* Effect.orDie(store.findings.set(key, Object.fromEntries(Object.entries(old).filter(([id]) => ids.has(id)))))
-      }
+      yield* carryFindingStates(store, headKey(ref, last.headSha), headKey(ref, headSha), new Set(decisions.flatMap((d) => d.findings.map((f) => f.id))))
       return { ...last.opinion, headSha, decisions, carriedFrom: last.headSha } satisfies PrOpinion
     })
 

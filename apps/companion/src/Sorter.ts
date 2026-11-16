@@ -6,7 +6,7 @@ import { Agent } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
-import { sameChange } from './interdiff.ts'
+import { changedBetween, shiftRanges } from './carry.ts'
 import { normalize } from './normalize.ts'
 import { guidanceSection } from './opinionContext.ts'
 import { annotate, measure } from './Perf.ts'
@@ -41,17 +41,11 @@ export type SortPrompt = { prompt: string; cwd: string; repo: string; files: Rea
 /** A push smaller than this, in interdiff lines, is sorted from the previous sort; a larger one from scratch. */
 export const RESORT_LINES = 400
 
-/** The sort of an earlier head of the PR, and the files whose change differs since: see `Sorter.since`. */
-export type PreviousSort = { headSha: string; sort: SortResult; changed: ReadonlyArray<string>; interdiff: string }
-
-/** A patch per file, keyed by its path at the new side (the old side for a deleted file). */
-export const patchesByPath = (patch: string) =>
-  new Map(
-    patch
-      .split(/^(?=diff --git )/m)
-      .filter((s) => s.startsWith('diff --git '))
-      .map((s) => [/^\+\+\+ b\/(.+)$/m.exec(s)?.[1] ?? /^rename to (.+)$/m.exec(s)?.[1] ?? /^--- a\/(.+)$/m.exec(s)?.[1] ?? /^diff --git a\/(.+?) b\//.exec(s)?.[1] ?? '', s] as const),
-  )
+/**
+ * The sort of an earlier head of the PR, the files whose change differs since, and its decisions on none of those files
+ * (`kept`), their lines moved to the new head: see `Sorter.since`.
+ */
+export type PreviousSort = { headSha: string; sort: SortResult; changed: ReadonlyArray<string>; interdiff: string; kept: ReadonlyArray<Decision> }
 
 const sortPaths = (s: SortResult) => [...s.decisions.flatMap((d) => d.files.map((f) => f.path)), ...s.skim.flatMap((a) => a.files), ...s.trusted.flatMap((g) => g.files)]
 
@@ -110,6 +104,7 @@ export class Sorter extends Context.Service<
         // A moved file needs its old path too, or the diff shows it as new.
         const paths = rest.flatMap((f) => (f.previous ? [f.previous, f.path] : [f.path]))
         const master = `origin/${yield* git.defaultBranch(repoKey)}`
+        const keptIds = new Set(previous?.kept.map((d) => d.id))
         const [diff, guidance] = yield* Effect.all(
           [paths.length && !previous ? git.diff(repoKey, mergeBase, head, paths) : Effect.succeed(''), review.guidance.length ? git.lsTree(repoKey, master, review.guidance) : Effect.succeed([])],
           { concurrency: 2 },
@@ -123,13 +118,17 @@ export class Sorter extends Context.Service<
           `# Likely trusted (not in the diff below; read with git diff if unsure)\n${groups.map((g) => `## ${g.group}: ${g.why}\n${g.files.join('\n')}`).join('\n\n') || '(none)'}`,
           ...(previous
             ? [
-                `# Previous sort (head ${previous.headSha})\n${JSON.stringify({ summary: previous.sort.summary ?? '', decisions: previous.sort.decisions, skim: previous.sort.skim, trusted: previous.sort.trusted, claims: previous.sort.claims })}`,
-                `# Changed since then\nOnly these files change differently than at ${previous.headSha}; every other file's change is as it was:\n${previous.changed.join('\n')}\n\n${
+                `# Previous sort (head ${previous.headSha})\n${JSON.stringify({ summary: previous.sort.summary ?? '', skim: previous.sort.skim, trusted: previous.sort.trusted, claims: previous.sort.claims })}`,
+                `# Kept decisions\nTheir files change as they did at ${previous.headSha}, so they stay as they are and are not yours to return:\n${
+                  previous.kept.map((d) => `${d.id}: ${d.title} (${d.files.map((f) => f.path).join(', ')})`).join('\n') || '(none)'
+                }`,
+                `# Decisions to revise\n${JSON.stringify(previous.sort.decisions.filter((d) => !keptIds.has(d.id)))}`,
+                `# Changed since then\nOnly these files change differently than at ${previous.headSha}:\n${previous.changed.join('\n')}\n\n${
                   previous.interdiff.length > review.maxDiffKb * 1000
                     ? `Interdiff too large; read it with git diff ${previous.headSha} ${head} -- <path>`
                     : `Interdiff (git diff ${previous.headSha} ${head}):\n${previous.interdiff}`
                 }`,
-                `# This sort\nThe PR was sorted at ${previous.headSha} (above) and pushed to since. Return the whole sort for ${head}. Keep each decision whose files are not under "Changed since then" exactly as it was: same id, title, lens, reason, theme, note, existing and files. Revise, split, merge or add decisions for the changed code, place new files, and leave out files no longer in the PR. The full diff is git diff ${mergeBase} ${head}; read from it where the interdiff is not enough.`,
+                `# This sort\nThe PR was sorted at ${previous.headSha} and pushed to since. Return decisions for the changed code only: revise, split, merge or drop the decisions to revise, add decisions where the changed code needs them, and place every file under "Changed since then" that is still in the PR. Give new decisions ids no kept decision has. Return skim, trusted, claims and summary for the whole PR at ${head}; a claim may name kept decisions. The full diff is git diff ${mergeBase} ${head}; read from it where the interdiff is not enough.`,
               ]
             : [
                 diff.length > review.maxDiffKb * 1000
@@ -148,7 +147,10 @@ export class Sorter extends Context.Service<
           promptBytes: Buffer.byteLength(prompt),
           ...(previous ? { since: true, changedFiles: previous.changed.length } : {}),
         })
-        return { prompt, cwd: git.dir(repoKey), repo: repoKey, files, finish: (answer) => normalize(answer, files, groups, head, review.neverTrust, mergeBase) } satisfies SortPrompt
+        // Kept decisions come first, as the agent never writes them.
+        const finish = (answer: AgentSort) =>
+          normalize({ ...answer, decisions: [...(previous?.kept ?? []), ...answer.decisions.filter((d) => !keptIds.has(d.id))] }, files, groups, head, review.neverTrust, mergeBase)
+        return { prompt, cwd: git.dir(repoKey), repo: repoKey, files, finish } satisfies SortPrompt
       }, measure('context.prepare'))
 
       const run = Effect.fn('Sorter.run')(function* (key: SortKey) {
@@ -175,13 +177,15 @@ export class Sorter extends Context.Service<
           const { headSha: head, mergeBase } = yield* git.fetchPr(repoKey, ref.number, pr.baseRef, headSha)
           const files = yield* git.numstat(repoKey, mergeBase, head)
           const paths = [...new Set([...files.flatMap((f) => (f.previous ? [f.previous, f.path] : [f.path])), ...sortPaths(sort)])]
-          const [was, now] = yield* Effect.all([git.diff(repoKey, before.mergeBase, before.headSha, paths), git.diff(repoKey, mergeBase, head, paths)], { concurrency: 2 })
-          const [a, b] = [patchesByPath(was), patchesByPath(now)]
-          const changed = [...new Set([...a.keys(), ...b.keys()])].filter((p) => !a.has(p) || !b.has(p) || !sameChange(a.get(p)!, b.get(p)!))
+          const { changed: differ, was, now } = yield* changedBetween(git, repoKey, before, { headSha: head, mergeBase }, paths)
+          const changed = [...differ]
+          const kept = sort.decisions
+            .filter((d) => d.files.every((f) => !differ.has(f.path)))
+            .map((d) => ({ ...d, files: d.files.map((f) => ({ ...f, ranges: shiftRanges(was.get(f.path) ?? '', now.get(f.path) ?? '', f.ranges) })) }))
           const interdiff = changed.length ? yield* git.diff(repoKey, before.headSha, head, changed) : ''
           const lines = interdiff.split('\n').filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l)).length
           yield* annotate({ interdiffLines: lines, changedFiles: changed.length })
-          return lines >= RESORT_LINES ? undefined : ({ headSha: before.headSha, sort, changed, interdiff } satisfies PreviousSort)
+          return lines >= RESORT_LINES ? undefined : ({ headSha: before.headSha, sort, changed, interdiff, kept } satisfies PreviousSort)
         }).pipe(
           // The old head may be gone from the clone; then the sort starts over.
           Effect.orElseSucceed(() => undefined),

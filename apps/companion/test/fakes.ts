@@ -94,7 +94,7 @@ export const fakeAgent = (
 
 export const overviewReply: StackOverview = { summary: 's', tables: [], modules: [], endpoints: [], sharedLayers: [] }
 
-export const fakeGit = (o: { files?: FileStat[]; diff?: string | ((from: string, to: string, paths: ReadonlyArray<string>) => string); /** One text for every file, or texts keyed `ref:path` (others fail). */ show?: string | Record<string, string>; rules?: string[] } = {}) => {
+export const fakeGit = (o: { files?: FileStat[]; /** A `GitError` from the function fails that diff. */ diff?: string | ((from: string, to: string, paths: ReadonlyArray<string>) => string | GitError); /** One text for every file, or texts keyed `ref:path` (others fail). */ show?: string | Record<string, string>; rules?: string[] } = {}) => {
   const diffPaths: Array<ReadonlyArray<string>> = []
   const shown: string[] = []
   const listed: Array<ReadonlyArray<string>> = []
@@ -105,7 +105,12 @@ export const fakeGit = (o: { files?: FileStat[]; diff?: string | ((from: string,
       ensureClone: () => Effect.void,
       fetchPr: (_k, _n, _b, headSha) => Effect.succeed({ headSha: headSha || 'HEAD1', baseSha: 'BASE1', mergeBase: 'MB1' }),
       numstat: () => Effect.succeed(o.files ?? []),
-      diff: (_k, from, to, paths = []) => Effect.sync(() => (diffPaths.push(paths), typeof o.diff === 'function' ? o.diff(from, to, paths) : (o.diff ?? ''))),
+      diff: (_k, from, to, paths = []) =>
+        Effect.suspend(() => {
+          diffPaths.push(paths)
+          const d = typeof o.diff === 'function' ? o.diff(from, to, paths) : (o.diff ?? '')
+          return typeof d === 'string' ? Effect.succeed(d) : Effect.fail(d)
+        }),
       show: (_k, ref, path) =>
         Effect.suspend(() => {
           shown.push(ref)

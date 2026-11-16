@@ -7,6 +7,7 @@ import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { judged, type OpinionContext, Opiner, quickDecision } from './Opiner.ts'
 import { annotate, measure } from './Perf.ts'
+import { carryFindingStates } from './carry.ts'
 import { type SortError, Sorter, writtenDecisions } from './Sorter.ts'
 import { Store } from './Store.ts'
 import { type TicketSummary, Tickets } from './Tickets.ts'
@@ -47,8 +48,6 @@ type Tracker = ReturnType<typeof tracker>
 
 /** Where a session's steps go. */
 type Slot = { phase: Phase['id']; worker: number }
-
-const samePaths = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) => a.length === b.length && a.every((p) => b.includes(p))
 
 /** A finding as the agent gave it, so a carried one is checked and anchored again at the new head. */
 const asAgentFinding = ({ severity, axis, kind, title, take, evidence, alternative, comment, anchor, handledIn }: AgentFinding): AgentFinding => ({ severity, axis, kind, title, take, evidence, alternative, comment, anchor, handledIn })
@@ -226,15 +225,11 @@ export class Reviewer extends Context.Service<
         let specReady = false
         let specTaken = false
         const decided = new Map<string, DecisionOpinion>()
-        const changed = new Set(previous?.changed)
-        /** Decisions whose files change as they did at the previous head, with the opinion they had there. */
+        /** Decisions the sort keeps from the previous head (see `Sorter.since`), with the opinion they had there. */
         const carried = new Map<string, { decision: Decision; opinion: DecisionOpinion }>()
-        const carryOf = (d: Decision) => {
-          if (!previous || !last) return undefined
-          const paths = d.files.map((f) => f.path)
-          const old = previous.sort.decisions.find((e) => e.id === d.id || samePaths(e.files.map((f) => f.path), paths))
-          const opinion = old && last.opinion.decisions.find((o) => o.decisionId === old.id)
-          return opinion && ![...paths, ...old!.files.map((f) => f.path)].some((p) => changed.has(p)) ? opinion : undefined
+        for (const d of previous?.kept ?? []) {
+          const opinion = last?.opinion.decisions.find((o) => o.decisionId === d.id)
+          if (opinion) carried.set(d.id, { decision: d, opinion })
         }
         /** What is left for the agent to judge. */
         const toJudge = (s: SortResult) => judged(s).filter((d) => !carried.has(d.id))
@@ -250,12 +245,6 @@ export class Reviewer extends Context.Service<
 
         const enqueue = (ds: ReadonlyArray<Decision>) =>
           Effect.gen(function* () {
-            const before = carried.size
-            for (const d of ds) {
-              const opinion = !carried.has(d.id) && !queued.some((q) => q.id === d.id) ? carryOf(d) : undefined
-              if (opinion) carried.set(d.id, { decision: d, opinion })
-            }
-            if (context && carried.size > before) yield* settleCarried(context)
             const fresh = ds.filter((d) => !queued.some((q) => q.id === d.id) && !carried.has(d.id))
             if (!fresh.length) return
             queued.push(...fresh)
@@ -289,8 +278,13 @@ export class Reviewer extends Context.Service<
             [...carried].filter(([id]) => !decided.has(id)),
             ([id, { decision, opinion }]) =>
               c.decide({ decisionId: id, authorCase: opinion.authorCase, checked: opinion.checked, findings: opinion.findings.map(asAgentFinding) }, decision, opinion.deep).pipe(
-                Effect.map((made) => made && void decided.set(id, { ...made, carriedFrom: opinion.carriedFrom ?? previous!.headSha })),
-                Effect.ignore,
+                Effect.orElseSucceed(() => undefined),
+                Effect.flatMap((made) => {
+                  if (made) return Effect.sync(() => void decided.set(id, { ...made, carriedFrom: opinion.carriedFrom ?? previous!.headSha }))
+                  // Judged afresh: by a session while the queue is open, else by the last retry.
+                  carried.delete(id)
+                  return enqueue([decision])
+                }),
               ),
             { discard: true },
           ).pipe(Effect.andThen(publish))
@@ -479,13 +473,9 @@ export class Reviewer extends Context.Service<
           opinion = yield* context.opinion(judged(sort).flatMap((d) => decided.get(d.id) ?? []))
           yield* opiner.remember(ref, headSha, opinion)
           yield* Effect.orDie(store.lastOpinion.set(`${repoKey}#${ref.number}`, { headSha, ...(sort.mergeBase ? { mergeBase: sort.mergeBase } : {}), opinion }))
-          // What the reviewer did with a carried finding (posted, dismissed) carries with it.
+          // What the reviewer did with a carried finding (posted, dismissed) carries with it; a finding keeps its id, as its decision does.
           const ids = new Set(opinion.decisions.filter((d) => d.carriedFrom !== undefined).flatMap((d) => d.findings.map((f) => f.id)))
-          const here = `${repoKey}#${ref.number}@${headSha}`
-          if (last && ids.size && Option.isNone(yield* Effect.orDie(store.findings.get(here)))) {
-            const before = Option.getOrElse(yield* Effect.orDie(store.findings.get(`${repoKey}#${ref.number}@${last.headSha}`)), () => ({}))
-            yield* Effect.orDie(store.findings.set(here, Object.fromEntries(Object.entries(before).filter(([id]) => ids.has(id)))))
-          }
+          if (last) yield* carryFindingStates(store, `${repoKey}#${ref.number}@${last.headSha}`, `${repoKey}#${ref.number}@${headSha}`, ids)
         }
         if (wantOpinion) yield* t.end('opinion', opinionError ? 'failed' : 'done')
         return { sort, opinion: opinion ?? cachedOpinion ?? null, ...(opinionError ? { opinionError } : {}) } satisfies Review
