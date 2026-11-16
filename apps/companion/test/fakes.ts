@@ -30,8 +30,8 @@ export const fakeAccount2: AgentAccount = { ...fakeAccount, id: 'fake2', name: '
 
 /**
  * An Agent whose structured runs and session turns answer with `reply()`, streaming runs emit `Hi` then Done, and ticket runs answer with `ticket()` (default: no ticket account).
- * A session takes the first `pool` account it doesn't avoid; `idle()` lists the whole pool.
- * A session failing with "usage limit" benches its account: `use` reruns in a new session on the next pool account, while there is one.
+ * A session takes the least busy `pool` account it doesn't avoid (the first of equals); `freeSlots()` is the pool's slots but one, the asking session's.
+ * A session failing with "usage limit" benches its account for later sessions too: `use` reruns in a new session on the next pool account, while there is one.
  */
 export const fakeAgent = (
   reply: (call: AgentCall) => Effect.Effect<unknown, any> = () => Effect.succeed({ decisions: [], skim: [], claims: [] } satisfies AgentSort),
@@ -40,6 +40,8 @@ export const fakeAgent = (
 ) => {
   const calls: AgentCall[] = []
   let sessions = 0
+  const busy = new Map<string, number>()
+  const benched = new Set<string>()
   const ticketPrompts: string[] = []
   const ticketModels: Array<'fast' | 'main' | undefined> = []
   const answer = (call: AgentCall, onStep: ((s: string) => Effect.Effect<void>) | undefined, schema: Schema.Top) =>
@@ -58,8 +60,9 @@ export const fakeAgent = (
         const attempt = (tried: ReadonlySet<string>): ReturnType<typeof use> =>
           Effect.suspend(() => {
             const session = ++sessions
-            const free = (a: AgentAccount) => !o.avoid?.has(a.id) && !tried.has(a.id)
-            const account = pool.find(free) ?? fakeAccount
+            const free = (a: AgentAccount) => !o.avoid?.has(a.id) && !tried.has(a.id) && !benched.has(a.id)
+            const account = pool.filter(free).sort((a, b) => (busy.get(a.id) ?? 0) - (busy.get(b.id) ?? 0))[0] ?? fakeAccount
+            busy.set(account.id, (busy.get(account.id) ?? 0) + 1)
             let turn = 0
             return use(
               {
@@ -67,11 +70,14 @@ export const fakeAgent = (
                   answer({ ...o, prompt, session, account: account.id, turn: turn++, model, log: turnKind ? { ...o.log, kind: turnKind } : o.log }, o.onStep, schema) as never,
               },
               account,
-            ).pipe(Effect.catchIf((e) => /usage limit/.test(e.message) && pool.some((a) => a.id !== account.id && free(a)), () => attempt(new Set([...tried, account.id]))))
+            ).pipe(
+              Effect.ensuring(Effect.sync(() => void busy.set(account.id, busy.get(account.id)! - 1))),
+              Effect.catchIf((e) => /usage limit/.test(e.message) && pool.some((a) => a.id !== account.id && free(a)), () => (benched.add(account.id), attempt(new Set([...tried, account.id])))),
+            )
           })
         return attempt(new Set())
       },
-      idle: () => Effect.succeed(pool),
+      freeSlots: () => Effect.succeed(pool.reduce((n, a) => n + a.concurrency, 0) - 1),
       streaming: (o) =>
         Stream.suspend(() => {
           calls.push(o)

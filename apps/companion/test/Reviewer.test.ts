@@ -246,11 +246,26 @@ describe('Reviewer', () => {
       assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
     }))
 
-  it.effect('4 decisions or fewer stay in one session even with an idle account', () =>
+  it.effect('two decisions split over a free slot too', () =>
     Effect.gen(function* () {
       const { agent, layer } = setup({ decisions: few, pool: [fakeAccount, fakeAccount2] })
       yield* review.pipe(Effect.provide(layer))
-      assert.deepStrictEqual(turns(agent.calls), ['1/fake/0/main/sort', '1/fake/1/main/opinion', '1/fake/2/fast/opinion'])
+      assert.deepStrictEqual(turns(agent.calls), ['1/fake/0/main/sort', '1/fake/1/main/opinion', '2/fake2/0/fast/opinion'])
+    }))
+
+  it.effect('high-impact decisions spread over every free slot, low-impact share one', () =>
+    Effect.gen(function* () {
+      const fakeAccount3 = { ...fakeAccount, id: 'fake3', name: 'Fake 3' }
+      const decisions = [decision('h1', true), decision('h2', true), decision('h3', true), decision('l1', false), decision('l2', false)]
+      const { agent, layer } = setup({ decisions, pool: [fakeAccount, { ...fakeAccount2, concurrency: 2 }, fakeAccount3] })
+      const r = yield* review.pipe(Effect.provide(layer))
+      const opinions = agent.calls.filter((c) => c.log.kind === 'opinion')
+      assert.deepStrictEqual(
+        opinions.map((c) => [c.model, idsIn(c)]),
+        [['main', ['h1']], ['main', ['h2']], ['main', ['h3']], ['fast', ['l1', 'l2']]],
+      )
+      assert.strictEqual(new Set(opinions.map((c) => c.session)).size, 4)
+      assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'h2', 'h3', 'l1', 'l2'])
     }))
 
   it.effect('a cached sort runs only the opinion', () =>
@@ -359,7 +374,7 @@ describe('Reviewer', () => {
         opinion: (call) => (call.account === 'fake' ? Effect.fail(new AgentError({ message: "You've hit your usage limit" })) : Effect.succeed(opinionOn(call.prompt))),
       })
       const r = yield* review.pipe(Effect.provide(layer))
-      assert.deepStrictEqual(turns(agent.calls), ['1/fake/0/main/sort', '1/fake/1/main/opinion', '2/fake2/0/main/opinion', '2/fake2/1/fast/opinion'])
+      assert.deepStrictEqual(turns(agent.calls), ['1/fake/0/main/sort', '1/fake/1/main/opinion', '2/fake2/0/main/opinion', '3/fake2/0/fast/opinion'])
       // The fresh session has no sort turn before it, so it gets the diff.
       assert.match(agent.calls[2]!.prompt, /THE DIFF/)
       assert.isUndefined(r.opinionError)
@@ -378,7 +393,7 @@ describe('Reviewer', () => {
       assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
     }))
 
-  it.live('a benched high turn keeps the low group the second account already answered', () =>
+  it.live('a benched high turn keeps the groups other sessions already answered', () =>
     Effect.gen(function* () {
       const fakeAccount3 = { ...fakeAccount, id: 'fake3', name: 'Fake 3' }
       const { agent, layer } = setup({
@@ -389,7 +404,7 @@ describe('Reviewer', () => {
             : Effect.succeed(opinionOn(call.prompt)),
       })
       const r = yield* review.pipe(Effect.provide(layer))
-      assert.deepStrictEqual(turns(agent.calls), ['1/fake/0/main/sort', '1/fake/1/main/opinion', '2/fake2/0/fast/opinion', '3/fake2/0/main/opinion'])
+      assert.deepStrictEqual(turns(agent.calls), ['1/fake/0/main/sort', '1/fake/1/main/opinion', '2/fake2/0/main/opinion', '3/fake2/0/fast/opinion', '4/fake2/0/main/opinion'])
       assert.isUndefined(r.opinionError)
       assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
     }))

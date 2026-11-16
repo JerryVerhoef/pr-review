@@ -42,6 +42,27 @@ const tracker = (phases: Phases) => {
 }
 type Tracker = ReturnType<typeof tracker>
 
+/** Decisions judged in one turn, and the model for them. */
+export type OpinionGroup = { decisions: ReadonlyArray<Decision>; model: 'fast' | 'main' }
+
+const chunks = <A>(xs: ReadonlyArray<A>, k: number) => {
+  const n = Math.min(k, xs.length)
+  return Array.from({ length: n }, (_, i) => xs.slice(Math.floor((i * xs.length) / n), Math.floor(((i + 1) * xs.length) / n)))
+}
+
+/**
+ * Turns for `sessions` parallel sessions: low-impact decisions together on the fast model, high-impact spread over the
+ * rest on the main one. One turn judges decision after decision, so its time grows with how many it has.
+ * Groups past `sessions` run after the first in its session.
+ */
+export const opinionGroups = (hi: ReadonlyArray<Decision>, lo: ReadonlyArray<Decision>, sessions: number): ReadonlyArray<OpinionGroup> => {
+  const forLo = !lo.length ? 0 : hi.length ? 1 : sessions
+  return [
+    ...chunks(hi, Math.max(1, sessions - forLo)).map((decisions) => ({ decisions, model: 'main' as const })),
+    ...chunks(lo, Math.max(1, forLo)).map((decisions) => ({ decisions, model: 'fast' as const })),
+  ]
+}
+
 /** Where a session's steps and `Judging:` lines go, and the decisions it judges in order. */
 type Slot = { phase: Phase['id']; worker: number; judging: ReadonlyArray<Decision> }
 
@@ -206,8 +227,9 @@ export class Reviewer extends Context.Service<
         let sort = cachedSort
         let context: OpinionContext | undefined
         let opinionError: string | undefined
-        let high: AgentOpinion | undefined
-        let low: AgentOpinion | undefined
+        let groups: ReadonlyArray<OpinionGroup> | undefined
+        const answers: Array<AgentOpinion | undefined> = []
+        let workers = 1
 
         const step = (w: Worker, s: string): Worker => ({ ...w, step: s, recent: w.step ? [...w.recent, w.step].slice(-4) : w.recent })
         const options = (slot: Slot): SessionOptions => ({
@@ -224,8 +246,10 @@ export class Reviewer extends Context.Service<
             }),
         })
         const named = (slot: Slot, a: AgentAccount) => t.worker(slot.phase, slot.worker, (w) => ({ ...w, account: a.name }))
-        const ask = (turns: AgentTurns, c: OpinionContext, group: ReadonlyArray<Decision>, model: 'fast' | 'main', continued: boolean) =>
-          Effect.flatMap(c.prompt(group, { continued }), (prompt) => turns.structured(prompt, AgentOpinion, model, 'opinion'))
+        const ask = (turns: AgentTurns, c: OpinionContext, i: number, continued: boolean) =>
+          Effect.flatMap(c.prompt(groups![i]!.decisions, { continued }), (prompt) => turns.structured(prompt, AgentOpinion, groups![i]!.model, 'opinion')).pipe(
+            Effect.tap((a) => Effect.sync(() => void (answers[i] = a))),
+          )
 
         const main: Slot = { phase: 'sort', worker: 0, judging: [] }
         const judging = (s: SortResult) =>
@@ -259,29 +283,33 @@ export class Reviewer extends Context.Service<
             const got = yield* Effect.result(Fiber.join(contextFiber).pipe(measure('context.wait', { on: 'context' })))
             if (got._tag === 'Failure') return void (opinionError = got.failure.message)
             const c = (context = got.success)
-            // A quick sort's one decision gets the main model, as on the quick path.
-            const hi = sort.quick ? decisions : decisions.filter((d) => impact(d) === 'high')
-            const lo = sort.quick ? [] : decisions.filter((d) => impact(d) === 'low')
-            const other = decisions.length > 4 && hi.length && lo.length ? (yield* agent.idle()).find((a) => a.id !== account.id) : undefined
-            main.judging = other ? hi : [...hi, ...lo]
-            yield* annotate({ decisions: decisions.length, highDecisions: hi.length, lowDecisions: lo.length, splitAccounts: other !== undefined })
-
-            const side: Slot = { phase: 'opinion', worker: 1, judging: lo }
-            // Never waits for a slot; without one the low group runs here after the high one.
-            const elsewhere =
-              other && !low
-                ? agent.session({ ...options(side), avoid: new Set([account.id]), noWait: true }, (turns2, account2) =>
-                    Effect.andThen(named(side, account2), ask(turns2, c, lo, 'fast', false)).pipe(Effect.tap((a) => Effect.sync(() => void (low = a)))),
-                  )
-                : Effect.void
-            // `low` is set as soon as the side session answers, so a failed high turn doesn't throw it away.
-            yield* Effect.all([high || !hi.length ? Effect.void : Effect.map(ask(turns, c, hi, 'main', continued), (a) => void (high = a)), Effect.ignore(elsewhere)], {
-              concurrency: 2,
-            })
-            if (!low && lo.length) {
-              main.judging = [...hi, ...lo]
-              low = yield* ask(turns, c, lo, 'fast', continued)
+            const sessions = 1 + (yield* agent.freeSlots())
+            if (!groups) {
+              // A quick sort's one decision gets the main model, as on the quick path.
+              const hi = sort.quick ? decisions : decisions.filter((d) => impact(d) === 'high')
+              const lo = sort.quick ? [] : decisions.filter((d) => impact(d) === 'low')
+              groups = opinionGroups(hi, lo, sessions)
+              yield* annotate({ decisions: decisions.length, highDecisions: hi.length, lowDecisions: lo.length, opinionGroups: groups.length, freeSlots: sessions - 1 })
             }
+            const gs = groups
+            const here = (i: number) => i === 0 || i >= sessions
+            main.judging = gs.filter((_, i) => here(i)).flatMap((g) => g.decisions)
+            // Never waits for a slot; a group without one runs here afterwards.
+            const side = (i: number) => {
+              const slot: Slot = { phase: 'opinion', worker: 0, judging: gs[i]!.decisions }
+              return agent.session({ ...options(slot), noWait: true }, (turns2, account2) =>
+                Effect.andThen(
+                  Effect.suspend(() => ((slot.worker = workers++), named(slot, account2))),
+                  ask(turns2, c, i, false),
+                ),
+              )
+            }
+            const elsewhere = gs.flatMap((_, i) => (!here(i) && !answers[i] ? [Effect.ignore(side(i))] : []))
+            // Each answer is kept as it comes, so a failed turn doesn't throw the others away.
+            yield* Effect.all([answers[0] ? Effect.void : ask(turns, c, 0, continued), ...elsewhere], { concurrency: 'unbounded', discard: true })
+            const left = [...gs.keys()].filter((i) => !answers[i])
+            if (left.some((i) => !here(i))) main.judging = [...main.judging, ...left.filter((i) => !here(i)).flatMap((i) => gs[i]!.decisions)]
+            for (const i of left) yield* ask(turns, c, i, continued)
           }),
         )
         // Nothing for a session to do: the sort is known and there is no opinion to make.
@@ -296,8 +324,8 @@ export class Reviewer extends Context.Service<
         if (context && !opinionError) {
           const decisions = judged(sort)
           const order = new Map(decisions.map((d, i) => [d.id, i]))
-          const answers = [...(high?.decisions ?? []), ...(low?.decisions ?? [])].filter((a) => order.has(a.decisionId))
-          const made = yield* Effect.result(context.finish({ decisions: answers.sort((a, b) => order.get(a.decisionId)! - order.get(b.decisionId)!) }, decisions))
+          const all = answers.flatMap((a) => a?.decisions ?? []).filter((a) => order.has(a.decisionId))
+          const made = yield* Effect.result(context.finish({ decisions: all.sort((a, b) => order.get(a.decisionId)! - order.get(b.decisionId)!) }, decisions))
           if (made._tag === 'Failure') opinionError = made.failure.message
           else {
             opinion = made.success
