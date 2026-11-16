@@ -269,8 +269,8 @@ describe('Reviewer', () => {
       const first = yield* Deferred.make<void>()
       const { agent, layer } = setup({
         pool: [fakeAccount, fakeAccount2],
-        // Writes the first decision, then only finishes once it has been judged.
-        sort: (call) => Effect.as(Effect.andThen(call.onDelta!(`{"summary": "s", "decisions": [${JSON.stringify(many[0])},`), Deferred.await(first)), sortOf(many)),
+        // Writes the first decision and starts the next, then only finishes once the first has been judged.
+        sort: (call) => Effect.as(Effect.andThen(call.onDelta!(`{"summary": "s", "decisions": [${JSON.stringify(many[0])}, {"id": "l`), Deferred.await(first)), sortOf(many)),
         opinion: (call) => Effect.as(idsIn(call).includes('h1') ? Deferred.succeed(first, undefined) : Effect.void, opinionOn(call.prompt)),
       })
       const r = yield* review.pipe(Effect.provide(layer))

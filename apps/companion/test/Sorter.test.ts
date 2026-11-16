@@ -1,9 +1,9 @@
 import { NodeServices } from '@effect/platform-node'
 import { assert, describe, it } from '@effect/vitest'
-import { AgentError, defaultSettings, type FileStat } from '@pr-review/domain'
+import { AgentError, type Decision, defaultSettings, type FileStat } from '@pr-review/domain'
 import { Effect, Layer } from 'effect'
 import { KeyValueStore, PersistedCache } from 'effect/persistence'
-import { Sorter } from '../src/Sorter.ts'
+import { Sorter, writtenDecisions } from '../src/Sorter.ts'
 import { cacheOptions, PatchKey, Store } from '../src/Store.ts'
 import { configLayer, fakeAgent, fakeGit, fakeGitHub, ref } from './fakes.ts'
 import { tmp } from './helpers.ts'
@@ -137,4 +137,20 @@ describe('Store', () => {
       }).pipe(Effect.provide(layers({ agent }).layer))
       assert.strictEqual(agent.calls.length, 1)
     }))
+})
+
+describe('writtenDecisions', () => {
+  const d = (id: string): Decision => ({ id, title: id, lens: 'quality', reason: 'convention', theme: 't', note: 'n', existing: null, authorWhy: null, files: [{ path: 'a.ts', ranges: [] }] })
+  const answer = JSON.stringify({ summary: 's', decisions: [d('d1'), d('d2')], skim: [], claims: [] })
+
+  it('gives each decision once the next one has started, never one half written', () => {
+    const ids = (text: string) => writtenDecisions(text).map((x) => x.id)
+    const second = answer.indexOf('{"id":"d2"')
+    assert.deepStrictEqual(ids(answer.slice(0, second - 1)), [])
+    assert.deepStrictEqual(ids(answer.slice(0, second + 12)), ['d1'])
+    assert.deepStrictEqual(ids(answer.slice(0, answer.indexOf('"skim"') + 9)), ['d1', 'd2'])
+    assert.deepStrictEqual(ids('```json\n' + answer + '\n```'), ['d1', 'd2'])
+    assert.deepStrictEqual(ids('{"decisions": [{"id": 1}, {"id": "x"}'), [])
+    assert.deepStrictEqual(ids('no answer yet'), [])
+  })
 })

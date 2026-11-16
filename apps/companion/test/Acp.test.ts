@@ -12,7 +12,7 @@ type Ask = (command: string, kind?: acp.ToolKind) => Promise<boolean>
 
 /** An ACP agent in-process: answers each prompt with `turn`, and records what the client asked of it. */
 const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp.StopReason | { stopReason: acp.StopReason; usage?: unknown }>; needsLogin?: boolean } = {}) => {
-  const seen = { modes: [] as string[], models: [] as string[], auth: [] as string[], resumed: [] as string[], prompts: [] as string[], meta: [] as unknown[], efforts: [] as string[] }
+  const seen = { modes: [] as string[], models: [] as string[], auth: [] as string[], resumed: [] as string[], prompts: [] as string[], meta: [] as Array<acp.NewSessionRequest['_meta']>, efforts: [] as string[] }
   let loggedIn = false
   const app = acp
     .agent({ name: 'fake' })

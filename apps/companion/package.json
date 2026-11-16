@@ -13,7 +13,8 @@
     "@pr-review/domain": "workspace:*",
     "@pr-review/native-messaging": "workspace:*",
     "effect": "~4.1.1",
-    "octokit": "^5.0.5"
+    "octokit": "^5.0.5",
+    "partial-json": "0.1.7"
   },
   "devDependencies": {
     "rolldown": "1.2.16"

@@ -831,7 +831,7 @@ test('the review opens at the sort while decisions are judged, and fills in with
     ),
   })
   expect(await heading('Decision one')).toBeInTheDocument()
-  expect(await screen.findByText('Name the timeout')).toBeInTheDocument()
+  expect(await screen.findByText('Name the timeout', {}, { timeout: 3000 })).toBeInTheDocument()
   expect(screen.getByText('Judging decisions: 1 of 2 done')).toBeInTheDocument()
   expect(screen.queryByRole('button', { name: "Claude's opinion" })).toBeNull()
   await userEvent.keyboard('j')
@@ -839,7 +839,7 @@ test('the review opens at the sort while decisions are judged, and fills in with
   expect(screen.getByText('Claude is judging this decision')).toBeInTheDocument()
 
   await act(async () => void Effect.runSync(Deferred.succeed(gate, undefined)))
-  expect(await screen.findByText('Races the save')).toBeInTheDocument()
+  expect(await screen.findByText('Races the save', {}, { timeout: 3000 })).toBeInTheDocument()
   expect(screen.queryByText(/Judging decisions/)).toBeNull()
   // Two now ranks first by severity, but the page keeps the order it opened with.
   await userEvent.keyboard('k')

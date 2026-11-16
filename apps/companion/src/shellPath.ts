@@ -34,7 +34,7 @@ const NPX = /^npx\s+(?:-y|--yes)\s+(\S+)(.*)$/s
 export async function directCommand(command: string, env: NodeJS.ProcessEnv): Promise<string> {
   const m = NPX.exec(command.trim())
   if (!m) return command
-  const [, spec, rest] = m as unknown as [string, string, string]
+  const [, spec = '', rest = ''] = m
   const name = spec.replace(/(?<=.)@[^@/]*$/, '')
   const short = name.split('/').pop()!
   try {

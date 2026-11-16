@@ -1,14 +1,13 @@
-import { type AgentAccount, type AgentDecisionOpinion, AgentOpinion, AgentQuick, AgentSort, Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
+import { type AgentAccount, type AgentDecisionOpinion, AgentOpinion, AgentQuick, AgentSort, type Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
-import { type Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream, SubscriptionRef } from 'effect'
+import { type Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream, SubscriptionRef } from 'effect'
 import { Agent, type AgentTurns, type SessionOptions } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { judged, type OpinionContext, Opiner, quickDecision } from './Opiner.ts'
 import { annotate, measure } from './Perf.ts'
-import { completeItems } from './partialJson.ts'
-import { type SortError, Sorter } from './Sorter.ts'
+import { type SortError, Sorter, writtenDecisions } from './Sorter.ts'
 import { Store } from './Store.ts'
 import { type TicketSummary, Tickets } from './Tickets.ts'
 import { needsTicketAgent } from './ticketRefs.ts'
@@ -50,8 +49,6 @@ type Tracker = ReturnType<typeof tracker>
 type Slot = { phase: Phase['id']; worker: number }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
-
-const decodeDecision = Schema.decodeUnknownOption(Decision)
 
 export class Reviewer extends Context.Service<
   Reviewer,
@@ -244,10 +241,9 @@ export class Reviewer extends Context.Service<
         const fromSort = (delta: string) =>
           Effect.suspend(() => {
             sortText += delta
-            const ds = completeItems(sortText, 'decisions').flatMap((x) => {
-              const d = Option.getOrUndefined(decodeDecision(x))
-              const files = d?.files.filter((f) => known.has(f.path)) ?? []
-              return d && files.length ? [{ ...d, files }] : []
+            const ds = writtenDecisions(sortText).flatMap((d) => {
+              const files = d.files.filter((f) => known.has(f.path))
+              return files.length ? [{ ...d, files }] : []
             })
             return enqueue(ds)
           })
