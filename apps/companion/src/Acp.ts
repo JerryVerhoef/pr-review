@@ -3,7 +3,7 @@ import { AgentError, type AgentAccount } from '@pr-review/domain'
 import { Clock, Context, Effect, Exit, Fiber, Layer, Option, Queue, Schema, type Scope, Stream, type Tracer } from 'effect'
 import { spawn } from 'node:child_process'
 import { Readable, Writable } from 'node:stream'
-import { safeGhCommand, safeGitCommand } from './gitOnly.ts'
+import { safeGhCommand, safeGitCommand, words } from './gitOnly.ts'
 import { directCommand, expandHome, loginPath } from './shellPath.ts'
 import { annotate, elapsedMs, measure, type Meta, round, startSpan } from './Perf.ts'
 import { ticketPermission } from './permissions.ts'
@@ -76,17 +76,16 @@ const toUpdate = (u: acp.SessionUpdate, seen: Set<string>): AcpUpdate | undefine
   return { _tag: 'Step', step: describeTool('Bash', { command }) }
 }
 
-const SHELL = /^\s*(git|gh)\s+([a-z][a-z-]*)/
-
 /** What a tool call is, without its arguments: the agent's tool name and kind, and for git or gh the subcommand. */
 const toolMeta = (u: acp.ToolCall | acp.ToolCallUpdate): Meta => {
   const command = commandOf(u.rawInput)
-  const shell = command === undefined ? null : SHELL.exec(command)
+  const w = command === undefined ? undefined : words(command)
+  const shell = w?.[0] === 'git' || w?.[0] === 'gh' ? w : undefined
   return {
     tool: Option.getOrUndefined(Schema.decodeUnknownOption(ClaudeCodeMeta)(u._meta))?.claudeCode.toolName,
     toolKind: u.kind ?? undefined,
-    command: shell?.[1],
-    subcommand: shell?.[2],
+    command: shell?.[0],
+    subcommand: shell?.[1],
   }
 }
 

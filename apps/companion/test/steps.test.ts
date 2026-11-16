@@ -11,6 +11,9 @@ describe('describeTool', () => {
     expect(describeTool('Bash', { command: 'git ls-tree -r --name-only origin/master apps/core/src' })).toBe('Listing apps/core/src')
     expect(describeTool('Bash', { command: 'git grep -n "findNotDeleted\\|function findOnline" HEAD' })).toBe('Searching for "findNotDeleted" or "function findOnline"')
     expect(describeTool('Bash', { command: 'git grep -nE "class (Foo|Bar)" HEAD' })).toBe('Searching for "class (Foo|Bar)"')
+    expect(describeTool('Bash', { command: 'git show "abc:apps/my file.ts" | head -40' })).toBe('Reading my file.ts')
+    expect(describeTool('Bash', { command: 'git log -- "src/a b.ts"' })).toBe('Reading the history of a b.ts')
+    expect(describeTool('Bash', { command: 'git log | grep x' })).toBe('Running a shell command')
   })
 
   it('names the other tools and falls back to the tool name', () => {

@@ -32,7 +32,7 @@ const commandWords = (c: Command) => {
 }
 
 /** The words of a single plain command, one trailing `| head`/`| tail` aside; undefined for any other shell. */
-const words = (command: string): ReadonlyArray<string> | undefined => {
+export const words = (command: string): ReadonlyArray<string> | undefined => {
   // Bash reads a CR as part of a word; refused anyway, since no read needs one.
   if (/[\0-\x08\n-\x1f]/.test(command)) return undefined
   const script = parse(command)

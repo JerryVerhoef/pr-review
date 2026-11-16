@@ -1,12 +1,9 @@
 import { Effect, PubSub, Stream } from 'effect'
+import { basename } from 'node:path'
+import { words } from './gitOnly.ts'
 
-const basename = (path: string) => path.split('/').filter(Boolean).at(-1) ?? path
-const unquote = (s: string) => s.replace(/^(['"])(.*)\1$/, '$2')
-// Arguments with quoted strings kept whole; options dropped.
-const args = (command: string) => (command.match(/'[^']*'|"[^"]*"|\S+/g) ?? []).slice(2).filter((a) => !a.startsWith('-')).map(unquote)
 // Basic-regex alternation (`a\|b`) reads as a list of searches.
 const searching = (pattern: string) => `Searching for ${pattern.split('\\|').map((p) => `"${p}"`).join(' or ')}`
-const afterDashes = (command: string) => command.split(/\s--\s/)[1]?.trim().split(/\s+/)[0]
 
 /** A short line for the loading indicator: what Claude is looking at right now. */
 export function describeTool(name: string, input: Record<string, unknown>): string {
@@ -16,10 +13,14 @@ export function describeTool(name: string, input: Record<string, unknown>): stri
   if (name === 'StructuredOutput') return 'Writing up the decisions'
   if (name === 'Glob') return `Listing ${str('pattern')}`
   if (name !== 'Bash') return `Using ${name}`
-  const command = str('command')
-  const sub = command.split(/\s+/)[1]
-  const path = afterDashes(command)
-  const [first] = args(command)
+  const w = words(str('command'))
+  if (!w) return 'Running a shell command'
+  const sub = w[1]
+  const dashes = w.indexOf('--')
+  const path = dashes < 0 ? undefined : w[dashes + 1]
+  // Arguments, options dropped.
+  const args = w.slice(2, dashes < 0 ? undefined : dashes).filter((a) => !a.startsWith('-'))
+  const [first] = args
   switch (sub) {
     case 'show':
       return first?.includes(':') ? `Reading ${basename(first.split(':').slice(1).join(':'))}` : `Reading commit ${first ?? ''}`.trim()
@@ -30,9 +31,9 @@ export function describeTool(name: string, input: Record<string, unknown>): stri
     case 'diff':
       return path ? `Comparing ${basename(path)}` : 'Comparing changes'
     case 'ls-tree':
-      return `Listing ${args(command).at(-1) ?? 'files'}`
+      return `Listing ${args.at(-1) ?? 'files'}`
     default:
-      return `Running git ${sub ?? ''}`.trim()
+      return `Running ${w[0]} ${sub ?? ''}`.trim()
   }
 }
 
