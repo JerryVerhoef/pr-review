@@ -13,6 +13,7 @@ import {
   type Phase,
   type PrOpinion,
   ReviewRejected,
+  ReviewStopped,
   type Decision,
   type PrView,
   type ReviewEvent,
@@ -123,7 +124,7 @@ const renderPage = (
     /** Set on the review while no opinion is cached. */
     opinionError?: string
     /** Replaces the review stream, which by default follows `sort`. */
-    review?: Stream.Stream<ReviewEvent>
+    review?: Stream.Stream<ReviewEvent, ReviewStopped>
     deeper?: () => Stream.Stream<DeeperEvent>
     /** Whether the companion says the review was stopped; StopReview and ResumeReview flip it. */
     stopped?: boolean
@@ -655,9 +656,15 @@ test('a stopped PR shows the stopped page and runs nothing until Start review', 
 
 test('a review stopped from another tab shows the stopped page', async () => {
   let stop = () => {}
-  const page = renderPage({ review: Stream.concat(Stream.take(preparing, 1), Stream.drain(Stream.fromEffect(Effect.andThen(Effect.sleep(50), Effect.sync(() => stop()))))).pipe(Stream.concat(Stream.fromEffect(Effect.interrupt))) })
+  // Like the companion: a stopped run ends the stream with ReviewStopped.
+  const page = renderPage({ review: Stream.concat(Stream.take(preparing, 1), Stream.drain(Stream.fromEffect(Effect.andThen(Effect.sleep(50), Effect.sync(() => stop()))))).pipe(Stream.concat(Stream.fail(new ReviewStopped()))) })
   stop = page.stop
+  const seen: string[] = []
+  const watch = new MutationObserver(() => void seen.push(document.body.textContent ?? ''))
+  watch.observe(document.body, { childList: true, subtree: true, characterData: true })
   await screen.findByText("You stopped Claude's review of this PR.", undefined, { timeout: 3000 })
+  watch.disconnect()
+  expect(seen.some((t) => t.includes('sort failed'))).toBe(false)
 })
 
 test('renders the review once on Done, ordered by severity', async () => {

@@ -1,6 +1,6 @@
 import { Schema } from 'effect'
 import { Rpc, RpcGroup } from 'effect/rpc'
-import { AgentError, CompanionUnavailable, ReviewRejected, GitError, GitHubError, RepoNotConfigured } from './errors.ts'
+import { AgentError, CompanionUnavailable, ReviewRejected, ReviewStopped, GitError, GitHubError, RepoNotConfigured } from './errors.ts'
 import { AskEvent, AskTarget, Chat, DecisionState, Draft, PrRef, PrView, ReviewEvent, SortEvent, StackEvent } from './schemas.ts'
 import { DeeperEvent, FindingState, OpinionEvent, RuleDraft, StackOpinionEvent } from './opinion.ts'
 import { AccountStatus, Settings } from './settings.ts'
@@ -31,7 +31,7 @@ export class ReviewRpcs extends RpcGroup.make(
   Rpc.make('Review', {
     payload: { ref: PrRef, headSha: Schema.String },
     success: ReviewEvent,
-    error: Schema.Union([RepoNotConfigured, GitError, GitHubError, AgentError, CompanionUnavailable]),
+    error: Schema.Union([RepoNotConfigured, GitError, GitHubError, AgentError, ReviewStopped, CompanionUnavailable]),
     stream: true,
   }),
   /** Starts preparing a review early, so it is ready when the reviewer opens it. True when it started (or one was running). */

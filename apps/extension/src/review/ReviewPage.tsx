@@ -1,7 +1,6 @@
 import { RegistryContext, useAtomSet, useAtomValue } from '@effect/atom-react'
 import type { DecisionState, DecisionStates, OpinionEvent, PrRef, PrView, ReviewEvent } from '@pr-review/domain'
 import { useHotkeys } from '@tanstack/react-hotkeys'
-import { Cause } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
 import { useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useAtoms } from '../atoms.ts'
@@ -56,16 +55,17 @@ function Loaded({ prRef, pr, ...embed }: { prRef: PrRef; pr: PrView } & Embed) {
   const registry = useContext(RegistryContext)
   const atom = reviewAtom(prRef, pr.headSha)
   const result = useAtomValue(atom)
-  // A review stopped from another tab ends this one's stream; reading the PR again shows it stopped.
-  const interrupted = AsyncResult.isFailure(result) && Cause.hasInterruptsOnly(result.cause)
+  // A review stopped elsewhere (another tab, the stack view) ends with ReviewStopped; reading the PR again shows it stopped.
+  const stopped = (failureOf(result) as { _tag?: string } | undefined)?._tag === 'ReviewStopped'
   useEffect(() => {
-    if (interrupted) registry.refresh(prAtom(prRef))
-  }, [interrupted, registry, prAtom, prRef])
+    if (stopped) registry.refresh(prAtom(prRef))
+  }, [stopped, registry, prAtom, prRef])
   const event = AsyncResult.isSuccess(result) ? result.value : undefined
   const [shown, setShown] = useState<ReviewDone>()
   if (event?._tag === 'Done' && event !== shown) setShown(event)
   const review = event?._tag === 'Done' ? event : shown
   if (review) return <Ready prRef={prRef} pr={pr} review={review} {...embed} />
+  if (stopped) return <Stopped prRef={prRef} pr={pr} />
   if (AsyncResult.isFailure(result)) return <Ready prRef={prRef} pr={pr} {...embed} sortError={String((failureOf(result) as { message?: string } | undefined)?.message ?? 'unknown error')} />
   return <Preparing prRef={prRef} pr={pr} phases={event?._tag === 'Preparing' ? event.phases : []} />
 }

@@ -1,4 +1,4 @@
-import { AgentError, AgentRule, appendPatch, inGuidance, opinionsMode, ruleBranch, ruleTitle, type Decision, type DecisionState, type DeeperEvent, type DecisionOpinion, type DecisionStates, type Draft, type FindingStates, type OpinionEvent, type PrOpinion, type PrRef, type Rereview, type ReviewEvent, ReviewRejected, ReviewRpcs, type SortResult, type SortEvent, type StackEntry, type StackEntryStatus, type StackEvent, type StackOpinion, type StackOpinionEvent, targetKey } from '@pr-review/domain'
+import { AgentError, AgentRule, ReviewStopped, appendPatch, inGuidance, opinionsMode, ruleBranch, ruleTitle, type Decision, type DecisionState, type DeeperEvent, type DecisionOpinion, type DecisionStates, type Draft, type FindingStates, type OpinionEvent, type PrOpinion, type PrRef, type Rereview, type ReviewEvent, ReviewRejected, ReviewRpcs, type SortResult, type SortEvent, type StackEntry, type StackEntryStatus, type StackEvent, type StackOpinion, type StackOpinionEvent, targetKey } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
 import { Cause, Clock, Effect, Exit, Fiber, Layer, Option, Queue, type Scope, Stream } from 'effect'
 import { RpcMiddleware } from 'effect/rpc'
@@ -15,7 +15,7 @@ import { guidanceSection } from './opinionContext.ts'
 import { Overview } from './Overview.ts'
 import { annotate, measure } from './Perf.ts'
 import { Reviewer } from './Reviewer.ts'
-import { Sorter } from './Sorter.ts'
+import { type SortError, Sorter } from './Sorter.ts'
 import { buildStack } from './stack.ts'
 import { StackOpiner } from './StackOpiner.ts'
 import { Tickets } from './Tickets.ts'
@@ -302,8 +302,11 @@ export const HandlersLive = ReviewRpcs.toLayer(
         Stream.unwrap(
           Effect.gen(function* () {
             yield* config.repo(repoKeyOf(ref))
+            if (yield* reviewer.isStopped(ref)) return yield* new ReviewStopped()
             yield* reviewer.prepare(ref, headSha)
-            const { fiber, cached } = yield* startIn(scope, reviewer.result(ref, headSha))
+            // A stop interrupts the run; whoever watches it learns why.
+            const result = Effect.catchCause(reviewer.result(ref, headSha), (cause): Effect.Effect<never, SortError | ReviewStopped> => (Cause.hasInterruptsOnly(cause) ? Effect.fail(new ReviewStopped()) : Effect.failCause(cause)))
+            const { fiber, cached } = yield* startIn(scope, result)
             // After this PR's run, so it never waits on the one above for an agent slot.
             yield* Effect.forkIn(Effect.andThen(Fiber.await(fiber), prepareAbove(ref)), scope)
             const end = Stream.fromEffect(
@@ -455,9 +458,13 @@ export const HandlersLive = ReviewRpcs.toLayer(
               entries,
               (entry, i) =>
                 Effect.gen(function* () {
+                  const entryRef = { ...ref, number: entry.pr.number }
+                  if (yield* reviewer.isStopped(entryRef)) {
+                    entries[i] = { ...entry, status: 'failed', error: new ReviewStopped().message }
+                    return yield* emit()
+                  }
                   entries[i] = { ...entry, status: 'running' }
                   yield* emit()
-                  const entryRef = { ...ref, number: entry.pr.number }
                   const steps = yield* Effect.forkChild(
                     Stream.runForEach(sorter.steps(entryRef, entry.pr.headSha), (step) =>
                       Effect.suspend(() => (entries[i]!.status === 'running' ? ((entries[i] = { ...entries[i]!, step }), emit()) : Effect.void)),

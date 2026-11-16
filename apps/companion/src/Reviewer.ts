@@ -535,6 +535,7 @@ export class Reviewer extends Context.Service<
             yield* Effect.orDie(store.stopped.set(prKey(ref), true))
             const mine = [...runs].filter(([key]) => key.startsWith(`${prKey(ref)}@`)).flatMap(([, run]) => (run.fiber ? [run.fiber] : []))
             yield* Fiber.interruptAll(mine)
+            yield* sorter.cancel(ref)
           }),
         resume: (ref) => Effect.orDie(store.stopped.remove(prKey(ref))),
         isStopped,
