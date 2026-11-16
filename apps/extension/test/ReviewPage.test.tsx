@@ -816,3 +816,32 @@ test('Make it a rule is offered on the reviewer\'s own line comments only', asyn
   expect(await screen.findByRole('dialog', { name: 'Make it a rule' }, { timeout: 3000 })).toBeInTheDocument()
   expect(ruleTexts).toEqual(['by jorrin'])
 })
+
+test('the review opens at the sort while decisions are judged, and fills in without reordering', async () => {
+  const gate = Deferred.makeUnsafe<void>()
+  const review = (decisions: DecisionOpinion[], judging: boolean): ReviewEvent => ({
+    _tag: 'Done', sort: sorted, state: {}, findingStates: {}, opinion: { ...opinion, decisions }, ...(judging ? { judging } : {}),
+  })
+  const one = decisionOpinion('one', [finding({ id: 'f1', decisionId: 'one', severity: 'ask', title: 'Name the timeout' })])
+  const two = decisionOpinion('two', [finding({ id: 'f2', decisionId: 'two', severity: 'blocks', title: 'Races the save' })])
+  renderPage({
+    review: Stream.make(review([one], true)).pipe(
+      Stream.concat(Stream.fromEffect(Effect.as(Deferred.await(gate), review([one, two], false)))),
+      Stream.concat(Stream.never),
+    ),
+  })
+  expect(await heading('Decision one')).toBeInTheDocument()
+  expect(await screen.findByText('Name the timeout', {}, { timeout: 3000 })).toBeInTheDocument()
+  expect(screen.getByText('Judging decisions: 1 of 2 done')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: "Claude's opinion" })).toBeNull()
+  await userEvent.keyboard('j')
+  expect(await heading('Decision two')).toBeInTheDocument()
+  expect(screen.getByText('Claude is judging this decision')).toBeInTheDocument()
+
+  await act(async () => void Effect.runSync(Deferred.succeed(gate, undefined)))
+  expect(await screen.findByText('Races the save', {}, { timeout: 3000 })).toBeInTheDocument()
+  expect(screen.queryByText(/Judging decisions/)).toBeNull()
+  // Two now ranks first by severity, but the page keeps the order it opened with.
+  await userEvent.keyboard('k')
+  expect(await heading('Decision one')).toBeInTheDocument()
+})

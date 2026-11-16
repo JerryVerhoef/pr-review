@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { Readable, Writable } from 'node:stream'
 import { safeGhCommand, safeGitCommand } from './gitOnly.ts'
-import { loginPath } from './shellPath.ts'
+import { directCommand, loginPath } from './shellPath.ts'
 import { annotate, elapsedMs, measure, type Meta, round, startSpan } from './Perf.ts'
 import { ticketPermission } from './permissions.ts'
 import { describeTool } from './steps.ts'
@@ -162,14 +162,19 @@ const promptTimer = (clock: Clock.Clock, tracer: Tracer.Tracer, parent: Tracer.A
 
 const expandHome = (v: string) => (v === '~' || v.startsWith('~/') ? homedir() + v.slice(1) : v)
 
+const direct = new Map<string, Promise<string>>()
+
 /** Starts `account.command` through the shell, on the user's own PATH. Keys that would bill an API instead of the login are left out. */
 export const spawnAgent: Launch = (account, cwd) =>
   Effect.gen(function* () {
     const PATH = (yield* Effect.promise(loginPath)) ?? process.env.PATH
     const env: NodeJS.ProcessEnv = { ...process.env, PATH, ...Object.fromEntries(Object.entries(account.env).map(([k, v]) => [k, expandHome(v)])) }
     for (const key of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY']) if (!(key in account.env)) delete env[key]
+    const key = `${PATH}\n${account.command}`
+    if (!direct.has(key)) direct.set(key, directCommand(account.command, env))
+    const command = yield* Effect.promise(() => direct.get(key)!)
     const child = yield* Effect.acquireRelease(
-      Effect.sync(() => spawn(account.command, { shell: true, cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })),
+      Effect.sync(() => spawn(command, { shell: true, cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })),
       (c) => Effect.sync(() => void c.kill()),
     )
     let output = ''
@@ -179,7 +184,7 @@ export const spawnAgent: Launch = (account, cwd) =>
     return { target, output: () => output }
   })
 
-export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd: string, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean }): Effect.Effect<AcpSession, AgentError, Scope.Scope> }>()(
+export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd: string, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; /** A `thought_level` value, set when the agent offers it. */ effort?: string | undefined }): Effect.Effect<AcpSession, AgentError, Scope.Scope> }>()(
   'pr-review/Acp',
 ) {
   static readonly layerWith = (launch: Launch) =>
@@ -264,6 +269,11 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
                     ),
               )
             if (account.model) yield* setModel(account.model)
+            // Pinned for the session: a later model switch keeps it.
+            const thought = options?.find((c): c is acp.SessionConfigOption & { type: 'select' } => c.category === 'thought_level' && c.type === 'select')
+            const levels = thought?.options.flatMap((x) => ('options' in x ? x.options : [x])).map((x) => x.value) ?? []
+            if (thought && o?.effort && o.effort !== thought.currentValue && levels.includes(o.effort))
+              yield* call(() => agent.request(acp.methods.agent.session.setConfigOption, { sessionId, configId: thought.id, value: o.effort! })).pipe(measure('acp.setEffort'))
 
             const steps = new Set<string>()
             return {

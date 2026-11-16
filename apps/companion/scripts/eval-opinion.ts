@@ -120,6 +120,7 @@ const agentTraced = Layer.effect(
         agent.session(o, (turns, account) =>
           use(
             {
+              ready: turns.ready,
               structured: (prompt, schema, model, kind) =>
                 Effect.gen(function* () {
                   const from = yield* Clock.currentTimeMillis

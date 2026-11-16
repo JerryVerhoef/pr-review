@@ -1,6 +1,7 @@
-import { AgentSort, type AgentError, type FileStat, type GitError, type GitHubError, type PrRef, type RepoNotConfigured, type SortResult } from '@pr-review/domain'
-import { Context, Deferred, Effect, Exit, Fiber, Layer, type Stream } from 'effect'
+import { AgentSort, type AgentError, Decision, type FileStat, type GitError, type GitHubError, type PrRef, type RepoNotConfigured, type SortResult } from '@pr-review/domain'
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, type Stream } from 'effect'
 import { readFileSync } from 'node:fs'
+import { parse } from 'partial-json'
 import { Agent } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
@@ -14,6 +15,23 @@ import { buildTrusted } from './trusted.ts'
 const instructions = readFileSync(new URL('../prompts/sort.md', import.meta.url), 'utf8')
 
 export type SortError = AgentError | GitError | GitHubError | RepoNotConfigured
+
+const parsePartial = Option.liftThrowable(parse)
+const decodeDecisions = Schema.decodeUnknownOption(Schema.Struct({ decisions: Schema.Array(Decision) }))
+
+/** The decisions in a sort answer that are written out so far: the last one only once the answer has moved past them, as it may still be half written. */
+export const writtenDecisions = (text: string): ReadonlyArray<Decision> => {
+  const start = text.indexOf('{')
+  if (start < 0) return []
+  return parsePartial(text.slice(start)).pipe(
+    Option.filter((sort) => typeof sort === 'object' && sort !== null && Array.isArray(sort.decisions)),
+    Option.flatMap((sort) => {
+      const past = ['skim', 'trusted', 'claims'].some((k) => k in sort)
+      return decodeDecisions({ decisions: past ? sort.decisions : sort.decisions.slice(0, -1) })
+    }),
+    Option.match({ onNone: () => [], onSome: (s) => s.decisions }),
+  )
+}
 
 /** A sort ready to run: the prompt, and what makes the agent's answer a `SortResult`. */
 export type SortPrompt = { prompt: string; cwd: string; files: ReadonlyArray<FileStat>; finish(answer: AgentSort): SortResult }

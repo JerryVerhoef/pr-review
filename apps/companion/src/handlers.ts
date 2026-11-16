@@ -17,6 +17,7 @@ import { Reviewer } from './Reviewer.ts'
 import { Sorter } from './Sorter.ts'
 import { buildStack } from './stack.ts'
 import { StackOpiner } from './StackOpiner.ts'
+import { Tickets } from './Tickets.ts'
 import { cacheOptions, type Chats, type OverviewEntry, PatchKey, Store, storeFailuresDie } from './Store.ts'
 
 const ruleInstructions = readFileSync(new URL('../prompts/rule.md', import.meta.url), 'utf8')
@@ -103,6 +104,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
     const overview = yield* Overview
     const agent = yield* Agent
     const reviewer = yield* Reviewer
+    const tickets = yield* Tickets
     // Sorts and opinions run in the companion's scope, so a closed or reloaded tab doesn't throw away a paid run.
     const scope = yield* Effect.scope
 
@@ -320,12 +322,20 @@ export const HandlersLive = ReviewRpcs.toLayer(
               }),
             )
             if (cached) return end
-            return reviewer.progress(ref, headSha).pipe(
+            const preparing = reviewer.progress(ref, headSha).pipe(
               Stream.changesWith((a, b) => JSON.stringify(a) === JSON.stringify(b)),
               Stream.map((phases): ReviewEvent => ({ _tag: 'Preparing', phases })),
-              Stream.interruptWhen(Fiber.await(fiber)),
-              Stream.concat(end),
             )
+            // The sort as soon as it is done, then again with each decision judged.
+            const judging = reviewer.partial(ref, headSha).pipe(
+              Stream.mapEffect((r) =>
+                Effect.gen(function* () {
+                  const verdicts = yield* verdictsFor(ref, headSha, r.sort)
+                  return { _tag: 'Done', sort: r.sort, ...verdicts, opinion: r.opinion, findingStates: yield* findingStatesFor(ref, headSha), judging: true } satisfies ReviewEvent
+                }),
+              ),
+            )
+            return Stream.merge(preparing, judging).pipe(Stream.interruptWhen(Fiber.await(fiber)), Stream.concat(end))
           }),
         ),
 
@@ -415,11 +425,17 @@ export const HandlersLive = ReviewRpcs.toLayer(
       Stack: ({ ref }) =>
         Stream.callback<StackEvent, Effect.Error<ReturnType<typeof openStack>>>((queue) =>
           Effect.gen(function* () {
-            const { stack } = yield* openStack(ref)
+            const { gh, stack } = yield* openStack(ref)
+            const settings = yield* config.settings
+            const automatic = opinionsMode(settings) === 'automatic'
             yield* annotate({ prs: stack.length })
             // The bottom PR is where the reviewer starts; opening each PR then prepares the one above it.
             const bottom = stack[0]
             if (bottom) yield* reviewer.prepare({ ...ref, number: bottom.number }, bottom.headSha)
+            // The stack opinion reads the top PR's ticket; looked up now, it is cached by then.
+            const top = stack.at(-1)
+            if (top && automatic)
+              yield* Effect.forkIn(Effect.ignore(Effect.flatMap(gh.getPr(ref.owner, ref.repo, top.number), (pr) => tickets.summary({ ...ref, number: top.number }, pr))), scope)
             const entries: StackEntryStatus[] = yield* Effect.forEach(stack, (pr) =>
               Effect.gen(function* () {
                 const prRef = { ...ref, number: pr.number }
@@ -435,7 +451,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
             yield* emit()
 
             const sorted: OverviewEntry[] = []
-            // Bottom first: the Agent's two permits are taken in stack order.
+            // Bottom first, as many at once as the pool has slots.
             yield* Effect.forEach(
               entries,
               (entry, i) =>
@@ -461,7 +477,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
                   }
                   yield* emit()
                 }),
-              { concurrency: 2 },
+              { concurrency: Math.max(1, settings.accounts.filter((a) => a.enabled).reduce((n, a) => n + a.concurrency, 0)) },
             )
 
             const done = sorted.filter(Boolean)
@@ -475,7 +491,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
               yield* emit()
             }
 
-            if (opinionsMode(yield* config.settings) === 'automatic' && entries.every((e) => e.status === 'done') && !(yield* stackOpiner.cached(ref))) {
+            if (automatic && entries.every((e) => e.status === 'done') && !(yield* stackOpiner.cached(ref))) {
               stackOpinion = { running: true }
               yield* emit()
               const fiber = yield* Effect.forkIn(stackOpiner.opine(ref), scope)

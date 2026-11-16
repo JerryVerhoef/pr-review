@@ -1,15 +1,16 @@
-import { type AgentAccount, AgentOpinion, AgentQuick, AgentSort, type Decision, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
+import { type AgentAccount, type AgentDecisionOpinion, AgentOpinion, AgentQuick, AgentSort, type Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
-import { Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Stream, SubscriptionRef } from 'effect'
+import { type Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream, SubscriptionRef } from 'effect'
 import { Agent, type AgentTurns, type SessionOptions } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { judged, type OpinionContext, Opiner, quickDecision } from './Opiner.ts'
 import { annotate, measure } from './Perf.ts'
-import { type SortError, Sorter } from './Sorter.ts'
+import { type SortError, Sorter, writtenDecisions } from './Sorter.ts'
 import { Store } from './Store.ts'
 import { type TicketSummary, Tickets } from './Tickets.ts'
+import { needsTicketAgent } from './ticketRefs.ts'
 import { buildTrusted } from './trusted.ts'
 
 const quickInstructions = readFileSync(new URL('../prompts/quick.md', import.meta.url), 'utf8')
@@ -20,10 +21,12 @@ type Worker = Phase['workers'][number]
 type Phases = SubscriptionRef.SubscriptionRef<ReadonlyArray<Phase>>
 
 /** Phase updates that only set values, so a session `use` that reruns on another account repeats them harmlessly. */
-const tracker = (phases: Phases) => {
+const tracker = (phases: Phases, partial: SubscriptionRef.SubscriptionRef<Review | undefined>) => {
   const now = Effect.map(Clock.currentTimeMillis, (ms) => new Date(ms).toISOString())
   const update = (id: Phase['id'], f: (p: Phase) => Phase) => SubscriptionRef.update(phases, (ps) => ps.map((p) => (p.id === id ? f(p) : p)))
   return {
+    /** The review so far, while the opinion is still being judged. */
+    partial: (r: Review) => SubscriptionRef.set(partial, r),
     begin: (id: Phase['id'], label: string) =>
       Effect.flatMap(now, (startedAt) =>
         SubscriptionRef.update(phases, (ps) =>
@@ -42,13 +45,10 @@ const tracker = (phases: Phases) => {
 }
 type Tracker = ReturnType<typeof tracker>
 
-/** Where a session's steps and `Judging:` lines go, and the decisions it judges in order. */
-type Slot = { phase: Phase['id']; worker: number; judging: ReadonlyArray<Decision> }
+/** Where a session's steps go. */
+type Slot = { phase: Phase['id']; worker: number }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
-
-// Tolerates markdown around the line, like **Judging:** `d1`.
-const JUDGING = /^\W*Judging:[\s*_`]*([\w.:-]+)/
 
 export class Reviewer extends Context.Service<
   Reviewer,
@@ -59,6 +59,8 @@ export class Reviewer extends Context.Service<
     progress(ref: PrRef, headSha: string): Stream.Stream<ReadonlyArray<Phase>>
     /** The prepared review, starting a preparation when none runs. A failed opinion still returns the sort. */
     result(ref: PrRef, headSha: string): Effect.Effect<Review, SortError>
+    /** The running preparation's review so far: from the sort on, then after each decision judged. Never ends; empty when nothing runs. */
+    partial(ref: PrRef, headSha: string): Stream.Stream<Review>
   }
 >()('pr-review/Reviewer') {
   static readonly layer = Layer.effect(
@@ -74,7 +76,7 @@ export class Reviewer extends Context.Service<
       const tickets = yield* Tickets
       const scope = yield* Effect.scope
       const keyOf = (ref: PrRef, headSha: string) => `${ref.host}/${ref.owner}/${ref.repo}#${ref.number}@${headSha}`
-      const runs = new Map<string, { phases: Phases; done: Deferred.Deferred<Review, SortError> }>()
+      const runs = new Map<string, { phases: Phases; partial: SubscriptionRef.SubscriptionRef<Review | undefined>; done: Deferred.Deferred<Review, SortError> }>()
 
       /** Small PRs get one turn on the whole change instead of piles. Undefined means sort as usual. */
       const quick = Effect.fnUntraced(function* (ref: PrRef, headSha: string, t: Tracker, ticket: Fiber.Fiber<TicketSummary>) {
@@ -202,12 +204,67 @@ export class Reviewer extends Context.Service<
           yield* t.end('sort', 'done')
         }
 
-        // Kept outside the session, so a rerun on another account skips what already finished.
+        // Kept outside the sessions, so a rerun on another account skips what already finished.
         let sort = cachedSort
         let context: OpinionContext | undefined
         let opinionError: string | undefined
-        let high: AgentOpinion | undefined
-        let low: AgentOpinion | undefined
+        // A ticket only an agent can read is checked in a turn of its own, so judging doesn't wait for it.
+        const slowTicket = wantOpinion && needsTicketAgent(pr, ref.host)
+        const answers = new Map<string, AgentDecisionOpinion>()
+        const specAnswers = new Map<string, AgentDecisionOpinion>()
+        let specDone = !slowTicket
+        let specReady = false
+        let specTaken = false
+        const decided = new Map<string, DecisionOpinion>()
+        // Each decision once, taken from the sort as it writes them, then the rest of the finished sort; then the spec turn.
+        const queue = yield* Queue.unbounded<Decision | 'spec', Cause.Done>()
+        const queued: Decision[] = []
+        const taken = new Set<string>()
+        const found = yield* Deferred.make<void>()
+        const sorted = yield* Deferred.make<void>()
+        let streamed = 0
+        // Opinion workers are numbered as they join, so sessions that start during the sort come first.
+        let workers = 0
+
+        const enqueue = (ds: ReadonlyArray<Decision>) =>
+          Effect.gen(function* () {
+            const fresh = ds.filter((d) => !queued.some((q) => q.id === d.id))
+            if (!fresh.length) return
+            queued.push(...fresh)
+            yield* Queue.offerAll(queue, fresh)
+            yield* t.begin('opinion', `Judging ${plural(queued.length, 'decision')}`)
+            yield* Deferred.succeed(found, undefined)
+          })
+        const known = new Set(sortPrompt?.files.map((f) => f.path))
+        let sortText = ''
+        /** Decisions the sort has finished writing, kept as `normalize` keeps them. */
+        const fromSort = (delta: string) =>
+          Effect.suspend(() => {
+            sortText += delta
+            const ds = writtenDecisions(sortText).flatMap((d) => {
+              const files = d.files.filter((f) => known.has(f.path))
+              return files.length ? [{ ...d, files }] : []
+            })
+            return enqueue(ds)
+          })
+
+        /** The review so far, for the page to show while the rest is judged. */
+        const publish = Effect.suspend(() => {
+          if (!sort) return Effect.void
+          const s = sort
+          if (!context) return t.partial({ sort: s, opinion: null })
+          return Effect.flatMap(context.opinion(judged(s).flatMap((d) => decided.get(d.id) ?? []), true), (opinion) => t.partial({ sort: s, opinion }))
+        })
+        /** A decision's answers so far, with its Spec findings once they are in, made the decision's opinion. */
+        const settle = (c: OpinionContext, id: string) =>
+          Effect.gen(function* () {
+            const a = answers.get(id)
+            const d = (sort ? judged(sort) : queued).find((x) => x.id === id)
+            if (!a || !d) return
+            const made = yield* c.decide({ ...a, findings: [...a.findings, ...(specAnswers.get(id)?.findings ?? [])] }, d)
+            if (made) decided.set(id, made)
+            yield* publish
+          }).pipe(Effect.catch((e) => Effect.sync(() => void (opinionError ??= e.message))))
 
         const step = (w: Worker, s: string): Worker => ({ ...w, step: s, recent: w.step ? [...w.recent, w.step].slice(-4) : w.recent })
         const options = (slot: Slot): SessionOptions => ({
@@ -215,95 +272,172 @@ export class Reviewer extends Context.Service<
           ...(wantOpinion ? { related: repoSettings(settings, repoKey).related.map((r) => r.repo) } : {}),
           log: { kind: 'sort', owner: ref.owner, repo: ref.repo, number: ref.number, headSha },
           onStep: (s) => Effect.suspend(() => t.worker(slot.phase, slot.worker, (w) => step(w, s))),
-          onText: (line) =>
-            Effect.suspend(() => {
-              const id = JUDGING.exec(line)?.[1]
-              const i = slot.judging.findIndex((d) => d.id === id)
-              if (i < 0) return Effect.void
-              return t.worker(slot.phase, slot.worker, (w) => ({ ...w, current: `Judging ${i + 1} of ${slot.judging.length}: ${slot.judging[i]!.title}` }))
-            }),
         })
         const named = (slot: Slot, a: AgentAccount) => t.worker(slot.phase, slot.worker, (w) => ({ ...w, account: a.name }))
-        const ask = (turns: AgentTurns, c: OpinionContext, group: ReadonlyArray<Decision>, model: 'fast' | 'main', continued: boolean) =>
-          Effect.flatMap(c.prompt(group, { continued }), (prompt) => turns.structured(prompt, AgentOpinion, model, 'opinion'))
 
-        const main: Slot = { phase: 'sort', worker: 0, judging: [] }
-        const judging = (s: SortResult) =>
-          Effect.andThen(
-            Effect.sync(() => void (main.phase = 'opinion')),
-            t.begin('opinion', `Judging ${plural(judged(s).length, 'decision')}`),
+        const judgeTurn = (turns: AgentTurns, c: OpinionContext, ds: ReadonlyArray<Decision>, o: { continued: boolean; brief: boolean }) =>
+          Effect.gen(function* () {
+            const prompt = yield* c.prompt(ds, { ...o, ...(slowTicket ? { spec: 'skip' as const } : {}) })
+            const model = sort?.quick || ds.some((d) => impact(d) === 'high') ? 'main' : 'fast'
+            const answer = yield* turns.structured(prompt, AgentOpinion, model, 'opinion')
+            for (const a of answer.decisions) answers.set(a.decisionId, a)
+            yield* Effect.forEach(answer.decisions, (a) => settle(c, a.decisionId), { discard: true })
+          })
+        const specTurn = (turns: AgentTurns, c: OpinionContext, continued: boolean) =>
+          Effect.gen(function* () {
+            const prompt = yield* c.prompt(judged(sort!), { continued, spec: 'only' })
+            const answer = yield* turns.structured(prompt, AgentOpinion, 'main', 'opinion')
+            for (const a of answer.decisions) specAnswers.set(a.decisionId, a)
+            specDone = true
+            yield* Effect.forEach(answer.decisions, (a) => settle(c, a.decisionId), { discard: true })
+          })
+
+        /**
+         * Takes from the queue one turn at a time until it is drained. The first turn in a session gets the whole
+         * context, later ones only their decision and diff; `continued` means the sort ran in this session.
+         */
+        const judge = (turns: AgentTurns, slot: Slot, continued: boolean) =>
+          Effect.gen(function* () {
+            yield* turns.ready
+            if (!contextFiber!.pollUnsafe())
+              yield* t.worker('opinion', slot.worker, (w) => step(w, slowTicket || ticket.pollUnsafe() ? 'Reading the stack and review guidance' : 'Reading the ticket'))
+            const got = yield* Effect.result(Fiber.join(contextFiber!).pipe(measure('context.wait', { on: 'context' })))
+            if (got._tag === 'Failure') return void (opinionError = got.failure.message)
+            const c = (context = got.success)
+            yield* publish
+            let first = true
+            for (;;) {
+              // The spec turn goes first once it can run, so it doesn't trail the last decision.
+              const item = specReady && !specTaken ? 'spec' : yield* Queue.take(queue).pipe(Effect.orElseSucceed(() => undefined))
+              if (!item) return
+              if (item === 'spec') {
+                if (specTaken) continue
+                specTaken = true
+                yield* t.worker('opinion', slot.worker, (w) => ({ ...w, current: 'Checking the ticket' }))
+                yield* specTurn(turns, c, continued)
+              } else {
+                taken.add(item.id)
+                // The finished sort may have dropped a decision it was writing.
+                if (sort && !judged(sort).some((x) => x.id === item.id)) continue
+                yield* t.worker('opinion', slot.worker, (w) => ({ ...w, current: `Judging ${queued.indexOf(item) + 1} of ${queued.length}: ${item.title}` }))
+                yield* judgeTurn(turns, c, [item], { continued, brief: !first })
+              }
+              first = false
+            }
+          })
+
+        // Never waits for a slot; the sort's session and the others drain the queue without it.
+        const side = Effect.suspend(() => {
+          const slot: Slot = { phase: 'opinion', worker: 0 }
+          return agent.session({ ...options(slot), noWait: true }, (turns, account) =>
+            Effect.andThen(
+              Effect.suspend(() => ((slot.worker = workers++), named(slot, account))),
+              judge(turns, slot, false),
+            ),
           )
+        })
+        /** Ends the queue once the sort is done; first, when the ticket is read, the spec turn goes in ahead of what is left. */
+        const specGate = Effect.gen(function* () {
+          yield* Deferred.await(sorted)
+          if (sort && !specDone && judged(sort).length) {
+            yield* Fiber.await(ticket)
+            specReady = true
+            // Queued too, to wake a session waiting on the queue.
+            yield* Queue.offer(queue, 'spec')
+          }
+          yield* Queue.end(queue)
+        })
+        let started = 0
+        /** A session on every free slot, while there is still something to take. */
+        const launch = Effect.gen(function* () {
+          if (sort && queued.every((d) => answers.has(d.id) || taken.has(d.id)) && (specDone || specTaken)) return
+          const free = yield* agent.freeSlots()
+          started += free
+          return Array.from({ length: free }, () => Effect.ignore(side))
+        })
+        /** Sessions once there is something to judge and the context is ready, and more when the ticket read gives its slot back. */
+        const sides = Effect.gen(function* () {
+          yield* Deferred.await(found)
+          if (!contextFiber || !queued.length) return
+          yield* Fiber.await(contextFiber)
+          const first = yield* launch
+          const later = Effect.andThen(Fiber.await(ticket), Effect.flatMap(launch, (more) => Effect.all(more ?? [], { concurrency: 'unbounded', discard: true })))
+          yield* Effect.all([...(first ?? []), later], { concurrency: 'unbounded', discard: true })
+          yield* annotate({ sideSessions: started })
+        })
+
+        const main: Slot = { phase: 'sort', worker: 0 }
         // Begun before the session takes an account, so a wait for one shows on it.
         if (!sort) yield* t.begin('sort', `Sorting ${plural(sortPrompt!.files.length, 'file')}`)
         else if (!judged(sort).length) opinionError = 'Nothing to judge'
-        else yield* judging(sort)
-        const session = agent.session(options(main), (turns, account) =>
+        else yield* t.begin('opinion', `Judging ${plural(judged(sort).length, 'decision')}`)
+        const session = agent.session({ ...options(main), ...(contextFiber && !sort ? { onDelta: (d: string) => (main.phase === 'sort' ? fromSort(d) : Effect.void) } : {}) }, (turns, account) =>
           Effect.gen(function* () {
             let continued = false
             if (!sort) {
               main.phase = 'sort'
+              sortText = ''
               yield* t.begin('sort', `Sorting ${plural(sortPrompt!.files.length, 'file')}`)
               yield* named(main, account)
               sort = sortPrompt!.finish(yield* turns.structured(sortPrompt!.prompt, AgentSort, 'main', 'sort'))
               yield* sorter.remember(ref, headSha, sort)
               yield* t.end('sort', 'done')
+              streamed = queued.length
               continued = true
             }
             if (!contextFiber) return
-            const decisions = judged(sort)
-            if (!decisions.length) return void (opinionError = 'Nothing to judge')
-            yield* judging(sort)
+            yield* publish
+            yield* enqueue(judged(sort))
+            yield* Deferred.succeed(sorted, undefined)
+            if (!judged(sort).length) return void (opinionError = 'Nothing to judge')
+            yield* t.begin('opinion', `Judging ${plural(judged(sort).length, 'decision')}`)
+            if (main.phase === 'sort') main.worker = workers++
+            main.phase = 'opinion'
             yield* named(main, account)
-            if (!contextFiber.pollUnsafe())
-              yield* t.worker('opinion', 0, (w) => step(w, ticket.pollUnsafe() ? 'Reading the stack and review guidance' : 'Reading the ticket'))
-            const got = yield* Effect.result(Fiber.join(contextFiber).pipe(measure('context.wait', { on: 'context' })))
-            if (got._tag === 'Failure') return void (opinionError = got.failure.message)
-            const c = (context = got.success)
-            // A quick sort's one decision gets the main model, as on the quick path.
-            const hi = sort.quick ? decisions : decisions.filter((d) => impact(d) === 'high')
-            const lo = sort.quick ? [] : decisions.filter((d) => impact(d) === 'low')
-            const other = decisions.length > 4 && hi.length && lo.length ? (yield* agent.idle()).find((a) => a.id !== account.id) : undefined
-            main.judging = other ? hi : [...hi, ...lo]
-            yield* annotate({ decisions: decisions.length, highDecisions: hi.length, lowDecisions: lo.length, splitAccounts: other !== undefined })
-
-            const side: Slot = { phase: 'opinion', worker: 1, judging: lo }
-            // Never waits for a slot; without one the low group runs here after the high one.
-            const elsewhere =
-              other && !low
-                ? agent.session({ ...options(side), avoid: new Set([account.id]), noWait: true }, (turns2, account2) =>
-                    Effect.andThen(named(side, account2), ask(turns2, c, lo, 'fast', false)).pipe(Effect.tap((a) => Effect.sync(() => void (low = a)))),
-                  )
-                : Effect.void
-            // `low` is set as soon as the side session answers, so a failed high turn doesn't throw it away.
-            yield* Effect.all([high || !hi.length ? Effect.void : Effect.map(ask(turns, c, hi, 'main', continued), (a) => void (high = a)), Effect.ignore(elsewhere)], {
-              concurrency: 2,
-            })
-            if (!low && lo.length) {
-              main.judging = [...hi, ...lo]
-              low = yield* ask(turns, c, lo, 'fast', continued)
-            }
+            yield* judge(turns, main, continued)
           }),
         )
         // Nothing for a session to do: the sort is known and there is no opinion to make.
-        const outcome = sort && (!contextFiber || opinionError) ? undefined : yield* Effect.result(session)
+        const outcome =
+          sort && (!contextFiber || opinionError)
+            ? undefined
+            : (yield* Effect.all(
+                [
+                  // A failed session never sorted, or can't judge: nothing more goes in the queue.
+                  Effect.result(session).pipe(Effect.ensuring(Effect.all([Deferred.succeed(sorted, undefined), Deferred.succeed(found, undefined)]))),
+                  sides,
+                  specGate,
+                ],
+                { concurrency: 'unbounded' },
+              ))[0]
         if (outcome?._tag === 'Failure') {
           if (!sort) return yield* outcome.failure
           opinionError ??= outcome.failure.message
         }
         if (!sort) return yield* Effect.die('the session ended without a sort')
 
+        // A turn that failed in another session left its work; one more try in a session of its own.
+        const left = context && !opinionError ? judged(sort).filter((d) => !answers.has(d.id)) : []
+        const specLeft = context !== undefined && !opinionError && !specDone && judged(sort).length > 0
+        if (left.length || specLeft) {
+          const c = context!
+          const retried = yield* Effect.result(
+            agent.session(options(main), (turns) =>
+              Effect.andThen(left.length ? judgeTurn(turns, c, left, { continued: false, brief: false }) : Effect.void, specLeft ? specTurn(turns, c, false) : Effect.void),
+            ),
+          )
+          if (retried._tag === 'Failure') opinionError = retried.failure.message
+        }
+        if (contextFiber && judged(sort).length) {
+          const decisions = judged(sort)
+          yield* annotate({ decisions: decisions.length, highDecisions: decisions.filter((d) => impact(d) === 'high').length, streamed, retried: left.length, slowTicket, specRetried: specLeft })
+        }
+
         let opinion: PrOpinion | undefined
         if (context && !opinionError) {
-          const decisions = judged(sort)
-          const order = new Map(decisions.map((d, i) => [d.id, i]))
-          const answers = [...(high?.decisions ?? []), ...(low?.decisions ?? [])].filter((a) => order.has(a.decisionId))
-          const made = yield* Effect.result(context.finish({ decisions: answers.sort((a, b) => order.get(a.decisionId)! - order.get(b.decisionId)!) }, decisions))
-          if (made._tag === 'Failure') opinionError = made.failure.message
-          else {
-            opinion = made.success
-            yield* opiner.remember(ref, headSha, opinion)
-            yield* Effect.orDie(store.lastOpinion.set(`${repoKey}#${ref.number}`, { headSha, ...(sort.mergeBase ? { mergeBase: sort.mergeBase } : {}), opinion }))
-          }
+          opinion = yield* context.opinion(judged(sort).flatMap((d) => decided.get(d.id) ?? []))
+          yield* opiner.remember(ref, headSha, opinion)
+          yield* Effect.orDie(store.lastOpinion.set(`${repoKey}#${ref.number}`, { headSha, ...(sort.mergeBase ? { mergeBase: sort.mergeBase } : {}), opinion }))
         }
         if (wantOpinion) yield* t.end('opinion', opinionError ? 'failed' : 'done')
         return { sort, opinion: opinion ?? cachedOpinion ?? null, ...(opinionError ? { opinionError } : {}) } satisfies Review
@@ -314,13 +448,14 @@ export class Reviewer extends Context.Service<
         const running = runs.get(key)
         if (running) return running
         const phases = yield* SubscriptionRef.make<ReadonlyArray<Phase>>([])
+        const partial = yield* SubscriptionRef.make<Review | undefined>(undefined)
         const done = yield* Deferred.make<Review, SortError>()
         // Another caller may have started one while these were made.
         const raced = runs.get(key)
         if (raced) return raced
-        const run = { phases, done }
+        const run = { phases, partial, done }
         runs.set(key, run)
-        const t = tracker(phases)
+        const t = tracker(phases, partial)
         yield* Effect.forkIn(
           work(ref, headSha, t).pipe(
             measure('operation', { kind: 'review', owner: ref.owner, repo: ref.repo, prNumber: ref.number, headSha }),
@@ -342,6 +477,13 @@ export class Reviewer extends Context.Service<
             }),
           ),
         result: (ref, headSha) => Effect.flatMap(ensure(ref, headSha), (run) => Deferred.await(run.done)),
+        partial: (ref, headSha) =>
+          Stream.unwrap(
+            Effect.sync(() => {
+              const run = runs.get(keyOf(ref, headSha))
+              return run ? SubscriptionRef.changes(run.partial).pipe(Stream.filter((r): r is Review => r !== undefined)) : Stream.empty
+            }),
+          ),
       })
     }),
   )

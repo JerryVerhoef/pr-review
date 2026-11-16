@@ -254,17 +254,17 @@ describe('Agent.session', () => {
       assert.deepStrictEqual(lines, ['Judging: first', 'Judging: second', '{"n": 1}', '{"n": 2}'])
     }))
 
-  it.live('idle lists accounts with room', () =>
+  it.live('freeSlots counts the room left on enabled accounts', () =>
     Effect.gen(function* () {
       const gate = yield* Deferred.make<void>()
       const { layer } = setup(() => Effect.as(Deferred.await(gate), '{"ok": true}'), [account('a'), account('b', 2), { ...account('c'), enabled: false }])
       yield* Effect.gen(function* () {
         const agent = yield* Agent
-        assert.deepStrictEqual((yield* agent.idle()).map((a) => a.id), ['a', 'b'])
+        assert.strictEqual(yield* agent.freeSlots(), 3)
         const runs = yield* Effect.forEach([1, 2], () => Effect.forkChild(structured()))
         yield* Effect.sleep('100 millis')
         // a is full; b has one of two slots left.
-        assert.deepStrictEqual((yield* agent.idle()).map((a) => a.id), ['b'])
+        assert.strictEqual(yield* agent.freeSlots(), 1)
         yield* Deferred.succeed(gate, undefined)
         yield* Fiber.joinAll(runs)
       }).pipe(Effect.provide(layer))

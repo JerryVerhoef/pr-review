@@ -41,6 +41,8 @@ export function TopBar(props: {
   /** The cached opinion; `Idle` offers to run one. */
   opinion: OpinionEvent | undefined
   running: boolean
+  /** The review's own opinion is still coming in. */
+  judging?: { judged: number; total: number } | undefined
   onRunOpinion: () => void
   onOpinionDone: () => void
 }) {
@@ -66,6 +68,8 @@ export function TopBar(props: {
       <span className="ml-auto flex min-w-0 items-center">
         {props.running ? (
           <OpinionRun prRef={props.prRef} headSha={pr.headSha} onDone={props.onOpinionDone} />
+        ) : props.judging ? (
+          <Working className="max-w-72" step={`Judging decisions: ${props.judging.judged} of ${props.judging.total} done`} />
         ) : (
           (props.opinion?._tag === 'Idle' || (props.opinion?._tag === 'Done' && props.opinion.opinion.carriedFrom !== undefined)) && (
             <Button size="xs" variant="outline" onClick={props.onRunOpinion}>
