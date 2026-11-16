@@ -69,7 +69,7 @@ const finding = (o: Partial<AgentFinding> = {}): AgentFinding => ({
 
 const setup = (o: { reply?: AgentOpinion | ((kind: string) => AgentOpinion); show?: Record<string, string>; repos?: (typeof defaultSettings)['repos']; prs?: StackEntry[]; fileAt?: GitHubClient['fileAt']; ticket?: TicketSummary; diff?: string } = {}) => {
   const agent = fakeAgent((call) => Effect.succeed((typeof o.reply === 'function' ? o.reply(call.log.kind) : o.reply) ?? { decisions: [{ decisionId: 'd1', authorCase: 'c', checked: 'looked', findings: [] }] }))
-  const git = fakeGit({ files: [{ path: 'src/a.ts', additions: 3, deletions: 1 }], diff: o.diff ?? 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,9 @@\n+added', rules: ['AGENTS.md'], show: o.show ?? {} })
+  const git = fakeGit({ files: [{ path: 'src/a.ts', additions: 3, deletions: 1 }], diff: o.diff ?? 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,9 @@\n a\n+added\n+x\n+x\n+x\n+x\n+x\n+x\n b\n', rules: ['AGENTS.md'], show: o.show ?? {} })
   const config = Config.layerTest({ cacheRoot: '/cache', settings: { ...defaultSettings, hosts: [ref.host], ...(o.repos ? { repos: o.repos } : {}) } })
   const layer = Opiner.layer.pipe(
     Layer.provide([agent.layer, git.layer, fakeGitHub({ listOpenPrs: () => Effect.succeed(o.prs ?? stack), ...(o.fileAt ? { fileAt: o.fileAt } : {}) }), config, fakeSorter, Layer.succeed(Tickets, Tickets.of({ summary: () => Effect.succeed(o.ticket ?? { text: null, note: 'No ticket reference found' }) }))]),
@@ -202,7 +202,7 @@ describe('Opiner', () => {
       }
       // The decision's range starts at line 3, outside these hunks, so a finding without an anchor gets none.
       assert.deepStrictEqual(yield* at(hunks), [12, 32, 31, null])
-      assert.deepStrictEqual(yield* at('@@ -1,2 +1,9 @@\n+x'), [9, 9, 9, 3])
+      assert.deepStrictEqual(yield* at('@@ -1,2 +1,9 @@\n a\n+x\n+x\n+x\n+x\n+x\n+x\n+x\n b'), [9, 9, 9, 3])
     }))
 
   it.effect('bad citations are dropped and severity lowered', () =>

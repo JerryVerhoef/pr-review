@@ -77,7 +77,7 @@ const setup = (
 const tags = <A extends { _tag: string }>(xs: ReadonlyArray<A>) => xs.map((x) => x._tag)
 
 /** A one-line patch of `path` adding `line`. */
-const filePatch = (path: string, line: string) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1,2 @@\n+${line}\n`
+const filePatch = (path: string, line: string) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -0,0 +1,2 @@\n+${line}\n+more\n`
 
 describe('handlers', () => {
   it.effect('GetPr carries files and stack but no diff', () =>
@@ -252,7 +252,7 @@ describe('handlers', () => {
     }).pipe(Effect.scoped))
 
   // The fake PR's head is HEAD1; the page still showed OLD, where src/a.ts lacked its first line.
-  const pushed = (from: string) => (from === 'OLD' ? 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1 @@\n+top\n@@ -5 +6 @@\n-five\n+five\n+more\n' : '')
+  const pushed = (from: string) => (from === 'OLD' ? 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1 @@\n+top\n@@ -5 +6,2 @@\n-five\n+five\n+more\n' : '')
 
   it.effect('a review sent after a push moves its comments with the code and goes on the new head', () =>
     Effect.gen(function* () {

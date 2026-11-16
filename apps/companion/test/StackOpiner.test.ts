@@ -70,7 +70,7 @@ function finding(o: Partial<AgentFinding> = {}): AgentFinding {
 
 const setup = (o: { reply?: AgentStackOpinion; prs?: () => StackEntry[]; show?: Record<string, string> } = {}) => {
   const agent = fakeAgent((call) => Effect.succeed(call.log.kind === 'overview' ? overviewReply : (o.reply ?? { findings: [] })))
-  const git = fakeGit({ files: [{ path: 'src/a.ts', additions: 3, deletions: 1 }], diff: 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n+x', rules: ['AGENTS.md'], show: o.show ?? {} })
+  const git = fakeGit({ files: [{ path: 'src/a.ts', additions: 3, deletions: 1 }], diff: 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n a\n+x\n b\n', rules: ['AGENTS.md'], show: o.show ?? {} })
   const config = Config.layerTest({ cacheRoot: '/cache', settings: { ...defaultSettings, hosts: [ref.host], repos: { 'h/o/r': { related: [{ repo: 'h/o/svc', note: 'permissions' }] } } } })
   const layer = Layer.mergeAll(StackOpiner.layer, Overview.layer).pipe(
     Layer.provide([

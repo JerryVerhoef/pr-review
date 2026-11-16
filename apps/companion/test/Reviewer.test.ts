@@ -534,7 +534,7 @@ describe('Reviewer', () => {
     const patch = (path: string, line: string, at = 1) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +${at} @@\n-old\n+${line}\n`
     /** h1 changes the same way at both heads, two lines lower at HEAD2; l1 changes differently, by an interdiff of `lines` lines. */
     const pushed = (lines: number) => (from: string, to: string, paths: ReadonlyArray<string>) => {
-      if (from === 'HEAD1' && to === 'HEAD2') return `diff --git a/src/l1.ts b/src/l1.ts\n--- a/src/l1.ts\n+++ b/src/l1.ts\n@@ -1,1 +1,${lines} @@\n${'+x\n'.repeat(lines)}`
+      if (from === 'HEAD1' && to === 'HEAD2') return `diff --git a/src/l1.ts b/src/l1.ts\n--- a/src/l1.ts\n+++ b/src/l1.ts\n@@ -0,0 +1,${lines} @@\n${'+x\n'.repeat(lines)}`
       if (from !== 'MB1') return 'THE DIFF'
       if (paths.length > 2) return 'THE DIFF'
       const at2 = to === 'HEAD2'

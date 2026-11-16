@@ -129,7 +129,7 @@ export class Git extends Context.Service<
           ),
         // -M: a moved file diffs as a rename when both its paths are asked for.
         diff: (key, from, to, paths = []) =>
-          inRepo(key, 'diff', '--no-color', '--no-ext-diff', '-M', from, to, '--', ...paths).pipe(measure('git.diff', { paths: paths.length }, (d: string) => ({ bytes: Buffer.byteLength(d) }))),
+          inRepo(key, 'diff', '--no-color', '--no-ext-diff', '--src-prefix=a/', '--dst-prefix=b/', '-M', from, to, '--', ...paths).pipe(measure('git.diff', { paths: paths.length }, (d: string) => ({ bytes: Buffer.byteLength(d) }))),
         revParse: (key, ref) => Effect.map(inRepo(key, 'rev-parse', '--verify', `${ref}^{commit}`), (s) => s.trim()),
         show: (key, sha, path) => inRepo(key, 'show', `${sha}:${path}`).pipe(measure('git.show', {}, (t: string) => ({ bytes: Buffer.byteLength(t) }))),
         blobs: (key, ref) =>

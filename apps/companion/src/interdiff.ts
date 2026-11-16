@@ -1,35 +1,30 @@
-/** True when two patches make the same change, whatever base they sit on: blob hashes and hunk line numbers are ignored. */
-export const sameChange = (a: string, b: string) => normalizePatch(a) === normalizePatch(b)
+import { parsePatch, type StructuredPatch } from 'diff'
 
-const normalizePatch = (patch: string) =>
-  patch
-    .split('\n')
-    .filter((l) => !l.startsWith('index '))
-    .map((l) => l.replace(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/, '@@'))
-    .join('\n')
+/** The files of a `git diff`; text that is no diff, or that `parsePatch` can't read, has none. */
+export const parseDiff = (patch: string): ReadonlyArray<StructuredPatch> => {
+  try {
+    return parsePatch(patch).filter((f) => f.oldFileName !== undefined || f.newFileName !== undefined)
+  } catch {
+    return []
+  }
+}
 
-const HUNK = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/
+/** A side's path, without git's `a/`/`b/`; undefined for /dev/null. */
+export const pathOf = (name: string | undefined) => (name === undefined || name === '/dev/null' ? undefined : name.replace(/^[ab]\//, ''))
+
+/** True when two files' patches make the same change, whatever base they sit on: blob ids and hunk positions aside. */
+export const sameChange = (a: StructuredPatch, b: StructuredPatch) => JSON.stringify(shape(a)) === JSON.stringify(shape(b))
+
+const shape = (f: StructuredPatch) => [f.oldFileName, f.newFileName, f.oldMode, f.newMode, f.isRename, f.isCopy, f.isCreate, f.isDelete, f.isBinary, f.hunks.map((h) => h.lines)]
 
 /** New-side line ranges per file: the lines GitHub accepts a review comment on. */
-export const hunkLines = (patch: string) => {
-  const files = new Map<string, Array<[number, number]>>()
-  let current: Array<[number, number]> | undefined
-  let header = false
-  for (const line of patch.split('\n')) {
-    if (line.startsWith('diff --git ')) [current, header] = [undefined, true]
-    else if (header && line.startsWith('+++ ')) {
-      current = line === '+++ /dev/null' ? undefined : []
-      if (current) files.set(line.slice('+++ b/'.length), current)
-    } else {
-      const m = HUNK.exec(line)
-      if (!m) continue
-      header = false
-      const [start, count] = [Number(m[1]), m[2] === undefined ? 1 : Number(m[2])]
-      if (count > 0) current?.push([start, start + count - 1])
-    }
-  }
-  return files
-}
+export const hunkLines = (patch: string) =>
+  new Map(
+    parseDiff(patch).flatMap((f) => {
+      const to = pathOf(f.newFileName)
+      return to ? [[to, f.hunks.filter((h) => h.newLines > 0).map((h): [number, number] => [h.newStart, h.newStart + h.newLines - 1])] as const] : []
+    }),
+  )
 
 /** The line in `ranges` nearest to `line`, or undefined when there are none. */
 export const nearestLine = (ranges: ReadonlyArray<readonly [number, number]>, line: number) =>
@@ -41,41 +36,34 @@ export const nearestLine = (ranges: ReadonlyArray<readonly [number, number]>, li
  * usually still applies.
  */
 export const moveLine = (patch: string, path: string, line: number): { path: string; line: number } | undefined => {
-  for (const section of patch.split(/^diff --git /m).slice(1)) {
-    const ls = section.split('\n')
-    const field = (prefix: string) => ls.find((l) => l.startsWith(prefix))?.slice(prefix.length)
-    if ((field('--- a/') ?? field('rename from ')) !== path) continue
-    if (ls.includes('+++ /dev/null')) return undefined
-    const to = field('+++ b/') ?? field('rename to ') ?? path
-    let shift = 0
+  const file = parseDiff(patch).find((f) => pathOf(f.oldFileName) === path)
+  if (!file) return { path, line }
+  const to = pathOf(file.newFileName)
+  if (!to) return undefined
+  let shift = 0
+  for (const h of file.hunks) {
+    // An empty side's start already names the line after it.
+    let [o, n] = [h.oldStart, h.newStart]
+    if (line < o) return { path: to, line: line + shift }
+    const ls = h.lines
     for (let i = 0; i < ls.length; i++) {
-      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(ls[i]!)
-      if (!m) continue
-      // An empty side names the line before it.
-      let o = Number(m[1]) + (m[2] === '0' ? 1 : 0)
-      let n = Number(m[3]) + (m[4] === '0' ? 1 : 0)
-      if (line < o) return { path: to, line: line + shift }
-      for (i++; i < ls.length && /^[ +\-\\]/.test(ls[i]!); i++) {
-        const l = ls[i]!
-        if (l[0] === ' ') {
-          if (o === line) return { path: to, line: n }
-          o++, n++
-        } else if (l[0] === '+') n++
-        else if (l[0] === '-') {
-          let k = 0
-          while (ls[i + k]?.[0] === '-') k++
-          let a = 0
-          while (ls[i + k + a]?.[0] === '+') a++
-          if (line >= o && line < o + k) return k === a ? { path: to, line: n + line - o } : undefined
-          o += k
-          n += a
-          i += k + a - 1
-        }
+      const c = ls[i]![0]
+      if (c === ' ') {
+        if (o === line) return { path: to, line: n }
+        o++, n++
+      } else if (c === '+') n++
+      else if (c === '-') {
+        let k = 0
+        while (ls[i + k]?.[0] === '-') k++
+        let a = 0
+        while (ls[i + k + a]?.[0] === '+') a++
+        if (line >= o && line < o + k) return k === a ? { path: to, line: n + line - o } : undefined
+        o += k
+        n += a
+        i += k + a - 1
       }
-      i--
-      shift = n - o
     }
-    return { path: to, line: line + shift }
+    shift = n - o
   }
-  return { path, line }
+  return { path: to, line: line + shift }
 }

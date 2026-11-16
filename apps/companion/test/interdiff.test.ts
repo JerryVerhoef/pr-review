@@ -1,5 +1,5 @@
 import { assert, describe, it } from '@effect/vitest'
-import { hunkLines, moveLine, nearestLine, sameChange } from '../src/interdiff.ts'
+import { hunkLines, moveLine, nearestLine, parseDiff, sameChange } from '../src/interdiff.ts'
 
 const patch = (index: string, hunk: string, extra = '') => `diff --git a/a.ts b/a.ts
 index ${index} 100644
@@ -11,8 +11,12 @@ index ${index} 100644
 ${extra}`
 
 describe('sameChange', () => {
-  it('same change on a moved base is the same', () => assert.isTrue(sameChange(patch('111..222', '-1,1 +1,2'), patch('333..444', '-40,1 +41,2'))))
-  it('an extra added line is a change', () => assert.isFalse(sameChange(patch('111..222', '-1,1 +1,2'), patch('111..222', '-1,1 +1,3', '+three\n'))))
+  const same = (a: string, b: string) => sameChange(parseDiff(a)[0]!, parseDiff(b)[0]!)
+  it('same change on a moved base is the same', () => assert.isTrue(same(patch('111..222', '-1,1 +1,2'), patch('333..444', '-40,1 +41,2'))))
+  it('an extra added line is a change', () => assert.isFalse(same(patch('111..222', '-1,1 +1,2'), patch('111..222', '-1,1 +1,3', '+three\n'))))
+  it('a removed line is a change, though the hunk sizes match', () =>
+    assert.isFalse(same('diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n-x\n+y\n z\n', 'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n-x\n+q\n z\n')))
+  it('text that is no diff has no files', () => assert.deepStrictEqual(parseDiff('THE DIFF'), []))
 })
 
 describe('hunkLines', () => {

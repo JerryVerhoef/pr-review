@@ -7,6 +7,7 @@ import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { changedBetween, shiftRanges } from './carry.ts'
+import { parseDiff } from './interdiff.ts'
 import { normalize } from './normalize.ts'
 import { guidanceSection } from './opinionContext.ts'
 import { annotate, measure } from './Perf.ts'
@@ -181,9 +182,9 @@ export class Sorter extends Context.Service<
           const changed = [...differ]
           const kept = sort.decisions
             .filter((d) => d.files.every((f) => !differ.has(f.path)))
-            .map((d) => ({ ...d, files: d.files.map((f) => ({ ...f, ranges: shiftRanges(was.get(f.path) ?? '', now.get(f.path) ?? '', f.ranges) })) }))
+            .map((d) => ({ ...d, files: d.files.map((f) => ({ ...f, ranges: shiftRanges(was.get(f.path), now.get(f.path), f.ranges) })) }))
           const interdiff = changed.length ? yield* git.diff(repoKey, before.headSha, head, changed) : ''
-          const lines = interdiff.split('\n').filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l)).length
+          const lines = parseDiff(interdiff).flatMap((f) => f.hunks.flatMap((h) => h.lines)).filter((l) => l[0] === '+' || l[0] === '-').length
           yield* annotate({ interdiffLines: lines, changedFiles: changed.length })
           return lines >= RESORT_LINES ? undefined : ({ headSha: before.headSha, sort, changed, interdiff, kept } satisfies PreviousSort)
         }).pipe(

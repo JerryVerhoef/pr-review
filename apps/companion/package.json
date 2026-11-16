@@ -12,6 +12,7 @@
     "@effect/platform-node": "~4.1.1",
     "@pr-review/domain": "workspace:*",
     "@pr-review/native-messaging": "workspace:*",
+    "diff": "9.0.0",
     "effect": "~4.1.1",
     "octokit": "^5.0.5",
     "partial-json": "0.1.7",
