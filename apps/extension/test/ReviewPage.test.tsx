@@ -667,6 +667,22 @@ test('a review stopped from another tab shows the stopped page', async () => {
   expect(seen.some((t) => t.includes('sort failed'))).toBe(false)
 })
 
+test('a review stopped from another tab while decisions are judged shows the stopped page', async () => {
+  let stop = () => {}
+  const judging: ReviewEvent = { _tag: 'Done', sort: sorted, state: {}, findingStates: {}, opinion: { ...opinion, decisions: [opinion.decisions[0]!] }, judging: true }
+  const gate = Deferred.makeUnsafe<void>()
+  const page = renderPage({
+    review: Stream.make(judging).pipe(
+      Stream.concat(Stream.drain(Stream.fromEffect(Effect.andThen(Deferred.await(gate), Effect.sync(() => stop()))))),
+      Stream.concat(Stream.fail(new ReviewStopped())),
+    ),
+  })
+  stop = page.stop
+  expect(await heading('Decision one')).toBeInTheDocument()
+  await act(async () => void Effect.runSync(Deferred.succeed(gate, undefined)))
+  expect(await screen.findByText("You stopped Claude's review of this PR.", undefined, { timeout: 3000 })).toBeInTheDocument()
+})
+
 test('renders the review once on Done, ordered by severity', async () => {
   const gate = Effect.runSync(Deferred.make<void>())
   renderPage({
