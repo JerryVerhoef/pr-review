@@ -9,10 +9,9 @@ test('conversation page sends one prepare per PR', () => {
   expect(next('https://github.com/acme/core/pull/2927')).toEqual({ ...ref, number: 2927 })
 })
 
-test('files page sends none (it redirects)', () => {
+test('files page prepares too; non-PR pages do not', () => {
   const next = prepareOncePerLoad()
-  expect(next('https://github.com/acme/core/pull/2926/files')).toBeNull()
-  expect(next('https://github.com/acme/core/pull/2926/changes#diff-a')).toBeNull()
+  expect(next('https://github.com/acme/core/pull/2926/changes#diff-a')).toEqual(ref)
   expect(next('https://github.com/acme/core/pulls')).toBeNull()
 })
 

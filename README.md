@@ -1,6 +1,6 @@
 # pr-review
 
-A Firefox and Chrome extension that replaces a pull request's "Files changed" page with a review sorted by an AI agent: decisions to make, areas to skim, and files you can trust. A local companion does the git and agent work through the subscriptions you already have (Claude Code, Codex, Cursor, Gemini CLI and others, over the [Agent Client Protocol](https://agentclientprotocol.com)); nothing runs while no review tab is open.
+A Firefox and Chrome extension that opens a pull request in a review sorted by an AI agent: decisions to make, areas to skim, and files you can trust. A local companion does the git and agent work through the subscriptions you already have (Claude Code, Codex, Cursor, Gemini CLI and others, over the [Agent Client Protocol](https://agentclientprotocol.com)); nothing runs while no review tab is open.
 
 - `apps/extension`: the extension (WXT, React).
 - `apps/companion`: the native messaging host and `pr-review` CLI (Effect, ACP, Octokit).
@@ -15,7 +15,7 @@ A Firefox and Chrome extension that replaces a pull request's "Files changed" pa
 
 ## Install
 
-Install the extension, then open a PR's "Files changed" page. Until the companion is installed, the page shows the one line that installs it, with the extension's version and id filled in:
+Install the extension, then open a PR in the review (see [Use](#use)). Until the companion is installed, the page shows the one line that installs it, with the extension's version and id filled in:
 
 ```sh
 curl -fsSL https://github.com/JorrinKievit/pr-review/releases/download/v<version>/install.sh | sh
@@ -63,7 +63,7 @@ Run everything inside WSL and use the Windows browser. `install` notices WSL and
 
 ## Use
 
-Open a PR's "Files changed" page. The extension redirects to the review page. "Open on GitHub" goes back without redirecting (`?native=1`). For a stacked PR, the stack pill in the top bar opens the stack view.
+On a PR page, click "Open in PR Reviewer" next to GitHub's Changes tab, or the extension's toolbar button. "Open on GitHub" goes back to the PR's files. For a stacked PR, the stack pill in the top bar opens the stack view.
 
 "Architecture" in the sidebar (and next to "Overview" in the stack view) shows only what the change does to the structure. It lists the architecture decisions the sort found; "Map the architecture" then spends one agent run to draw the components the PR or stack touches and how they connect: new, changed, removed, and in a stack which PR does it. Every relation cites the line that shows it, and one whose line is not found is left out. The map reads two ways, as tabs over the same data: Graph (one drawing) and Flows (from each entry point down through what it reaches). A relation says how one component gets to the other: `http post`, `xhr get`, `code invoke`, `event`, `job`, `db read`, `db write`, `renders`, `extends`. Each component carries the mark of where its code lives, taken from its paths (`apps/web/…` is `web`); a part of the repo without a mark gets its first two letters. Click a component or a relation for its files, the cited line and the decisions in those files. The map is kept per head, so a push needs a new one.
 

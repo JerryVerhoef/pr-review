@@ -4,7 +4,7 @@ import { Button } from './ui/index.tsx'
 
 const REPO = 'https://github.com/JorrinKievit/pr-review'
 
-export const githubFilesUrl = (ref: PrRef) => `https://${ref.host}/${ref.owner}/${ref.repo}/pull/${ref.number}/files?native=1`
+export const githubFilesUrl = (ref: PrRef) => `https://${ref.host}/${ref.owner}/${ref.repo}/pull/${ref.number}/files`
 
 /** Installs or updates the companion of one release. Store builds for Chromium get their id from the store, so they pass it. */
 export const installLine = (version: string, chromiumId?: string) =>

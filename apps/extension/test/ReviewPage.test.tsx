@@ -520,7 +520,7 @@ test('without a companion, setup says why one is needed and gives the line that 
   expect(await screen.findByRole('heading', { name: 'Install the companion' }, { timeout: 3000 })).toBeInTheDocument()
   expect(screen.getByText(/don't let an extension register one itself/)).toBeInTheDocument()
   expect(screen.getByText(/^curl /).textContent).toBe('curl -fsSL https://github.com/JorrinKievit/pr-review/releases/download/v0.3.0/install.sh | sh -s -- --extension-id test-extension-id')
-  expect(screen.getByRole('link', { name: /Open on GitHub/ })).toHaveAttribute('href', 'https://github.com/acme/core/pull/7/files?native=1')
+  expect(screen.getByRole('link', { name: /Open on GitHub/ })).toHaveAttribute('href', 'https://github.com/acme/core/pull/7/files')
 })
 
 test('a companion from another release gets the same line to update it', async () => {
