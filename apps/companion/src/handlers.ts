@@ -1,4 +1,4 @@
-import { AgentError, AgentRule, type ArchitectureEvent, type ArchitectureMap, appendPatch, inGuidance, opinionsMode, ruleBranch, ruleTitle, type Decision, type DecisionState, type DeeperEvent, type DecisionOpinion, type DecisionStates, type Draft, type FindingStates, type OpinionEvent, type PrOpinion, type PrRef, type Rereview, type ReviewEvent, ReviewRejected, ReviewRpcs, type SortResult, type SortEvent, type StackEntry, type StackEntryStatus, type StackEvent, type StackOpinion, type StackOpinionEvent, targetKey } from '@pr-review/domain'
+import { AgentError, AgentRule, type ArchitectureEvent, type ArchitectureMap, appendPatch, inGuidance, opinionsMode, ruleBranch, ruleTitle, type Decision, type DecisionState, type DeeperEvent, type DecisionOpinion, type DecisionStates, type Draft, type FindingStates, type OpinionEvent, type PrOpinion, type PrRef, type Rereview, type ReviewEvent, ReviewRpcs, type SortResult, type SortEvent, type StackEntry, type StackEntryStatus, type StackEvent, type StackOpinion, type StackOpinionEvent, targetKey } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
 import { Cause, Clock, Effect, Exit, Fiber, Layer, Option, Queue, type Scope, Stream } from 'effect'
 import { RpcMiddleware } from 'effect/rpc'
@@ -219,7 +219,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
 
     /**
      * The drafts placed on the PR's current head. A draft written on an earlier head (its own, or the page's for older
-     * drafts) moves with the code; left-side lines move between the two merge bases. Fails naming those that can't.
+     * drafts) moves with the code; left-side lines move between the two merge bases. Drafts whose lines are gone are dropped.
      */
     const draftsAtHead = Effect.fnUntraced(function* (ref: PrRef, pageHead: string, head: { headSha: string; mergeBase: string }) {
       const repoKey = repoKeyOf(ref)
@@ -243,10 +243,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
         if (moved) placed.push(moved)
         else lost.push(d)
       }
-      if (lost.length)
-        return yield* new ReviewRejected({
-          message: `The PR was pushed to since you wrote ${lost.length === 1 ? 'this comment' : 'these comments'}, and the ${lost.length === 1 ? 'line is' : 'lines are'} gone: ${lost.map((d) => `${d.path}:${d.line}`).join(', ')}. Reload the page, then move or delete ${lost.length === 1 ? 'it' : 'them'}`,
-        })
+      if (lost.length) yield* Effect.logWarning(`Dropped drafts whose lines a push removed: ${lost.map((d) => `${d.path}:${d.line}`).join(', ')}`)
       return placed
     })
 

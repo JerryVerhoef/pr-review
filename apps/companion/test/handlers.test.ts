@@ -275,17 +275,16 @@ describe('handlers', () => {
       assert.deepStrictEqual(sent, [{ event: 'COMMENT', body: '', commitId: 'HEAD1', comments: [{ ...old, line: 3, headSha: 'HEAD1' }, fresh] }])
     }).pipe(Effect.scoped))
 
-  it.effect('a comment whose line a push rewrote stops the review, naming it, and every draft is kept', () =>
+  it.effect('a comment whose line a push rewrote is dropped and the rest of the review goes out', () =>
     Effect.gen(function* () {
       const sent: unknown[] = []
       const c = yield* setup({ git: fakeGit({ diff: pushed }), github: { submitReview: (_o, _r, _n, r) => Effect.sync(() => void sent.push(r)) } }).client
-      const drafts = [{ id: 'd1', path: 'src/a.ts', line: 5, side: 'RIGHT' as const, body: 'On five', headSha: 'OLD' }]
-      yield* c.SetDrafts({ ref, drafts })
-      const e = yield* Effect.flip(c.SubmitReview({ ref, event: 'COMMENT', body: '', commitId: 'HEAD1' }))
-      assert.instanceOf(e, ReviewRejected)
-      assert.include(e.message, 'src/a.ts:5')
-      assert.deepStrictEqual(sent, [])
-      assert.deepStrictEqual(yield* c.GetDrafts({ ref }), drafts)
+      const lost = { id: 'd1', path: 'src/a.ts', line: 5, side: 'RIGHT' as const, body: 'On five', headSha: 'OLD' }
+      const kept = { id: 'd2', path: 'src/a.ts', line: 2, side: 'RIGHT' as const, body: 'On two', headSha: 'HEAD1' }
+      yield* c.SetDrafts({ ref, drafts: [lost, kept] })
+      yield* c.SubmitReview({ ref, event: 'COMMENT', body: '', commitId: 'HEAD1' })
+      assert.deepStrictEqual(sent, [{ event: 'COMMENT', body: '', commitId: 'HEAD1', comments: [kept] }])
+      assert.deepStrictEqual(yield* c.GetDrafts({ ref }), [])
     }).pipe(Effect.scoped))
 
   it.effect('Ask follow-up resumes the stored session', () =>
