@@ -1,6 +1,6 @@
 import { assert, describe, it } from '@effect/vitest'
-import { type AgentAccount, type AgentAreas, AgentError, type AgentFinding, type AgentQuick, type FileStat, type AgentOpinion, type AgentSort, type Decision, GitError, type Phase, type SortResult } from '@pr-review/domain'
-import { Deferred, Effect, Fiber, Layer, Option, Stream } from 'effect'
+import { type AgentAccount, type AgentAreas, AgentError, type AgentFinding, type AgentQuick, type FileStat, type AgentOpinion, type AgentSort, type Decision, GitError, Phase, type SortResult } from '@pr-review/domain'
+import { Deferred, Effect, Fiber, Layer, Option, Schema, Stream } from 'effect'
 import { KeyValueStore } from 'effect/persistence'
 import { Opiner } from '../src/Opiner.ts'
 import { Reviewer } from '../src/Reviewer.ts'
@@ -317,6 +317,26 @@ describe('Reviewer', () => {
       sessions = agent.sessions
       const r = yield* review.pipe(Effect.provide(layer))
       assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
+    }))
+
+  it.effect('a session named before the opinion phase begins leaves no hole in its workers', () =>
+    Effect.gen(function* () {
+      let sessions = () => 0
+      const opened = Effect.andThen(Effect.yieldNow, Effect.suspend(() => (sessions() >= 2 ? Effect.void : Effect.fail(new AgentError({ message: 'no side session yet' })))))
+      const { agent, layer } = setup({
+        pool: [fakeAccount, fakeAccount2],
+        sort: (call) => Effect.as(Effect.andThen(call.onDelta!('{"summary": "s", "decisions": [{"id": "h'), Effect.retry(opened, { times: 200 })), sortOf(many)),
+      })
+      sessions = agent.sessions
+      yield* Effect.gen(function* () {
+        const reviewer = yield* Reviewer
+        yield* reviewer.prepare(ref, 'HEAD1')
+        const seen: Array<ReadonlyArray<Phase>> = []
+        yield* Effect.forkChild(Stream.runForEach(reviewer.progress(ref, 'HEAD1'), (ps) => Effect.sync(() => seen.push(ps))))
+        yield* reviewer.result(ref, 'HEAD1')
+        // Encoding rejects a hole, which failed the Review stream with "unknown error".
+        for (const ps of seen) Schema.encodeUnknownSync(Schema.Array(Phase))(ps)
+      }).pipe(Effect.provide(layer))
     }))
 
   it.effect('every free slot gets a session', () =>
