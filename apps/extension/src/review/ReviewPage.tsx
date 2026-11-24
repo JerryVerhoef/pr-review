@@ -14,7 +14,7 @@ import { Sidebar } from '../shell/Sidebar.tsx'
 import { TopBar } from '../shell/TopBar.tsx'
 import { Button, Spinner } from '../ui/index.tsx'
 import { ChatPanel } from './ChatPanel.tsx'
-import { buildItems, isOpen, type Item, itemId, nextOpen, stackMoved, startAt } from './items.ts'
+import { buildItems, isOpen, type Item, itemId, itemsOf, nextOpen, stackMoved, startAt } from './items.ts'
 import { ItemView } from './ItemView.tsx'
 import { Preparing } from './Preparing.tsx'
 
@@ -48,6 +48,8 @@ export function ReviewPage({ prRef, ...embed }: { prRef: PrRef } & Embed) {
 
 type ReviewDone = Extract<ReviewEvent, { _tag: 'Done' }>
 
+const sameItems = (a: ReviewDone, b: ReviewDone) => a.sort.headSha === b.sort.headSha && itemsOf(a.sort).map((i) => i.key).join('\n') === itemsOf(b.sort).map((i) => i.key).join('\n')
+
 /** Waits once behind the progress screen, then shows the review from the latest `Done`; a refresh keeps it up until the next one. */
 function Loaded({ prRef, pr, ...embed }: { prRef: PrRef; pr: PrView } & Embed) {
   const atom = useAtoms().reviewAtom(prRef, pr.headSha)
@@ -78,10 +80,11 @@ function Ready({ prRef, pr, review, sortError, focus, onProgress }: { prRef: PrR
   const [runningOpinion, setRunningOpinion] = useState(false)
   const [retrying, setRetrying] = useState(false)
   // Opinions that come in while the page is open fill in; they don't reorder what the reviewer is already reading.
+  // A sort still being written adds items, so those rebuild the list.
   const built = useRef<{ review: ReviewDone | undefined; items: ReadonlyArray<Item> }>(undefined)
   const items = useMemo(() => {
     const before = built.current
-    const next = before?.review?.judging && review && before.review.sort.headSha === review.sort.headSha ? before.items : buildItems(pr, review)
+    const next = before?.review?.judging && review && sameItems(before.review, review) ? before.items : buildItems(pr, review)
     built.current = { review, items: next }
     return next
   }, [pr, review])

@@ -256,6 +256,9 @@ export class Reviewer extends Context.Service<
           })
         const known = new Set(sortPrompt?.files.map((f) => f.path))
         let sortText = ''
+        /** The sort as far as it is written, while it runs. */
+        let sortSoFar: SortResult | undefined
+        let shownSoFar = 0
         /** Decisions the sort has finished writing, kept as `normalize` keeps them. */
         const fromSort = (delta: string) =>
           Effect.suspend(() => {
@@ -265,13 +268,18 @@ export class Reviewer extends Context.Service<
               const files = d.files.filter((f) => known.has(f.path))
               return files.length ? [{ ...d, files }] : []
             })
-            return enqueue(ds)
+            if (ds.length <= shownSoFar) return enqueue(ds)
+            shownSoFar = ds.length
+            // The page opens on the first decision instead of waiting for the whole sort.
+            const s = sortPrompt!.finish({ decisions: ds, skim: [], claims: [] })
+            sortSoFar = { ...s, skim: s.skim.map((a) => (a.area === 'Unsorted' ? { ...a, area: 'Still sorting', summary: 'The sort has not placed these files yet.' } : a)) }
+            return Effect.andThen(enqueue(ds), publish)
           })
 
-        /** The review so far, for the page to show while the rest is judged. */
+        /** The review so far, for the page to show while the rest is sorted and judged. */
         const publish = Effect.suspend(() => {
-          if (!sort) return Effect.void
-          const s = sort
+          const s = sort ?? sortSoFar
+          if (!s) return Effect.void
           if (!context) return t.partial({ sort: s, opinion: null })
           return Effect.flatMap(context.opinion(judged(s).flatMap((d) => decided.get(d.id) ?? []), true), (opinion) => t.partial({ sort: s, opinion }))
         })

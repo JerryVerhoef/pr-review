@@ -499,6 +499,22 @@ describe('Reviewer', () => {
       assert.deepStrictEqual(seen[0]!.sort.decisions.map((d) => d.id), many.map((d) => d.id))
     }))
 
+  it.effect('the review shows each decision as the sort writes it, the files it has not placed yet apart', () =>
+    Effect.gen(function* () {
+      const gate = yield* Deferred.make<void>()
+      const { layer } = setup({ sort: (call) => Effect.as(Effect.andThen(call.onDelta!(`{"summary": "s", "decisions": [${JSON.stringify(many[0])}, {"id": "l`), Deferred.await(gate)), sortOf(many)) })
+      const first = yield* Effect.gen(function* () {
+        const reviewer = yield* Reviewer
+        yield* reviewer.prepare(ref, 'HEAD1')
+        const first = yield* reviewer.partial(ref, 'HEAD1').pipe(Stream.runHead)
+        yield* Deferred.succeed(gate, undefined)
+        yield* reviewer.result(ref, 'HEAD1')
+        return Option.getOrThrow(first)
+      }).pipe(Effect.provide(layer))
+      assert.deepStrictEqual(first.sort.decisions.map((d) => d.id), ['h1'])
+      assert.deepStrictEqual(first.sort.skim.map((s) => [s.area, s.files.length]), [['Still sorting', 4]])
+    }))
+
   it.effect('the opinion phase shows "Reading the ticket" while the ticket holds it up', () =>
     Effect.gen(function* () {
       const gate = yield* Deferred.make<void>()

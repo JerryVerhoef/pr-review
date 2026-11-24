@@ -934,3 +934,18 @@ test('a map that failed says why and can be tried again', async () => {
   await userEvent.click(screen.getByRole('button', { name: 'Try again' }))
   expect(await screen.findByRole('group', { name: 'Architecture map' }, { timeout: 3000 })).toBeInTheDocument()
 })
+
+test('a review opened while the sort is still writing shows each decision it adds', async () => {
+  const gate = Deferred.makeUnsafe<void>()
+  const soFar: ReviewEvent = { _tag: 'Done', sort: { ...sorted, decisions: sorted.decisions.slice(0, 1) }, state: {}, findingStates: {}, opinion: null, judging: true }
+  renderPage({
+    review: Stream.make(soFar).pipe(
+      Stream.concat(Stream.fromEffect(Effect.as(Deferred.await(gate), { ...soFar, sort: sorted }))),
+      Stream.concat(Stream.never),
+    ),
+  })
+  expect(await heading('Decision one')).toBeInTheDocument()
+  await act(async () => void Effect.runSync(Deferred.succeed(gate, undefined)))
+  await userEvent.keyboard('j')
+  expect(await heading('Decision two')).toBeInTheDocument()
+})
