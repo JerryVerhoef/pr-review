@@ -1,8 +1,10 @@
 import { useAtomValue } from '@effect/atom-react'
-import type { PrRef, StackEntryStatus, StackEvent, StackOverview } from '@pr-review/domain'
+import type { Finding, PrRef, StackEntryStatus, StackEvent, StackOverview } from '@pr-review/domain'
 import { useHotkeys } from '@tanstack/react-hotkeys'
 import { AsyncResult } from 'effect/reactivity'
 import { useState } from 'react'
+import { ArchitectureView } from '../architecture/ArchitectureView.tsx'
+import type { Source } from '../architecture/related.ts'
 import { useAtoms } from '../atoms.ts'
 import { cn } from '../lib/utils.ts'
 import { useRemembered } from '../remembered.ts'
@@ -13,7 +15,7 @@ import { Setup } from '../Setup.tsx'
 import { Kbd, Spinner } from '../ui/index.tsx'
 import { Overview, shortTitle } from './Overview.tsx'
 
-type Selection = { kind: 'overview' } | { kind: 'pr'; pr: number; focus?: string }
+type Selection = { kind: 'overview' } | { kind: 'architecture' } | { kind: 'pr'; pr: number; focus?: string }
 
 export function StackPage({ prRef }: { prRef: PrRef }) {
   const { stackAtom } = useAtoms()
@@ -40,7 +42,7 @@ export function StackPage({ prRef }: { prRef: PrRef }) {
 function Loaded({ prRef, entries, overview, overviewError, stackOpinion }: { prRef: PrRef; entries: ReadonlyArray<StackEntryStatus>; overview: StackOverview | null; overviewError?: string | undefined; stackOpinion?: StackEvent['stackOpinion'] }) {
   const [stored, setSel] = useRemembered<Selection>(`at:stack:${prRef.host}/${prRef.owner}/${prRef.repo}#${prRef.number}`, { kind: 'overview' })
   // A remembered PR can be merged since, and older versions remembered an item instead.
-  const sel: Selection = stored.kind === 'pr' && entries.some((e) => e.pr.number === stored.pr) ? stored : { kind: 'overview' }
+  const sel: Selection = stored.kind === 'architecture' || (stored.kind === 'pr' && entries.some((e) => e.pr.number === stored.pr)) ? stored : { kind: 'overview' }
   const prIndex = sel.kind === 'pr' ? entries.findIndex((e) => e.pr.number === sel.pr) : -1
   // What the open review page reports beats the stack's saved verdicts, which only refresh with the stack.
   const [live, setLive] = useState<Record<number, { decided: number; total: number }>>({})
@@ -52,9 +54,11 @@ function Loaded({ prRef, entries, overview, overviewError, stackOpinion }: { prR
     return { decided: ids.filter((id) => e!.state[id]).length, total: ids.length }
   }
   const go = (next: Selection) => setSel(next)
+  // [ and ] walk the nav top to bottom: the overview, the architecture, then each PR.
   const stepPr = (by: number) => {
-    const i = prIndex + by
-    if (i < 0) return go({ kind: 'overview' })
+    const i = (sel.kind === 'overview' ? -2 : sel.kind === 'architecture' ? -1 : prIndex) + by
+    if (i <= -2) return go({ kind: 'overview' })
+    if (i === -1) return go({ kind: 'architecture' })
     if (entries[i]) go({ kind: 'pr', pr: entries[i].pr.number })
   }
 
@@ -107,6 +111,14 @@ function Loaded({ prRef, entries, overview, overviewError, stackOpinion }: { prR
           >
             Overview
           </button>
+          <button
+            type="button"
+            aria-current={sel.kind === 'architecture'}
+            onClick={() => go({ kind: 'architecture' })}
+            className={cn('mb-1 w-full rounded-md px-2 py-1.5 text-left text-muted-foreground hover:bg-accent/60', sel.kind === 'architecture' && 'bg-accent text-foreground')}
+          >
+            Architecture
+          </button>
           {entries.map((e, i) => {
             const n = e.pr.number
             const { decided: d, total: t } = progress(n)
@@ -137,7 +149,7 @@ function Loaded({ prRef, entries, overview, overviewError, stackOpinion }: { prR
           })}
           <p className="mt-auto flex items-center gap-1 px-2 pt-2 text-xs text-dim">
             <Kbd>[</Kbd>
-            <Kbd>]</Kbd> previous / next PR
+            <Kbd>]</Kbd> previous / next
           </p>
         </nav>
         {sel.kind === 'pr' ? (
@@ -149,6 +161,10 @@ function Loaded({ prRef, entries, overview, overviewError, stackOpinion }: { prR
               onProgress={(d, t) => setLive((l) => (l[sel.pr]?.decided === d && l[sel.pr]?.total === t ? l : { ...l, [sel.pr]: { decided: d, total: t } }))}
             />
           </div>
+        ) : sel.kind === 'architecture' ? (
+          <main className="min-w-0 flex-1 overflow-y-auto">
+            <StackArchitecture prRef={prRef} entries={entries} overview={overview} onOpen={(pr) => go({ kind: 'pr', pr })} onOpenDecision={(pr, id) => go({ kind: 'pr', pr, focus: `d:${id}` })} />
+          </main>
         ) : (
           <main className="min-w-0 flex-1 overflow-y-auto">
             <Overview
@@ -160,10 +176,37 @@ function Loaded({ prRef, entries, overview, overviewError, stackOpinion }: { prR
               progress={progress}
               onOpen={(pr) => go({ kind: 'pr', pr })}
               onOpenDecision={(pr, id) => go({ kind: 'pr', pr, focus: `d:${id}` })}
+              onOpenArchitecture={() => go({ kind: 'architecture' })}
             />
           </main>
         )}
       </div>
     </div>
+  )
+}
+
+/** The architecture of the whole stack, with what each PR's review and the stack opinion already know. */
+function StackArchitecture(props: { prRef: PrRef; entries: ReadonlyArray<StackEntryStatus>; overview: StackOverview | null; onOpen: (pr: number) => void; onOpenDecision: (pr: number, decisionId: string) => void }) {
+  const cached = useAtomValue(useAtoms().stackOpinionAtom(props.prRef, false))
+  const stackFindings: ReadonlyArray<Finding> = AsyncResult.isSuccess(cached) && cached.value._tag === 'Done' ? cached.value.opinion.findings : []
+  const sources = props.entries.map((e): Source => ({
+    pr: e.pr.number,
+    decisions: e.result?.decisions ?? [],
+    states: e.state,
+    findings: [
+      ...(e.opinion?.decisions.flatMap((d) => d.findings.filter((f) => e.opinionStates?.[f.id] !== 'dismissed' && f.handledIn === null)) ?? []),
+      ...stackFindings.filter((f) => f.pr === e.pr.number && f.handledIn === null),
+    ],
+  }))
+  return (
+    <ArchitectureView
+      prRef={props.prRef}
+      stack
+      version={props.entries.map((e) => `${e.pr.number}:${e.pr.headSha}`).join(' ')}
+      sources={sources}
+      overview={props.overview}
+      onOpenDecision={props.onOpenDecision}
+      onOpenPr={props.onOpen}
+    />
   )
 }

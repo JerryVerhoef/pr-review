@@ -8,17 +8,20 @@ export type Item =
   | { readonly kind: 'trusted'; readonly key: string; readonly group: TrustedGroup }
   | { readonly kind: 'unsorted'; readonly key: string; readonly files: ReadonlyArray<string> }
   | { readonly kind: 'description'; readonly key: string }
+  /** The architecture view: nothing to give a verdict on. */
+  | { readonly kind: 'architecture'; readonly key: string }
 
 export const description: Item = { kind: 'description', key: 'about' }
+export const architecture: Item = { kind: 'architecture', key: 'arch' }
 
-/** Sidebar order: the description, decisions, skim areas, trusted groups. Without a review every file sits in one Unsorted item. */
+/** Sidebar order: the description, the architecture view, decisions, skim areas, trusted groups. Without a review every file sits in one Unsorted item. */
 export function buildItems(pr: PrView, review?: { sort: SortResult; opinion: PrOpinion | null; findingStates: FindingStates }): ReadonlyArray<Item> {
   const about: Item[] = pr.body.trim() ? [description] : []
   if (!review) return [...about, { kind: 'unsorted', key: 'unsorted', files: pr.files.map((f) => f.path) }]
   const worst = new Map(review.opinion?.decisions.map((o): [string, number] => [o.decisionId, rank(worstSeverity(o.findings.filter((f) => isOpen(f, review.findingStates))))]))
   // Themes stay together so the sidebar reads in the order j and k move; a theme ranks by its worst decision.
   const bySeverity = (ds: ReadonlyArray<Decision>) => byTheme([...ds].sort((a, b) => (worst.get(a.id) ?? severities.length) - (worst.get(b.id) ?? severities.length)))
-  return [...about, ...itemsOf(review.sort, bySeverity)]
+  return [...about, architecture, ...itemsOf(review.sort, bySeverity)]
 }
 
 const severities: ReadonlyArray<Severity> = ['blocks', 'should', 'ask']
@@ -43,10 +46,10 @@ export const byTheme = (ds: ReadonlyArray<Decision>) => {
   return [...ds].sort((a, b) => order.indexOf(a.theme) - order.indexOf(b.theme))
 }
 
-/** Where a PR opens: on its first item until reviewing has started, then on the first item still open. */
+/** Where a PR opens: on its first item until reviewing has started (never on the architecture view), then on the first item still open. */
 export function startAt(items: ReadonlyArray<Item>, states: DecisionStates): number {
   const ids = items.map(itemId)
-  if (!ids.some((id) => id !== undefined && states[id])) return 0
+  if (!ids.some((id) => id !== undefined && states[id])) return Math.max(0, items.findIndex((i) => i.kind !== 'architecture'))
   const open = ids.findIndex((id) => id !== undefined && !states[id])
   return open >= 0 ? open : Math.max(0, ids.findIndex((id) => id !== undefined))
 }
@@ -87,7 +90,9 @@ export const itemTitle = (item: Item) =>
         ? (trustedLabel[item.group.group] ?? item.group.group)
         : item.kind === 'description'
           ? 'Description'
-          : 'Unsorted'
+          : item.kind === 'architecture'
+            ? 'Architecture'
+            : 'Unsorted'
 
 /** Names for the rule groups; Claude's own groups are named already. */
 export const trustedLabel: Partial<Record<string, string>> = {

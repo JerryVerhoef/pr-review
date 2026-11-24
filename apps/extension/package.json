@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
+    "@dagrejs/dagre": "^3.1.3",
     "@effect/atom-react": "~4.1.1",
     "@pierre/diffs": "^1.6.2",
     "@pr-review/domain": "workspace:*",

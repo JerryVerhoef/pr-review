@@ -32,6 +32,7 @@ export const fakeCompanion = (
     Ask: () => Stream.die('unused'),
     Stack: () => Stream.die('unused'),
     StackOpinion: () => Stream.make({ _tag: 'Idle' as const }),
+    Architecture: () => Stream.make({ _tag: 'Idle' as const }),
     GetChats: () => Effect.succeed([]),
     GetDescription: () => Effect.succeed(''),
     GetDrafts: () => Effect.succeed([]),
