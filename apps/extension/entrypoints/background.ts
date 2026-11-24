@@ -3,6 +3,7 @@ import { Effect, Layer } from 'effect'
 import { prepareDebounce } from '../src/prepare.ts'
 import { registerHosts } from '../src/hosts.ts'
 import { relay } from '../src/relay.ts'
+import { reviewUrlFor } from '../src/reviewUrl.ts'
 import { storedSettings } from '../src/settings/store.ts'
 
 export default defineBackground(() => {
@@ -30,5 +31,11 @@ export default defineBackground(() => {
   const reviewPage = chrome.runtime.getURL('/review.html')
   chrome.runtime.onMessage.addListener((msg: { open?: unknown }, sender) => {
     if (typeof msg.open === 'string' && msg.open.startsWith(reviewPage) && sender.tab?.id !== undefined) void chrome.tabs.update(sender.tab.id, { url: msg.open })
+  })
+
+  // Firefox builds MV2, where the toolbar button is browserAction.
+  ;(chrome.action ?? chrome.browserAction).onClicked.addListener((tab) => {
+    const target = tab.url && reviewUrlFor(tab.url, chrome.runtime.getURL('/'))
+    if (target && tab.id !== undefined) void chrome.tabs.update(tab.id, { url: target })
   })
 })

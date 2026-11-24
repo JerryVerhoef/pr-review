@@ -21,7 +21,8 @@ export default defineConfig({
       : process.env.STORE_BUILD
         ? {}
         : { key: EXTENSION_KEY }),
-    permissions: ['storage', 'nativeMessaging', 'scripting'],
+    permissions: ['storage', 'nativeMessaging', 'scripting', 'activeTab'],
+    action: { default_title: 'Open in PR Reviewer' },
     host_permissions: ['https://github.com/*'],
     // GitHub Enterprise hosts from the settings are asked for at runtime. Firefox builds MV2, which has no optional_host_permissions.
     ...(browser === 'firefox' ? { optional_permissions: ['https://*/*'] } : { optional_host_permissions: ['https://*/*'] }),
