@@ -31,7 +31,7 @@ How writing works:
 | `operationId` | The outermost measured span this event ran under. Everything from one review (or one stack walk) shares it. |
 | `spanId` / `parentId` | This event, and the nearest measured span it ran inside. Concurrent work has distinct `spanId`s under the same parent. |
 | `offsetMs` | Start time in ms after the operation started, so overlapping (parallel) phases can be laid out. |
-| `kind` | The nearest operation or agent turn kind: `review`, `sort`, `areas` (the sort's skim and trusted turn beside it), `opinion`, `deeper`, `overview`, `stack-opinion`, `architecture`, `stack`, `ask`, `chat`, `ticket`, `rule`. `other` is work outside any of them, like a page load's `GetPr`. |
+| `kind` | The nearest operation or agent turn kind: `review`, `sort`, `areas` (the sort's skim turn beside it), `opinion`, `deeper`, `overview`, `stack-opinion`, `architecture`, `stack`, `ask`, `chat`, `ticket`, `rule`. `other` is work outside any of them, like a page load's `GetPr`. |
 | `owner`, `repo`, `prNumber`, `headSha`, `agent`, `model` | Taken from the nearest enclosing span that has them. Left out when unknown. |
 | `durationMs` | The span's own start and end from Effect's `Clock` (high-resolution, monotonic between re-anchors to the wall clock). |
 | `status` | `success`, `error` (with `metadata.errorTag`, the error's type and never its message) or `cancelled` (interrupted). |
@@ -45,9 +45,9 @@ Only short tokens get logged: numbers, booleans, and strings of up to 80 charact
 | `operation` | A whole review (`Reviewer`), sort run, opinion run, overview, stack opinion, architecture map, stack walk | `concurrentOperations` (operations running at its start, nested ones included). A review adds `sortCached`, `opinionCached`, `sortJoined`, `quick`, `reviewLines`, `files`, `decisions`, `highDecisions`, `streamed` (decisions queued for judging while the sort was still writing), `sideSessions` (judging sessions started on free slots), `slowTicket` (the ticket is checked in a turn of its own), `retried` (decisions retried after a failed turn), `specRetried`, `since` (sorted from the previous push's sort), `carried` (decisions that kept their opinion from it). |
 | `git.clone` | First use of a repo | |
 | `git.fetch` | `fetchPr`: ensuring the clone, refs, fetching when needed, merge base. In-memory hits aren't logged. | `network` (false = head already local) |
-| `git.numstat`, `git.diff`, `git.show`, `git.lsTree` | Each git call | `files`, `additions`, `deletions` / `bytes`, `paths` / `entries` |
-| `git.maintain` | Background repack of a clone past 20 packs | `packs` |
-| `git.tree` | Moving the default branch checkout that `grep` reads | |
+| `git.numstat`, `git.diff`, `git.show`, `git.lsTree`, `git.grep` | Each git call | `files`, `additions`, `deletions` / `bytes`, `paths` / `entries` / `files` |
+| `git.maintain` | Background repack of a clone past 20 packs, holding the clone's fetch permit | `packs` |
+| `git.tree` | Checking out a default branch commit for `grep` | |
 | `mcp.tool` | One call to the companion's git tools, server side (`agent.tool` has the agent's side) | `tool`, and for `grep` `tree`, `differing` |
 | `github.request` | Each GitHub API request (cache misses only) | `op` (`getPr`, `listOpenPrs`, `getChecks`, `getIssue`, `fileAt`…) |
 | `ticket.lookup` | The ticket summary, including its agent turn if one runs | `refs`, `githubIssues`, `otherRefs`, `found` |
