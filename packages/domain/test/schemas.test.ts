@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Schema } from 'effect'
-import { AgentSort, AskTarget, defaultSettings, opinionsMode, PrRef, repoSettings, ReviewEvent, ReviewRpcs, smallPrLines, Settings, SortEvent, SortResult } from '../src/index.ts'
+import { AgentSort, AskTarget, defaultSettings, opinionsMode, PrRef, repoSettings, ReviewEvent, ReviewRpcs, smallPrLines, Settings, SortEvent, SortResult, areaOf, relationKey, relationLabel, underAny } from '../src/index.ts'
 
 const decision = {
   id: 'api-client',
@@ -41,7 +41,7 @@ describe('domain schemas', () => {
 
   it('ReviewRpcs lists its procedures', () => {
     expect([...ReviewRpcs.requests.keys()].sort()).toEqual(
-      ['Ask', 'Configure', 'DigDeeper', 'DraftRule', 'GetChats', 'GetDescription', 'GetDrafts', 'GetFilePatch', 'GetPr', 'GetSettings', 'Health', 'Opinion', 'PoolStatus', 'Prepare', 'Recall', 'Remember', 'Review', 'SetDrafts', 'SetFindingState', 'SetState', 'Sort', 'Stack', 'StackOpinion', 'SubmitReview'],
+      ['Architecture', 'Ask', 'Configure', 'DigDeeper', 'DraftRule', 'GetChats', 'GetDescription', 'GetDrafts', 'GetFilePatch', 'GetPr', 'GetSettings', 'Health', 'Opinion', 'PoolStatus', 'Prepare', 'Recall', 'Remember', 'Review', 'SetDrafts', 'SetFindingState', 'SetState', 'Sort', 'Stack', 'StackOpinion', 'SubmitReview'],
     )
   })
 })
@@ -72,4 +72,32 @@ it('ReviewEvent round-trips', () => {
     const enc = Schema.encodeSync(ReviewEvent)(Schema.decodeUnknownSync(ReviewEvent)(e))
     expect(enc).toEqual(e)
   }
+})
+
+it('underAny matches a path and what lies under it, not a sibling with the same prefix', () => {
+  expect(underAny('src/billing/Bill.ts', ['src/billing/'])).toBe(true)
+  expect(underAny('src/billing', ['src/billing'])).toBe(true)
+  expect(underAny('src/billing-old/Bill.ts', ['src/billing'])).toBe(false)
+  expect(underAny('src/a.ts', [''])).toBe(false)
+})
+
+it('areaOf names the part of the repo a component lives in', () => {
+  expect(areaOf(['apps/claus/app/Actions/X.php', 'apps/claus/app/Models/Y.php'])).toBe('claus')
+  expect(areaOf(['packages/ui/src/button.tsx'])).toBe('ui')
+  expect(areaOf(['src/billing/Bill.ts'])).toBe('src')
+  expect(areaOf(['security/'])).toBe('security')
+  // Most of its paths win; the first on a tie.
+  expect(areaOf(['apps/core/a.php', 'apps/web/b.tsx', 'apps/web/c.tsx'])).toBe('web')
+  expect(areaOf(['apps/core/a.php', 'apps/web/b.tsx'])).toBe('core')
+  expect(areaOf(['README.md'])).toBeUndefined()
+  expect(areaOf([])).toBeUndefined()
+})
+
+it('a relation reads as how it gets there, with the method on a request', () => {
+  expect(relationLabel({ kind: 'http', method: 'POST' })).toBe('http post')
+  expect(relationLabel({ kind: 'xhr', method: 'GET' })).toBe('xhr get')
+  expect(relationLabel({ kind: 'xhr', method: null })).toBe('xhr')
+  expect(relationLabel({ kind: 'invoke', method: null })).toBe('code invoke')
+  expect(relationLabel({ kind: 'write', method: null })).toBe('db write')
+  expect(relationKey({ from: 'a', to: 'b', kind: 'http', method: 'GET' })).not.toBe(relationKey({ from: 'a', to: 'b', kind: 'http', method: 'POST' }))
 })

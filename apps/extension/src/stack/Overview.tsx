@@ -8,19 +8,6 @@ import { failureOf } from '../result.ts'
 import { SeverityPill } from '../review/Findings.tsx'
 import { Button, Spinner, Working } from '../ui/index.tsx'
 
-const panels = [
-  ['tables', 'Tables'],
-  ['modules', 'Modules'],
-  ['endpoints', 'Endpoints'],
-  ['sharedLayers', 'Shared layers'],
-] as const
-
-/** "company_group: new entity…" splits into the thing and what changed; a line without a short lead-in stays whole. */
-const split = (line: string) => {
-  const at = line.indexOf(': ')
-  return at > 0 && at <= 60 ? { name: line.slice(0, at), what: line.slice(at + 2) } : undefined
-}
-
 /** Titles in a stack share a conventional-commit prefix ("feat(console): "); without it they can be told apart. */
 export const shortTitle = (title: string) => title.replace(/^\w+(\([^)]*\))?!?:\s*/, '')
 
@@ -36,7 +23,7 @@ export function PrLine({ entry }: { entry: StackEntryStatus }) {
   )
 }
 
-/** The stack at a glance: every PR bottom to top with what it does, then what the whole stack changes. */
+/** The stack at a glance: every PR bottom to top with what it does, Claude's findings, then what the whole stack adds in a few sentences. */
 export function Overview(props: {
   prRef: PrRef
   entries: ReadonlyArray<StackEntryStatus>
@@ -46,6 +33,8 @@ export function Overview(props: {
   progress: (pr: number) => { decided: number; total: number }
   onOpen: (pr: number) => void
   onOpenDecision: (pr: number, decisionId: string) => void
+  /** The tables, modules, endpoints and shared layers the summary lists are on the architecture view. */
+  onOpenArchitecture: () => void
 }) {
   const results: SortResult[] = props.entries.flatMap((e) => (e.result ? [e.result] : []))
   const pending = props.entries.some((e) => e.status === 'queued' || e.status === 'running')
@@ -90,36 +79,12 @@ export function Overview(props: {
       {overview ? (
         <>
           <h2 className="mb-2 text-lg font-medium">What the stack changes</h2>
-          <p className="mb-5 max-w-[70ch] leading-relaxed">{overview.summary}</p>
-          {panels.map(([key, label]) =>
-            overview[key].length === 0 ? null : (
-              <section key={key} aria-label={label} className="mb-5">
-                <h3 className="mb-1 text-sm text-dim">
-                  {label} <span className="tabular-nums">{overview[key].length}</span>
-                </h3>
-                <dl className="grid grid-cols-1 border-t border-border sm:grid-cols-[minmax(0,16rem)_1fr]">
-                  {overview[key].flatMap((v) => {
-                    const parts = split(v)
-                    return parts
-                      ? [
-                          <div key={v} className="contents">
-                            <dt className="border-b border-border pt-2 font-mono text-sm break-words sm:py-2 sm:pr-4">{parts.name}</dt>
-                            <dd className="border-b border-border pb-2 text-muted-foreground sm:py-2">{parts.what}</dd>
-                          </div>,
-                        ]
-                      : []
-                  })}
-                </dl>
-                {overview[key]
-                  .filter((v) => !split(v))
-                  .map((v) => (
-                    <p key={v} className="border-b border-border py-2 text-muted-foreground">
-                      {v}
-                    </p>
-                  ))}
-              </section>
-            ),
-          )}
+          <p className="mb-2 max-w-[70ch] leading-relaxed">{overview.summary}</p>
+          <p className="mb-5">
+            <button type="button" onClick={props.onOpenArchitecture} className="text-primary hover:underline">
+              Tables, modules, endpoints and shared layers are under Architecture
+            </button>
+          </p>
         </>
       ) : props.overviewError ? (
         <p className="mb-4 text-muted-foreground">No stack summary: {props.overviewError.replace(/\.$/, '')}. Reload the page to try again.</p>

@@ -136,6 +136,7 @@ export const relay = (native: NativeConnect, pages: OnConnectLike, settings: Eff
         Ask: (p) => stream((c) => c.Ask(p)),
         Stack: (p) => stream((c) => c.Stack(p)),
         StackOpinion: (p) => stream((c) => c.StackOpinion(p)),
+        Architecture: (p) => stream((c) => c.Architecture(p)),
         GetChats: (p) => call((c) => c.GetChats(p)),
         GetDescription: (p) => call((c) => c.GetDescription(p)),
         GetDrafts: (p) => call((c) => c.GetDrafts(p)),

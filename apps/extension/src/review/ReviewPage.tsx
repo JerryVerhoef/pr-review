@@ -3,6 +3,7 @@ import type { DecisionState, DecisionStates, OpinionEvent, PrRef, PrView, Review
 import { useHotkeys } from '@tanstack/react-hotkeys'
 import { AsyncResult } from 'effect/reactivity'
 import { useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { ArchitectureView } from '../architecture/ArchitectureView.tsx'
 import { useAtoms } from '../atoms.ts'
 import { useRemembered } from '../remembered.ts'
 import { failureOf, isUnavailable } from '../result.ts'
@@ -236,22 +237,32 @@ function Ready({ prRef, pr, review, sortError, focus, onProgress }: { prRef: PrR
           onSelect={select}
         />
         <main key={item.key} className="min-w-0 flex-1 overflow-y-auto">
-          <ItemView
-            key={item.key}
-            prRef={prRef}
-            pr={pr}
-            item={item}
-            verdict={id === undefined ? undefined : states[id]}
-            rereview={id === undefined ? undefined : rereview[id]}
-            commenting={decision !== undefined && commentingOn === decision.id}
-            onAccept={accept}
-            onPushBack={pushBack}
-            onDiscuss={discuss}
-            onCommentDone={() => setCommentingOn(undefined)}
-            {...(index < items.length - 1 ? { onNext: () => select(index + 1) } : {})}
-            opinion={done}
-            judging={judging}
-          />
+          {item.kind === 'architecture' ? (
+            <ArchitectureView
+              prRef={prRef}
+              stack={false}
+              version={pr.headSha}
+              sources={[{ pr: pr.number, decisions: review?.sort.decisions ?? [], states, findings: openFindings }]}
+              onOpenDecision={(_pr, decisionId) => select(items.findIndex((i) => i.key === `d:${decisionId}`))}
+            />
+          ) : (
+            <ItemView
+              key={item.key}
+              prRef={prRef}
+              pr={pr}
+              item={item}
+              verdict={id === undefined ? undefined : states[id]}
+              rereview={id === undefined ? undefined : rereview[id]}
+              commenting={decision !== undefined && commentingOn === decision.id}
+              onAccept={accept}
+              onPushBack={pushBack}
+              onDiscuss={discuss}
+              onCommentDone={() => setCommentingOn(undefined)}
+              {...(index < items.length - 1 ? { onNext: () => select(index + 1) } : {})}
+              opinion={done}
+              judging={judging}
+            />
+          )}
         </main>
         {chatOpen && decision && <ChatPanel key={decision.id} prRef={prRef} headSha={pr.headSha} decision={decision} focus={chatFocus} />}
       </div>

@@ -75,6 +75,17 @@ export const makeAtoms = (client: Client) => {
     )
   })
   const cachedStackOpinion = (ref: string): Atom.Atom<unknown> => stackOpinion(`${ref}@cached`)
+  const architecture = Atom.family((key: string) => {
+    const { ref, stack, run } = JSON.parse(key) as { ref: PrRef; stack: boolean; version: string; run: boolean }
+    return Atom.keepAlive(
+      client.runtime.atom((get) =>
+        Stream.unwrap(Effect.map(rpc, (c) => c('Architecture', { ref, stack, run }))).pipe(
+          Stream.tap((e) => (e._tag === 'Done' && run ? Effect.sync(() => get.refresh(cachedArchitecture(key))) : Effect.void)),
+        ),
+      ),
+    )
+  })
+  const cachedArchitecture = (key: string): Atom.Atom<unknown> => architecture(JSON.stringify({ ...JSON.parse(key), run: false }))
   const deeper = Atom.family((key: string) => {
     const { ref, headSha, decisionId } = JSON.parse(key) as { ref: PrRef; headSha: string; decisionId: string }
     return Atom.keepAlive(
@@ -100,6 +111,11 @@ export const makeAtoms = (client: Client) => {
     opinionAtom: (ref: PrRef, headSha: string, run: boolean) => opinion(`${refKey(ref)}@${headSha}@${run ? 'run' : 'cached'}`),
     /** One opinion on the stack as a whole. With `run` false it only reads a cached one (`Idle` without); a finished run refreshes that one. */
     stackOpinionAtom: (ref: PrRef, run: boolean) => stackOpinion(`${refKey(ref)}@${run ? 'run' : 'cached'}`),
+    /**
+     * The architecture map of a PR, or with `stack` of its stack. `version` names the heads in view, so a push reads again.
+     * With `run` false it only reads a cached one (`Idle` without); a finished run refreshes that one.
+     */
+    architectureAtom: (ref: PrRef, stack: boolean, version: string, run: boolean) => architecture(JSON.stringify({ ref, stack, version, run })),
     /** One decision looked at again on the strongest model; when done the cached opinion carries it. */
     deeperAtom: (ref: PrRef, headSha: string, decisionId: string) => deeper(JSON.stringify({ ref, headSha, decisionId })),
     findingStateAtom: client.runtime.fn((a: { ref: PrRef; headSha: string; findingId: string; state: FindingState | null }, get) =>

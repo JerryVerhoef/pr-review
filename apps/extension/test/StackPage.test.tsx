@@ -1,5 +1,5 @@
 import { RegistryProvider } from '@effect/atom-react'
-import { type Decision, type Draft, type Finding, GitError, type PrOpinion, type PrView, type SortResult, type StackEntry, type StackEvent, type StackOpinionEvent } from '@pr-review/domain'
+import { type ArchitectureMap, type Decision, type Draft, type Finding, GitError, type PrOpinion, type PrView, type SortResult, type StackEntry, type StackEvent, type StackOpinionEvent } from '@pr-review/domain'
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Effect, Exit, Layer, Scope, Stream } from 'effect'
@@ -24,9 +24,10 @@ const view = (number: number): PrView => ({
   host: ref.host, owner: ref.owner, repo: ref.repo, baseSha: 'B', mergeBase: 'MB', defaultBranch: 'master', files: [], threads: [], checks: 'pass', stack: [], viewer: 'me',
 })
 
-const renderStack = (events: ReadonlyArray<StackEvent>, o: { getPr?: (n: number) => Effect.Effect<PrView, GitError>; drafts?: Draft[]; stackOpinion?: StackOpinionEvent; cached?: boolean } = {}) => {
+const renderStack = (events: ReadonlyArray<StackEvent>, o: { getPr?: (n: number) => Effect.Effect<PrView, GitError>; drafts?: Draft[]; stackOpinion?: StackOpinionEvent; cached?: boolean; architecture?: ArchitectureMap } = {}) => {
   const saved: unknown[] = []
-  const calls = { opinion: 0, stack: [] as boolean[] }
+  const calls = { opinion: 0, stack: [] as boolean[], architecture: [] as Array<{ stack: boolean; run: boolean; pr: number }> }
+  let mapped = o.cached === true && o.architecture !== undefined
   const reviews: number[] = []
   const companion = fakeCompanion({
     handlers: {
@@ -42,6 +43,11 @@ const renderStack = (events: ReadonlyArray<StackEvent>, o: { getPr?: (n: number)
       StackOpinion: ({ run }) => {
         calls.stack.push(run)
         return Stream.make((calls.stack.includes(true) || o.cached) && o.stackOpinion ? o.stackOpinion : { _tag: 'Idle' as const })
+      },
+      Architecture: ({ ref, stack, run }) => {
+        calls.architecture.push({ stack, run, pr: ref.number })
+        if (run) mapped = true
+        return Stream.make(o.architecture && mapped && stack ? { _tag: 'Done' as const, map: o.architecture } : { _tag: 'Idle' as const })
       },
       GetDrafts: () => Effect.succeed(o.drafts ?? []),
       SubmitReview: (p) => Effect.sync(() => void reviews.push(p.ref.number)),
@@ -97,6 +103,10 @@ test('the stack summary reads as name and what changed, not one string per line'
       overview: { summary: 'Adds credits.', tables: ['company_group: new CompanyGroupEntity on the legacy table', 'No migrations in the stack'], modules: [], endpoints: [], sharedLayers: [] },
     },
   ])
+  // The summary stays on the overview; its lists are the architecture view's baseline.
+  expect(await screen.findByText('Adds credits.', {}, { timeout: 3000 })).toBeInTheDocument()
+  expect(screen.queryByRole('region', { name: 'Tables' })).not.toBeInTheDocument()
+  await userEvent.click(screen.getByRole('button', { name: /under Architecture/ }))
   const tables = await screen.findByRole('region', { name: 'Tables' }, { timeout: 3000 })
   expect(within(tables).getAllByRole('term').map((t) => t.textContent)).toEqual(['company_group'])
   expect(within(tables).getByRole('definition').textContent).toBe('new CompanyGroupEntity on the legacy table')
@@ -149,7 +159,7 @@ test('coming back to a stack opens the PR the review was on', async () => {
   ]
   renderStack(events)
   await screen.findByRole('navigation', { name: 'Stack' }, { timeout: 3000 })
-  await userEvent.keyboard(']]')
+  await userEvent.keyboard(']]]')
   expect(await screen.findByRole('heading', { name: 'Decision meter' }, { timeout: 3000 })).toBeInTheDocument()
   cleanup()
   renderStack(events)
@@ -171,7 +181,7 @@ test('a PR that could not be loaded says why', async () => {
   expect(await screen.findByText(/cannot lock ref/, {}, { timeout: 3000 })).toBeInTheDocument()
 })
 
-test('[ and ] move between PRs', async () => {
+test('[ and ] walk the overview, the architecture, then the PRs', async () => {
   renderStack([
     {
       entries: [
@@ -183,11 +193,16 @@ test('[ and ] move between PRs', async () => {
   ])
   await screen.findByRole('list', { name: 'PRs in this stack' }, { timeout: 3000 })
   await userEvent.keyboard(']')
+  expect(await screen.findByRole('heading', { name: 'Architecture' }, { timeout: 3000 })).toBeInTheDocument()
+  await userEvent.keyboard(']')
   expect(await screen.findByRole('heading', { name: 'Decision money' }, { timeout: 3000 })).toBeInTheDocument()
   await userEvent.keyboard(']')
   expect(await screen.findByRole('heading', { name: 'Decision meter' }, { timeout: 3000 })).toBeInTheDocument()
+  // In user-event, [[ types one [.
   await userEvent.keyboard('[[')
   expect(await screen.findByRole('heading', { name: 'Decision money' }, { timeout: 3000 })).toBeInTheDocument()
+  await userEvent.keyboard('[[')
+  expect(await screen.findByRole('heading', { name: 'Architecture' }, { timeout: 3000 })).toBeInTheDocument()
   await userEvent.keyboard('[[')
   expect(await screen.findByRole('list', { name: 'PRs in this stack' }, { timeout: 3000 })).toBeInTheDocument()
 })
@@ -308,4 +323,90 @@ test('shows the stack opinion\'s step while it runs', async () => {
   renderStack([{ ...two(), stackOpinion: { running: true, step: 'Reading the diff of #2568' } }])
   expect(await screen.findByText('Judging the stack: Reading the diff of #2568', {}, { timeout: 3000 })).toBeInTheDocument()
   expect(screen.queryByRole('button', { name: 'Judge the stack' })).toBeNull()
+})
+
+const stackMap: ArchitectureMap = {
+  heads: { 2567: 's2567', 2568: 's2568' },
+  summary: 'Credits get a ledger and an API on top.',
+  nodes: [
+    { id: 'ledger', kind: 'table', name: 'credit_ledger', status: 'new', what: 'One row per grant.', paths: ['money.php'], prs: [2567] },
+    { id: 'api', kind: 'endpoint', name: 'Credits API', status: 'new', what: 'Reads the balance.', paths: ['api/'], prs: [2567, 2568] },
+    { id: 'auth', kind: 'shared-layer', name: 'Voters', status: 'untouched', what: 'Access checks.', paths: ['security/'], prs: [] },
+  ],
+  edges: [
+    { from: 'api', to: 'ledger', kind: 'read', method: null, status: 'new', prs: [2568], evidence: { ref: 'head', path: 'api/Credits.php', line: 4, quote: '$ledger->balance()', pr: 2568 } },
+    { from: 'api', to: 'auth', kind: 'invoke', method: null, status: 'untouched', prs: [], evidence: { ref: 'head', path: 'api/Credits.php', line: 2, quote: 'denyAccessUnlessGranted', pr: 2568 } },
+  ],
+  dropped: { nodes: 0, edges: 0 },
+}
+
+test('the stack has its own architecture view: decisions of every PR and the summary lists until it is mapped', async () => {
+  const { calls } = renderStack([{ ...two(), overview: { summary: 'Adds credits.', tables: ['credit_ledger: new'], modules: [], endpoints: [], sharedLayers: [] } }])
+  const nav = await screen.findByRole('navigation', { name: 'Stack' }, { timeout: 3000 })
+  await userEvent.click(within(nav).getByRole('button', { name: 'Architecture' }))
+  const list = await screen.findByRole('region', { name: 'Architecture decisions' }, { timeout: 3000 })
+  expect(within(list).getAllByRole('button').map((b) => b.textContent)).toEqual(['#2567Decision moneyn', '#2568Decision moneyn'])
+  expect(screen.getByRole('region', { name: 'Tables' })).toBeInTheDocument()
+  expect(await screen.findByRole('button', { name: 'Map the architecture' })).toBeInTheDocument()
+  expect(calls.architecture).toEqual([{ stack: true, run: false, pr: 2567 }])
+})
+
+test('the mapped stack says which PR does what, can be coloured by PR, and a component opens the PR at its decision', async () => {
+  const { calls } = renderStack([two()], { architecture: stackMap })
+  const nav = await screen.findByRole('navigation', { name: 'Stack' }, { timeout: 3000 })
+  await userEvent.click(within(nav).getByRole('button', { name: 'Architecture' }))
+  await userEvent.click(await screen.findByRole('button', { name: 'Map the architecture' }, { timeout: 3000 }))
+  const graph = await screen.findByRole('group', { name: 'Architecture map' }, { timeout: 3000 })
+  expect(calls.architecture).toContainEqual({ stack: true, run: true, pr: 2567 })
+  expect(within(graph).getByRole('button', { name: 'Credits API, endpoint in api, new' }).textContent).toContain('#2567 +1')
+  // Once mapped the component table replaces the summary's lists.
+  expect(within(screen.getByRole('region', { name: 'Shared layers' })).getByText('Access checks.')).toBeInTheDocument()
+
+  const legend = () => screen.getByLabelText('Legend').textContent
+  expect(legend()).toMatch(/new.*changed.*removed.*untouched/)
+  await userEvent.click(within(screen.getByRole('group', { name: 'Colour by' })).getByRole('button', { name: 'PR' }))
+  expect(legend()).toBe('#2567#2568untouched')
+  // Each box says where its code lives, and the graph can be coloured by that.
+  expect(within(graph).getByRole('button', { name: /^Voters, shared layer in security/ }).textContent).toContain('security')
+  await userEvent.click(within(screen.getByRole('group', { name: 'Colour by' })).getByRole('button', { name: 'Where' }))
+  expect(within(screen.getByLabelText('Legend')).getAllByRole('img').map((i) => i.getAttribute('aria-label'))).toEqual(['api', 'security'])
+  // A part of the repo without a mark of its own gets its first two letters; the name is the mark's label.
+  expect(within(screen.getByLabelText('Legend')).getByRole('img', { name: 'security' }).textContent).toBe('securitySE')
+
+  await userEvent.click(within(graph).getByRole('button', { name: /^credit_ledger/ }))
+  const details = screen.getByRole('complementary', { name: 'Details' })
+  expect(within(details).getByRole('list', { name: 'Relations' }).textContent).toBe('Credits API db read this')
+  // Both PRs change money.php in a decision called money.
+  const related = within(within(details).getByRole('list', { name: 'Related decisions' })).getAllByRole('button')
+  expect(related.map((b) => b.textContent)).toEqual(['#2567Decision money', '#2568Decision money'])
+  await userEvent.click(related[1]!)
+  expect(await screen.findByText('#2568 PR 2568', {}, { timeout: 3000 })).toBeInTheDocument()
+  expect(await screen.findByRole('heading', { name: 'Decision money' }, { timeout: 3000 })).toBeInTheDocument()
+})
+
+test('the same map reads two ways, the graph and flows from each entry point, and the choice is kept', async () => {
+  renderStack([two()], { architecture: stackMap })
+  const nav = await screen.findByRole('navigation', { name: 'Stack' }, { timeout: 3000 })
+  await userEvent.click(within(nav).getByRole('button', { name: 'Architecture' }))
+  await userEvent.click(await screen.findByRole('button', { name: 'Map the architecture' }, { timeout: 3000 }))
+  const graph = await screen.findByRole('group', { name: 'Architecture map' }, { timeout: 3000 })
+  const tabs = screen.getByRole('tablist', { name: 'Format' })
+  expect(within(tabs).getAllByRole('tab').map((t) => [t.textContent, t.getAttribute('aria-selected')])).toEqual([['Graph', 'true'], ['Flows', 'false']])
+
+  // What is picked stays picked across formats, with its details beside it.
+  await userEvent.click(within(graph).getByRole('button', { name: /db read/ }))
+  expect(within(screen.getByRole('complementary', { name: 'Details' })).getByLabelText('Cited line').textContent).toBe('$ledger->balance()')
+  await userEvent.click(within(tabs).getByRole('tab', { name: 'Flows' }))
+  expect(screen.queryByRole('group', { name: 'Architecture map' })).toBeNull()
+  const panel = screen.getByRole('tabpanel', { name: 'Flows' })
+  expect(screen.getByRole('complementary', { name: 'Details' })).toBeInTheDocument()
+  expect(within(panel).getByRole('button', { name: 'db read' })).toHaveAttribute('aria-pressed', 'true')
+  // One entry point, and under it what it reaches and how.
+  expect(within(panel).getByRole('list', { name: 'Flows' }).textContent).toMatch(/Credits API.*db read.*credit_ledger.*code invoke.*Voters/)
+  expect(within(panel).getAllByRole('img').map((i) => i.getAttribute('aria-label'))).toEqual(['api', 'security'])
+  cleanup()
+
+  renderStack([two()], { architecture: stackMap, cached: true })
+  await userEvent.click(within(await screen.findByRole('navigation', { name: 'Stack' }, { timeout: 3000 })).getByRole('button', { name: 'Architecture' }))
+  expect(await screen.findByRole('tabpanel', { name: 'Flows' }, { timeout: 3000 })).toBeInTheDocument()
 })

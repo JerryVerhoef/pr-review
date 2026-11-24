@@ -20,7 +20,7 @@ export function Sidebar(props: {
   onSelect: (i: number) => void
 }) {
   const groups = [
-    { label: 'PR', kind: 'description' },
+    { label: 'PR', kind: 'description', also: 'architecture' },
     { label: 'Decisions', kind: 'decision' },
     { label: 'Skim', kind: 'skim' },
     { label: 'Trusted', kind: 'trusted' },
@@ -50,7 +50,7 @@ export function Sidebar(props: {
       <Dot tone={itemTone(item, verdictOf(item), (itemId(item) ?? '') in props.rereview)} />
       <span className="min-w-0 flex-1 truncate">{item.kind === 'unsorted' ? 'All files' : itemTitle(item)}</span>
       {item.kind === 'decision' && worst([{ item, i }])}
-      {item.kind !== 'decision' && item.kind !== 'description' && <span className="text-xs text-dim">{itemFiles(item).length}</span>}
+      {item.kind !== 'decision' && item.kind !== 'description' && item.kind !== 'architecture' && <span className="text-xs text-dim">{itemFiles(item).length}</span>}
     </button>
   )
 
@@ -99,7 +99,7 @@ export function Sidebar(props: {
       )}
       {changed > 0 && <p className="mx-2 mb-1 text-xs text-warn">{`${changed} ${changed === 1 ? 'decision' : 'decisions'} changed since you looked`}</p>}
       {groups.map((g) => {
-        const rows = props.items.map((item, i) => ({ item, i })).filter((r) => r.item.kind === g.kind)
+        const rows = props.items.map((item, i) => ({ item, i })).filter((r) => r.item.kind === g.kind || ('also' in g && r.item.kind === g.also))
         if (rows.length === 0) return null
         const decided = g.kind === 'unsorted' || g.kind === 'description' ? undefined : rows.filter((r) => verdictOf(r.item)).length
         return (

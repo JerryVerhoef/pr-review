@@ -1,5 +1,7 @@
 import { RegistryProvider } from '@effect/atom-react'
 import {
+  AgentError,
+  type ArchitectureMap,
   type AskEvent,
   type AskTarget,
   type Chat,
@@ -125,6 +127,10 @@ const renderPage = (
     /** Replaces the review stream, which by default follows `sort`. */
     review?: Stream.Stream<ReviewEvent>
     deeper?: () => Stream.Stream<DeeperEvent>
+    /** The map a run gives; without one the companion has none. */
+    architecture?: ArchitectureMap
+    /** How many map runs fail before one works. */
+    architectureFails?: number
   } = {},
 ) => {
   let drafts: ReadonlyArray<Draft> = []
@@ -148,6 +154,9 @@ const renderPage = (
           ...(o.opinionError && !stored ? { opinionError: o.opinionError } : {}),
         }
   let reviewCalls = 0
+  let mapped = false
+  let mapFails = o.architectureFails ?? 0
+  const architectureCalls: Array<{ stack: boolean; run: boolean }> = []
   const companion = fakeCompanion({
     handlers: {
       GetPr: o.getPr ?? (() => Effect.succeed(pr)),
@@ -192,6 +201,15 @@ const renderPage = (
             }),
           ),
         ),
+      // Like the companion: nothing until asked, then the map stays cached.
+      Architecture: ({ stack, run }) => {
+        architectureCalls.push({ stack, run })
+        const map = o.architecture
+        if (!map) return Stream.make({ _tag: 'Idle' as const })
+        if (run && mapFails-- > 0) return Stream.fail(new AgentError({ message: 'Claude took longer than 10 minutes' }))
+        if (run) return Stream.make({ _tag: 'Running' as const, startedAt: new Date().toISOString(), step: 'Reading the diff' }).pipe(Stream.concat(Stream.fromEffect(Effect.sync(() => ((mapped = true), { _tag: 'Done' as const, map })).pipe(Effect.delay(30)))))
+        return Stream.fromEffect(Effect.sync(() => (mapped ? { _tag: 'Done' as const, map } : { _tag: 'Idle' as const })))
+      },
       DraftRule: ({ text }) => Effect.sync(() => (ruleTexts.push(text), ruleDraft)),
       SetFindingState: (p) =>
         Effect.sync(() => {
@@ -219,7 +237,7 @@ const renderPage = (
       </AtomsContext.Provider>
     </RegistryProvider>,
   )
-  return { setStates, patches, bases, drafts: () => drafts, reviews, opinionRuns, stateCalls, ruleTexts, reviewCalls: () => reviewCalls }
+  return { setStates, patches, bases, drafts: () => drafts, reviews, opinionRuns, stateCalls, ruleTexts, architectureCalls, reviewCalls: () => reviewCalls }
 }
 
 const heading = (name: string) => screen.findByRole('heading', { name }, { timeout: 3000 })
@@ -402,6 +420,8 @@ test('a PR with a description opens on it, video included', async () => {
   expect(await heading('Description')).toBeInTheDocument()
   expect(await screen.findByText('Shows the list.', {}, { timeout: 3000 })).toBeInTheDocument()
   expect(container.querySelector('video')?.getAttribute('src')).toBe('https://objects.example/v.mp4')
+  await userEvent.keyboard('j')
+  expect(await heading('Architecture')).toBeInTheDocument()
   await userEvent.keyboard('j')
   expect(await heading('Decision one')).toBeInTheDocument()
 })
@@ -655,7 +675,7 @@ test('quick review shows one Changes item', async () => {
   const take: PrOpinion = { ...opinion, decisions: [decisionOpinion('changes', [finding({ id: 'q1', decisionId: 'changes', severity: 'should', title: 'Name the route' })], 'Small and contained.')] }
   renderPage({ opinion: { cached: take }, sort: Stream.concat(Stream.make({ ...done, result: quick } as SortEvent), Stream.never) })
   expect(await heading('Changes')).toBeInTheDocument()
-  expect(within(nav()).getAllByRole('button').map((b) => b.textContent)).toEqual(['Changes2', 'Tests1'])
+  expect(within(nav()).getAllByRole('button').map((b) => b.textContent)).toEqual(['Architecture', 'Changes2', 'Tests1'])
   screen.getByText('Adds the settings shell.')
   screen.getByText('Small and contained.')
   within(screen.getByRole('region', { name: 'Name the route' })).getByText('Should fix')
@@ -844,4 +864,73 @@ test('the review opens at the sort while decisions are judged, and fills in with
   // Two now ranks first by severity, but the page keeps the order it opened with.
   await userEvent.keyboard('k')
   expect(await heading('Decision one')).toBeInTheDocument()
+})
+
+const archMap: ArchitectureMap = {
+  heads: { 7: 'HEAD1' },
+  summary: 'The API now writes usage.',
+  nodes: [
+    { id: 'api', kind: 'endpoint', name: 'Usage API', status: 'changed', what: 'Records each chargeable turn.', paths: ['api.ts'], prs: [7] },
+    { id: 'usage', kind: 'table', name: 'usage_events', status: 'new', what: 'One row per turn.', paths: ['db/usage.sql'], prs: [7] },
+    { id: 'old', kind: 'module', name: 'Legacy meter', status: 'removed', what: 'Counted turns in memory.', paths: ['meter.ts'], prs: [7] },
+  ],
+  edges: [{ from: 'api', to: 'usage', kind: 'write', method: null, status: 'new', prs: [7], evidence: { ref: 'head', path: 'api.ts', line: 12, quote: 'usage.insert(row)' } }],
+  dropped: { nodes: 0, edges: 2 },
+}
+
+test('the architecture view lists the architecture decisions before anything is mapped, and never opens first', async () => {
+  const { architectureCalls } = renderPage()
+  // Without a description the PR still opens on its first decision.
+  expect(await heading('Decision one')).toBeInTheDocument()
+  await userEvent.click(within(nav()).getByRole('button', { name: 'Architecture' }))
+  expect(await heading('Architecture')).toBeInTheDocument()
+  const list = screen.getByRole('region', { name: 'Architecture decisions' })
+  expect(within(list).getAllByRole('button').map((b) => b.textContent)).toEqual(['Decision onenote one', 'Decision twonote two'])
+  expect(await screen.findByRole('button', { name: 'Map the architecture' })).toBeInTheDocument()
+  // Looking costs nothing: only the cache was read.
+  expect(architectureCalls).toEqual([{ stack: false, run: false }])
+  await userEvent.click(within(list).getByRole('button', { name: /Decision two/ }))
+  expect(await heading('Decision two')).toBeInTheDocument()
+})
+
+test('mapping draws the components and relations, and a component links to its decisions', async () => {
+  const { architectureCalls } = renderPage({ architecture: archMap })
+  await heading('Decision one')
+  await userEvent.click(within(nav()).getByRole('button', { name: 'Architecture' }))
+  await userEvent.click(await screen.findByRole('button', { name: 'Map the architecture' }))
+  expect(await screen.findByText('The API now writes usage.', {}, { timeout: 3000 })).toBeInTheDocument()
+  expect(architectureCalls).toContainEqual({ stack: false, run: true })
+  const graph = screen.getByRole('group', { name: 'Architecture map' })
+  expect(within(graph).getAllByRole('button').map((b) => b.getAttribute('aria-label'))).toEqual([
+    'Usage API db write usage_events, new',
+    'Usage API, endpoint, changed',
+    'usage_events, table in db, new',
+    'Legacy meter, module, removed',
+  ])
+  expect(screen.getByText(/Left out: 2 relations/)).toBeInTheDocument()
+  // One PR: nothing to colour by.
+  expect(screen.queryByRole('group', { name: 'Colour by' })).toBeNull()
+  expect(within(screen.getByRole('region', { name: 'Tables' })).getByText('One row per turn.')).toBeInTheDocument()
+
+  await userEvent.click(within(graph).getByRole('button', { name: /db write/ }))
+  const details = screen.getByRole('complementary', { name: 'Details' })
+  expect(within(details).getByText('api.ts:12')).toBeInTheDocument()
+  expect(within(details).getByLabelText('Cited line').textContent).toBe('usage.insert(row)')
+
+  await userEvent.click(within(graph).getByRole('button', { name: /^Usage API, endpoint/ }))
+  expect(within(details).getByText('Records each chargeable turn.')).toBeInTheDocument()
+  const related = within(details).getByRole('list', { name: 'Related decisions' })
+  expect(within(related).getAllByRole('button').map((b) => b.textContent)).toEqual(['Decision one'])
+  await userEvent.click(within(related).getByRole('button'))
+  expect(await heading('Decision one')).toBeInTheDocument()
+})
+
+test('a map that failed says why and can be tried again', async () => {
+  renderPage({ architecture: archMap, architectureFails: 1 })
+  await heading('Decision one')
+  await userEvent.click(within(nav()).getByRole('button', { name: 'Architecture' }))
+  await userEvent.click(await screen.findByRole('button', { name: 'Map the architecture' }))
+  expect(await screen.findByText(/The map failed: Claude took longer than 10 minutes/, {}, { timeout: 3000 })).toBeInTheDocument()
+  await userEvent.click(screen.getByRole('button', { name: 'Try again' }))
+  expect(await screen.findByRole('group', { name: 'Architecture map' }, { timeout: 3000 })).toBeInTheDocument()
 })

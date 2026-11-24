@@ -13,6 +13,13 @@ const locate = (e: Evidence, text: string): number | undefined => {
   return hits.find((n) => Math.abs(n - e.line) <= WINDOW) === undefined ? hits[0] : e.line
 }
 
+/** The citation with its line corrected when the quote is in the file it names; undefined when it is not. */
+export const checkEvidence = (e: Evidence, read: (e: Evidence) => Effect.Effect<string | undefined>): Effect.Effect<Evidence | undefined> =>
+  Effect.map(read(e), (text) => {
+    const line = text === undefined ? undefined : locate(e, text)
+    return line === undefined ? undefined : { ...e, line }
+  })
+
 export const checkFinding = (
   f: AgentFinding,
   read: (e: Evidence) => Effect.Effect<string | undefined>,
@@ -24,9 +31,8 @@ export const checkFinding = (
         kept.push(e)
         continue
       }
-      const text = yield* read(e)
-      const line = text === undefined ? undefined : locate(e, text)
-      if (line !== undefined) kept.push({ ...e, line })
+      const checked = yield* checkEvidence(e, read)
+      if (checked) kept.push(checked)
     }
     const verified = kept.some((e) => e.ref !== 'docs')
     const unsupported = !verified && !kept.some((e) => e.ref === 'docs')

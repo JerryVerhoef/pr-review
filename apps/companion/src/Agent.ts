@@ -6,7 +6,7 @@ import { Config } from './Config.ts'
 import { annotate, measure, measureStream } from './Perf.ts'
 import { Skills } from './Skills.ts'
 
-export type RunLog = { kind: 'sort' | 'ask' | 'chat' | 'overview' | 'opinion' | 'deeper' | 'stack-opinion' | 'ticket' | 'rule'; owner: string; repo: string; number: number; headSha: string }
+export type RunLog = { kind: 'sort' | 'ask' | 'chat' | 'overview' | 'opinion' | 'deeper' | 'stack-opinion' | 'architecture' | 'ticket' | 'rule'; owner: string; repo: string; number: number; headSha: string }
 type Opts = { cwd: string; /** The repo key of the clone at `cwd`, for its skills. */ repo?: string; related?: ReadonlyArray<string>; /** Only `deep` accounts when the pool has any, else the whole pool. */ prefer?: 'deep'; log: RunLog; onStep?: (step: string) => Effect.Effect<void> }
 type Run = Opts & { prompt: string }
 export type SessionOptions = Opts & {
@@ -32,7 +32,7 @@ const LOGIN = /not logged in|authenticat|log ?in/i
 // ponytail: a fixed sit-out; parse the agent's own "resets at" time if it proves too long or short
 const LIMITED_FOR = 30 * 60_000
 // Most of a turn is the model thinking; low effort halved sort and opinion time with the same decisions found.
-// Dig deeper, ask, chat and rule drafts keep the agent's own level.
+// Dig deeper, ask, chat, rule drafts and architecture maps keep the agent's own level.
 const LOW_EFFORT: ReadonlySet<RunLog['kind']> = new Set(['sort', 'opinion', 'overview', 'stack-opinion', 'ticket'])
 const effortFor = (kind: RunLog['kind']) => (LOW_EFFORT.has(kind) ? 'low' : undefined)
 const LOGIN_FOR = 5 * 60_000
