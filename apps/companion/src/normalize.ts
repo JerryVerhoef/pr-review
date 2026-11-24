@@ -13,17 +13,27 @@ export function normalize(agent: AgentSort, files: ReadonlyArray<FileStat>, cand
     .filter((d) => d.files.length > 0)
   const inDecision = new Set(decisions.flatMap((d) => d.files.map((x) => x.path)))
 
+  // A path ending in `/` stands for the changed files under it that no decision, rule candidate, other entry or deeper directory names.
+  const entries = [...agent.skim, ...(agent.trusted ?? [])].flatMap((g) => g.files)
+  const named = new Set([...inDecision, ...candidates.flatMap((g) => g.files), ...entries])
+  const dirs = entries.filter((p) => p.endsWith('/')).sort((a, b) => b.length - a.length)
+  const taken = new Set<string>()
+  const expand = (paths: ReadonlyArray<string>) =>
+    paths
+      .flatMap((p) => (p.endsWith('/') ? files.map((f) => f.path).filter((x) => !named.has(x) && dirs.find((d) => x.startsWith(d)) === p) : [p]))
+      .filter((p) => !taken.has(p) && taken.add(p))
+
   const skim = agent.skim
-    .map((s) => ({ ...s, files: s.files.filter((p) => known.has(p) && !inDecision.has(p)) }))
+    .map((s) => ({ ...s, files: expand(s.files).filter((p) => known.has(p) && !inDecision.has(p)) }))
     .filter((s) => s.files.length > 0)
   const inSkim = new Set(skim.flatMap((s) => s.files))
   const claimed = new Set<string>()
-  const keep = (groups: ReadonlyArray<TrustedGroup>) =>
+  const keep = (groups: ReadonlyArray<TrustedGroup>, own = false) =>
     groups
-      .map((t) => ({ ...t, files: t.files.filter((p) => known.has(p) && !inDecision.has(p) && !inSkim.has(p) && !neverTrusted(p, never) && !claimed.has(p) && claimed.add(p)) }))
+      .map((t) => ({ ...t, files: (own ? expand(t.files) : t.files).filter((p) => known.has(p) && !inDecision.has(p) && !inSkim.has(p) && !neverTrusted(p, never) && !claimed.has(p) && claimed.add(p)) }))
       .filter((t) => t.files.length > 0)
   // Claude's groups first, so a candidate it placed itself takes its grouping and reason.
-  const byClaude = keep(agent.trusted ?? [])
+  const byClaude = keep(agent.trusted ?? [], true)
   const trustedOut = [...keep(candidates), ...byClaude]
 
   const placed = new Set([...inDecision, ...inSkim, ...claimed])

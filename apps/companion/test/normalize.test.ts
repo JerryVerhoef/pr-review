@@ -54,6 +54,25 @@ test('Claude can send a rule candidate to skim', () => {
   assert.ok(r.skim.flatMap((s) => s.files).includes('x.test.ts'))
 })
 
+test('a directory stands for its changed files no decision, candidate or other entry names', () => {
+  const nested = [f('app/a.ts'), f('app/b.ts'), f('app/c.ts'), f('app/x.test.ts'), f('app/gen/d.ts'), f('lib/e.ts')]
+  const r = normalize(
+    agent({
+      decisions: [decision('d1', ['app/a.ts'])],
+      skim: [
+        { area: 'app', summary: '', files: ['app/'] },
+        { area: 'b', summary: '', files: ['app/b.ts'] },
+      ],
+      trusted: [{ group: 'gen', why: 'generated', files: ['app/gen/'] }],
+    }),
+    nested,
+    [{ group: 'tests', why: 'CI', files: ['app/x.test.ts'] }],
+    'sha',
+  )
+  assert.deepEqual(r.skim.map((s) => [s.area, s.files]), [['app', ['app/c.ts']], ['b', ['app/b.ts']], ['Unsorted', ['lib/e.ts']]])
+  assert.deepEqual(r.trusted.map((t) => [t.group, t.files]), [['tests', ['app/x.test.ts']], ['gen', ['app/gen/d.ts']]])
+})
+
 test('candidates Claude did not place keep their rule group', () => {
   const r = normalize(agent({ skim: [{ area: 's', summary: '', files: ['a.ts', 'b.ts', 'c.ts'] }] }), files, trusted, 'sha')
   assert.deepEqual(r.trusted, trusted)
