@@ -28,9 +28,11 @@ Read how this codebase wants things done, at the default branch (never at the PR
   - works around a framework or library instead of using it as intended (copying values to defeat memoization or the compiler, comments explaining a workaround, casts, manual state syncing)
   - builds a form field, control or other UI piece inline in feature code when the shared UI layer has, or should have, a component for it
 - **skim**: leaf feature code that follows existing patterns. Group it by feature area with a one-sentence summary per area.
-- **trusted**: files nobody needs to read: generated output, lockfiles, translations that only add or reword keys, tests that only exercise the change, fixtures and snapshots. They start out accepted. The "Likely trusted" section lists candidates found by path; confirm them, or move one to a decision or skim when it carries something a reviewer should see (a test that pins surprising behaviour, a hand-edited generated file, a missing locale). Group trusted files with a short name and one sentence on why nobody needs to read them. Never trust migrations, permissions, CI config or review rules.
+- **trusted**: files nobody needs to read: generated output, lockfiles, translations that only add or reword keys, tests that only exercise the change, fixtures and snapshots. They start out accepted. The "Likely trusted" section lists candidates found by path. They stay trusted unless you put them in a decision or skim, so never list them under `trusted`; move one only when it carries something a reviewer should see (a test that pins surprising behaviour, a hand-edited generated file, a missing locale). Use `trusted` only for other changed files nobody needs to read, grouped with a short name and one sentence on why. Never trust migrations, permissions, CI config or review rules.
 
 A file can belong to several decisions. A file that is in a decision should not also be in skim. **When in doubt, make it a decision.**
+
+In skim and trusted `files`, a directory ending in `/` stands for every changed file under it that is not in a decision, a likely-trusted candidate or another entry. Prefer it to listing many files of one directory.
 
 ## How fine to cut
 

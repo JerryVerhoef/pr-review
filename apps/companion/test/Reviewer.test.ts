@@ -279,6 +279,19 @@ describe('Reviewer', () => {
       assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
     }))
 
+  it.effect('sessions on the free slots open once the sort starts writing, before its first decision', () =>
+    Effect.gen(function* () {
+      let sessions = () => 0
+      const opened = Effect.andThen(Effect.yieldNow, Effect.suspend(() => (sessions() >= 2 ? Effect.void : Effect.fail(new AgentError({ message: 'no side session yet' })))))
+      const { agent, layer } = setup({
+        pool: [fakeAccount, fakeAccount2],
+        sort: (call) => Effect.as(Effect.andThen(call.onDelta!('{"summary": "s", "decisions": [{"id": "h'), Effect.retry(opened, { times: 200 })), sortOf(many)),
+      })
+      sessions = agent.sessions
+      const r = yield* review.pipe(Effect.provide(layer))
+      assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
+    }))
+
   it.effect('every free slot gets a session', () =>
     Effect.gen(function* () {
       const fakeAccount3 = { ...fakeAccount, id: 'fake3', name: 'Fake 3' }
@@ -460,6 +473,9 @@ describe('Reviewer', () => {
       assert.deepStrictEqual(idsIn(specTurns[0]!), ['h1', 'l1', 'h2', 'l2', 'l3'])
       // Decision turns are told to leave the Spec axis alone.
       assert.isTrue(turnsOf.filter((c) => !specTurns.includes(c) && !c.prompt.startsWith('Now these decisions')).every((c) => c.prompt.includes('skip the Spec axis')))
+      // "The same way" after a spec-only turn reads as spec-only, and the agent answers with nothing.
+      const afterSpec = turnsOf.find((c) => c.session === specTurns[0]!.session && c.turn === specTurns[0]!.turn! + 1)!
+      assert.notMatch(afterSpec.prompt, /^Now these decisions/)
       assert.deepStrictEqual(
         r.opinion?.decisions.map((d) => [d.decisionId, d.findings.map((f) => f.title)]),
         [['h1', []], ['l1', []], ['h2', ['Missing export']], ['l2', []], ['l3', []]],
@@ -481,6 +497,22 @@ describe('Reviewer', () => {
       assert.strictEqual(counts[0], -1)
       assert.deepStrictEqual(counts.slice(-5), [1, 2, 3, 4, 5])
       assert.deepStrictEqual(seen[0]!.sort.decisions.map((d) => d.id), many.map((d) => d.id))
+    }))
+
+  it.effect('the review shows each decision as the sort writes it, the files it has not placed yet apart', () =>
+    Effect.gen(function* () {
+      const gate = yield* Deferred.make<void>()
+      const { layer } = setup({ sort: (call) => Effect.as(Effect.andThen(call.onDelta!(`{"summary": "s", "decisions": [${JSON.stringify(many[0])}, {"id": "l`), Deferred.await(gate)), sortOf(many)) })
+      const first = yield* Effect.gen(function* () {
+        const reviewer = yield* Reviewer
+        yield* reviewer.prepare(ref, 'HEAD1')
+        const first = yield* reviewer.partial(ref, 'HEAD1').pipe(Stream.runHead)
+        yield* Deferred.succeed(gate, undefined)
+        yield* reviewer.result(ref, 'HEAD1')
+        return Option.getOrThrow(first)
+      }).pipe(Effect.provide(layer))
+      assert.deepStrictEqual(first.sort.decisions.map((d) => d.id), ['h1'])
+      assert.deepStrictEqual(first.sort.skim.map((s) => [s.area, s.files.length]), [['Still sorting', 4]])
     }))
 
   it.effect('the opinion phase shows "Reading the ticket" while the ticket holds it up', () =>
