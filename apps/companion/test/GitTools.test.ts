@@ -1,7 +1,7 @@
 import { NodeServices } from '@effect/platform-node'
 import { assert, describe, it } from '@effect/vitest'
 import { Effect, Layer } from 'effect'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Config } from '../src/Config.ts'
 import { Git } from '../src/Git.ts'
@@ -53,6 +53,15 @@ const client = (url: string, headers: Record<string, string>) => {
   }
 }
 
+/** The default branch checkout at `sha`, once it is there. */
+const treeAt = (cacheRoot: string, sha: string) =>
+  Effect.gen(function* () {
+    const dir = join(cacheRoot, 'trees', key, sha)
+    for (let i = 0; !existsSync(dir) && i < 100; i++) yield* Effect.sleep('50 millis')
+    assert.isTrue(existsSync(dir), `no checkout at ${sha}`)
+    return dir
+  })
+
 describe('GitTools', () => {
   it.live('serves read-only git over MCP to a registered session', () =>
     Effect.gen(function* () {
@@ -71,8 +80,7 @@ describe('GitTools', () => {
         assert.match(yield* c.call('show', { ref: '--output=/tmp/x', path: 'a.txt' }), /Not a ref/)
         // The default branch checkout comes up in the background; until then and after, a grep answers at the ref asked.
         assert.strictEqual(yield* c.call('grep', { pattern: 'two|new', ref: head }), 'a.txt:1:two\nb.txt:1:new')
-        yield* Effect.sleep('1500 millis')
-        assert.strictEqual(readFileSync(join(cacheRoot, 'trees', key, 'a.txt'), 'utf8'), 'one\n')
+        yield* treeAt(cacheRoot, git(remote, 'rev-parse', 'master'))
         assert.strictEqual(yield* c.call('grep', { pattern: 'two|new', ref: head }), 'a.txt:1:two\nb.txt:1:new')
         assert.strictEqual(yield* c.call('grep', { pattern: 'one', ref: 'origin/master' }), 'a.txt:1:one')
         assert.strictEqual(yield* c.call('grep', { pattern: 'n', ref: head, glob: 'b.*' }), 'b.txt:1:new')
@@ -93,10 +101,41 @@ describe('GitTools', () => {
         const { url, headers } = (yield* (yield* GitTools).register(key)) as { url: string; headers: Array<{ name: string; value: string }> }
         const c = client(url, Object.fromEntries(headers.map((h) => [h.name, h.value])))
         yield* c.init
-        yield* Effect.sleep('1500 millis')
         // The default branch checkout still has a.txt.
-        assert.strictEqual(readFileSync(join(cacheRoot, 'trees', key, 'a.txt'), 'utf8'), 'one\n')
+        assert.strictEqual(readFileSync(join(yield* treeAt(cacheRoot, git(remote, 'rev-parse', 'master')), 'a.txt'), 'utf8'), 'one\n')
         assert.strictEqual(yield* c.call('grep', { pattern: 'one', ref: head }), 'c.txt:1:one')
+      }).pipe(Effect.scoped, Effect.provide(layer))
+    }), 30_000)
+
+  it.live('both halves of a grep read Perl regex and tracked files .gitignore names; a new default branch commit gets its own checkout', () =>
+    Effect.gen(function* () {
+      const { remote, layer, cacheRoot } = setup()
+      writeFileSync(join(remote, '.gitignore'), 'gen.txt\n')
+      writeFileSync(join(remote, 'gen.txt'), 'some one\n')
+      git(remote, 'add', '-f', '.gitignore', 'gen.txt')
+      git(remote, 'commit', '-qm', 'gen')
+      const head = git(remote, 'rev-parse', 'feat')
+      yield* Effect.gen(function* () {
+        yield* (yield* Git).fetchPr(key, 7, 'master', head)
+        const register = Effect.map(Effect.flatMap(GitTools, (t) => t.register(key)), (s) => s as { url: string; headers: Array<{ name: string; value: string }> })
+        const { url, headers } = yield* register
+        const c = client(url, Object.fromEntries(headers.map((h) => [h.name, h.value])))
+        yield* c.init
+        const first = yield* treeAt(cacheRoot, git(remote, 'rev-parse', 'master'))
+        // From the checkout (rg) and from the ref (git grep): \b and \d mean the same in both.
+        assert.strictEqual(yield* c.call('grep', { pattern: '\\bone\\b', ref: 'origin/master' }), 'a.txt:1:one\ngen.txt:1:some one')
+        assert.strictEqual(yield* c.call('grep', { pattern: '\\bnew\\b|\\d', ref: head }), 'b.txt:1:new')
+
+        writeFileSync(join(remote, 'a.txt'), 'three\n')
+        git(remote, 'commit', '-qam', 'three')
+        git(remote, 'update-ref', 'refs/pull/9/head', 'feat')
+        yield* (yield* Git).fetchPr(key, 9, 'master', head)
+        yield* register
+        const second = yield* treeAt(cacheRoot, git(remote, 'rev-parse', 'master'))
+        assert.notStrictEqual(second, first)
+        // A grep that started on the earlier checkout can still read it.
+        assert.isTrue(existsSync(join(first, 'a.txt')))
+        assert.strictEqual(yield* c.call('grep', { pattern: 'three', ref: 'origin/master' }), 'a.txt:1:three')
       }).pipe(Effect.scoped, Effect.provide(layer))
     }), 30_000)
 

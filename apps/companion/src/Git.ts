@@ -49,8 +49,16 @@ export class Git extends Context.Service<
     /** Every file at `ref`, with its blob id. */
     blobs(key: string, ref: string): Effect.Effect<ReadonlyArray<{ path: string; id: string }>, GitError>
     revParse(key: string, ref: string): Effect.Effect<string, GitError>
-    /** Merges a clone's packs once fetches have left more than `MAX_PACKS`, and writes a commit-graph. Never fails. */
-    maintain(key: string): Effect.Effect<void>
+    /** Paths that differ between two commits, a rename counted at both its paths. */
+    changedPaths(key: string, from: string, to: string): Effect.Effect<ReadonlyArray<string>, GitError>
+    /** `path:line:text` for each line matching a Perl-compatible `pattern` in `files` at `sha` (every file when none). */
+    grep(key: string, sha: string, o: { pattern: string; files: ReadonlyArray<string>; fixed?: boolean | undefined; ignoreCase?: boolean | undefined }): Effect.Effect<ReadonlyArray<string>, GitError>
+    /** `hash date author subject`, newest first. */
+    log(key: string, ref: string, path: string | undefined, max: number): Effect.Effect<string, GitError>
+    /** Checks `sha` out into `dir`, a new directory, as a detached worktree of the clone; `dir` appears only once it is complete. */
+    addTree(key: string, dir: string, sha: string): Effect.Effect<void, GitError>
+    /** Forgets worktrees whose directory is gone. */
+    pruneTrees(key: string): Effect.Effect<void, GitError>
   }
 >()('pr-review/Git') {
   static readonly layer = Layer.effect(
@@ -63,12 +71,13 @@ export class Git extends Context.Service<
       const remoteUrl = (key: string) => config.repo(key).pipe(Effect.map((r) => r.remoteUrl))
 
       const text = (s: Stream.Stream<Uint8Array, unknown>) => Stream.mkString(Stream.decodeText(s))
-      const exec = (args: ReadonlyArray<string>, cwd?: string) =>
+      /** stdout; `ok` lists exit codes besides 0 that are an answer (grep's 1: no matches). */
+      const exec = (args: ReadonlyArray<string>, cwd?: string, ok: ReadonlyArray<number> = []) =>
         Effect.gen(function* () {
           // No tty here: a missing credential must fail, not wait for a password prompt.
           const handle = yield* spawner.spawn(ChildProcess.make('git', args, { ...(cwd ? { cwd } : {}), env: { GIT_TERMINAL_PROMPT: '0' }, extendEnv: true }))
           const [stdout, stderr, code] = yield* Effect.all([text(handle.stdout), text(handle.stderr), handle.exitCode], { concurrency: 'unbounded' })
-          if (code !== 0) return yield* new GitError({ message: `git ${args[0]}: ${stderr.trim() || `exit ${code}`}` })
+          if (code !== 0 && !ok.includes(code)) return yield* new GitError({ message: `git ${args[0]}: ${stderr.trim() || `exit ${code}`}` })
           return stdout
         }).pipe(
           Effect.scoped,
@@ -77,20 +86,6 @@ export class Git extends Context.Service<
       const inRepo = (key: string, ...args: string[]) => exec(args, dir(key))
       const failuresExpire = (exit: Exit.Exit<unknown, unknown>) => (Exit.isSuccess(exit) ? Infinity : 0)
       const scope = yield* Effect.scope
-
-      const maintaining = new Set<string>()
-      // Geometric: only small packs are merged, so after the first run this is quick. Readers and fetches keep going meanwhile.
-      const maintain = (key: string) =>
-        Effect.gen(function* () {
-          if (maintaining.has(key)) return
-          const packs = (yield* fs.readDirectory(join(dir(key), 'objects', 'pack'))).filter((f) => f.endsWith('.pack')).length
-          if (packs <= MAX_PACKS) return
-          maintaining.add(key)
-          yield* annotate({ packs })
-          yield* Effect.andThen(inRepo(key, 'repack', '-d', '-q', '--geometric=2', '--write-midx'), inRepo(key, 'commit-graph', 'write', '--reachable')).pipe(
-            Effect.ensuring(Effect.sync(() => void maintaining.delete(key))),
-          )
-        }).pipe(measure('git.maintain'), Effect.ignore)
 
       const clones = yield* Cache.makeWith(
         (key: string) =>
@@ -105,6 +100,7 @@ export class Git extends Context.Service<
               yield* exec(['clone', '--bare', '--quiet', url, partial])
               yield* exec(['config', 'gc.auto', '0'], partial)
               yield* exec(['config', 'maintenance.auto', 'false'], partial)
+              yield* exec(['config', 'fetch.writeCommitGraph', 'true'], partial)
               yield* Effect.orDie(fs.rename(partial, target))
             }).pipe(measure('git.clone'))
           }),
@@ -117,6 +113,21 @@ export class Git extends Context.Service<
       // Fetches into one clone write the same base refs; two at once fail each other's ref updates.
       const fetching = new Map<string, Semaphore.Semaphore>()
       const oneFetch = (key: string) => fetching.get(key) ?? fetching.set(key, Semaphore.makeUnsafe(1)).get(key)!
+
+      /**
+       * Merges a clone's packs once fetches have left more than `MAX_PACKS`. Geometric: only small packs are merged, so after
+       * the first run this is quick. `git maintenance`'s incremental-repack merges two of many equal packs per run, so not that.
+       * Holds the fetch permit: no fetch writes a pack while `-d` deletes the merged ones, and a second run finds few left.
+       */
+      const maintain = (key: string) =>
+        Semaphore.withPermit(oneFetch(key))(
+          Effect.gen(function* () {
+            const packs = (yield* fs.readDirectory(join(dir(key), 'objects', 'pack'))).filter((f) => f.endsWith('.pack')).length
+            if (packs <= MAX_PACKS) return
+            yield* annotate({ packs })
+            yield* inRepo(key, 'repack', '-d', '-q', '--geometric=2', '--write-midx')
+          }),
+        ).pipe(measure('git.maintain'), Effect.ignore)
 
       const fetches = yield* Cache.makeWith(
         (spec: string) =>
@@ -149,7 +160,6 @@ export class Git extends Context.Service<
       return Git.of({
         dir,
         ensureClone,
-        maintain,
         fetchPr: (key, n, baseRef, headSha) => Cache.get(fetches, JSON.stringify([key, n, baseRef, headSha])),
         defaultBranch: branchOf,
         numstat: (key, from, to) =>
@@ -164,7 +174,26 @@ export class Git extends Context.Service<
         // -M: a moved file diffs as a rename when both its paths are asked for.
         diff: (key, from, to, paths = []) =>
           inRepo(key, 'diff', '--no-color', '--no-ext-diff', '--src-prefix=a/', '--dst-prefix=b/', '-M', from, to, '--', ...paths).pipe(measure('git.diff', { paths: paths.length }, (d: string) => ({ bytes: Buffer.byteLength(d) }))),
-        revParse: (key, ref) => Effect.map(inRepo(key, 'rev-parse', '--verify', `${ref}^{commit}`), (s) => s.trim()),
+        revParse: (key, ref) => Effect.map(inRepo(key, 'rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`), (s) => s.trim()),
+        changedPaths: (key, from, to) => Effect.map(inRepo(key, 'diff', '--name-only', '--no-renames', '-z', from, to), (out) => out.split('\0').filter(Boolean)),
+        grep: (key, sha, o) =>
+          exec(['grep', '-n', '-I', '--no-color', o.fixed ? '-F' : '-P', ...(o.ignoreCase ? ['-i'] : []), '-e', o.pattern, sha, '--', ...o.files], dir(key), [1]).pipe(
+            Effect.map((out) =>
+              out
+                .split('\n')
+                .filter(Boolean)
+                .map((l) => l.slice(sha.length + 1)),
+            ),
+            measure('git.grep', { files: o.files.length }),
+          ),
+        log: (key, ref, path, max) => inRepo(key, 'log', '--no-color', '--date=short', '--format=%h %ad %an %s', `-n${max}`, ref, '--', ...(path ? [path] : [])),
+        // Checked out beside it and moved in, so `target` existing means the checkout finished.
+        addTree: (key, target, sha) =>
+          Effect.andThen(inRepo(key, 'worktree', 'add', '--quiet', '--detach', '--force', `${target}.partial`, sha), inRepo(key, 'worktree', 'move', `${target}.partial`, target)).pipe(
+            Effect.asVoid,
+            measure('git.tree'),
+          ),
+        pruneTrees: (key) => Effect.asVoid(inRepo(key, 'worktree', 'prune')),
         show: (key, sha, path) => inRepo(key, 'show', `${sha}:${path}`).pipe(measure('git.show', {}, (t: string) => ({ bytes: Buffer.byteLength(t) }))),
         blobs: (key, ref) =>
           inRepo(key, 'ls-tree', '-r', '-z', ref).pipe(

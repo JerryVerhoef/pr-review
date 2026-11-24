@@ -112,7 +112,11 @@ export const fakeGit = (o: { files?: FileStat[]; /** A `GitError` from the funct
     Git.of({
       dir: () => '/cache/repo.git',
       ensureClone: () => Effect.void,
-      maintain: () => Effect.void,
+      changedPaths: () => Effect.succeed([]),
+      grep: () => Effect.succeed([]),
+      log: () => Effect.succeed(''),
+      addTree: () => Effect.void,
+      pruneTrees: () => Effect.void,
       fetchPr: (_k, _n, _b, headSha) => Effect.succeed({ headSha: headSha || 'HEAD1', baseSha: 'BASE1', mergeBase: 'MB1' }),
       numstat: () => Effect.succeed(o.files ?? []),
       diff: (_k, from, to, paths = []) =>

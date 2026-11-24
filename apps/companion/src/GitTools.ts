@@ -1,7 +1,7 @@
 import type * as acp from '@agentclientprotocol/sdk'
 import { NodeHttpServer } from '@effect/platform-node'
 import { GitError } from '@pr-review/domain'
-import { Context, Effect, Layer, Schema, type Scope, Stream } from 'effect'
+import { Context, Effect, FileSystem, Layer, Schema, type Scope, Stream } from 'effect'
 import { McpProtocol, McpServer, Tool, Toolkit } from 'effect/ai'
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from 'effect/http'
 import { ChildProcess, ChildProcessSpawner } from 'effect/process'
@@ -34,7 +34,7 @@ export const GitToolkit = Toolkit.make(
   }),
   tool(
     'grep',
-    'Lines matching a regular expression (Rust regex syntax: | for alternation, no backslash before it) in the files at a ref, as path:line:text. Much faster than git grep.',
+    'Lines matching a Perl-compatible regular expression (| for alternation, no backslash before it; \\b, \\d, \\s work) in the files at a ref, as path:line:text. Much faster than git grep.',
     {
       pattern: Schema.String,
       ref: Ref,
@@ -75,6 +75,12 @@ const numbered = (text: string, from = 1, to?: number) => {
   const body = lines.slice(from - 1, last).map((l, i) => `${from + i}\t${l}`).join('\n')
   return last < lines.length ? `${body}\n(lines ${from}-${last} of ${lines.length}; pass from and to for more)` : body
 }
+interface GrepOptions {
+  readonly pattern: string
+  readonly glob?: string | undefined
+  readonly fixed?: boolean | undefined
+  readonly ignoreCase?: boolean | undefined
+}
 const capped = (matches: ReadonlyArray<string>) =>
   matches.length > MAX_MATCHES
     ? `${matches.slice(0, MAX_MATCHES).join('\n')}\n(${matches.length - MAX_MATCHES} more matches; narrow the pattern or paths)`
@@ -100,103 +106,93 @@ export class GitTools extends Context.Service<
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
       const scope = yield* Effect.scope
 
-      const text = (s: Stream.Stream<Uint8Array, unknown>) => Stream.mkString(Stream.decodeText(s))
-      /** stdout, or a GitError; `ok` lists exit codes besides 0 that are an answer (1: no matches). */
-      const run = (cmd: string, args: ReadonlyArray<string>, cwd: string, ok: ReadonlyArray<number> = [], PATH?: string) =>
-        Effect.gen(function* () {
-          const handle = yield* spawner.spawn(ChildProcess.make(cmd, args, { cwd, env: { GIT_TERMINAL_PROMPT: '0', ...(PATH ? { PATH } : {}) }, extendEnv: true }))
-          const [stdout, stderr, code] = yield* Effect.all([text(handle.stdout), text(handle.stderr), handle.exitCode], { concurrency: 'unbounded' })
-          if (code !== 0 && !ok.includes(code)) return yield* fail(`${cmd} ${args[0]}: ${stderr.trim().split('\n')[0] || `exit ${code}`}`)
-          return stdout
-        }).pipe(
-          Effect.scoped,
-          Effect.mapError((e) => (e instanceof GitError ? e : fail(String(e)))),
-        )
-      const inClone = (repo: string, args: ReadonlyArray<string>, ok?: ReadonlyArray<number>) => run('git', args, git.dir(repo), ok)
-      const commit = (repo: string, ref: string) => Effect.flatMap(safeRef(ref), (r) => Effect.map(inClone(repo, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${r}^{commit}`]), (s) => s.trim()))
+      const fs = yield* FileSystem.FileSystem
+      const commit = (repo: string, ref: string) => Effect.flatMap(safeRef(ref), (r) => git.revParse(repo, r))
 
-      // A checkout of each repo's default branch for ripgrep, moved along in the background; a grep never waits for it.
+      // A checkout of each repo's default branch for ripgrep, one directory per commit. A grep never waits for a new one;
+      // one already reading the tree before it keeps it until the next.
       const trees = new Map<string, { dir: string; sha: string }>()
       const moving = new Set<string>()
       const refreshTree = (repo: string) =>
         Effect.gen(function* () {
           if (moving.has(repo)) return
           const sha = yield* commit(repo, `origin/${yield* git.defaultBranch(repo)}`)
-          if (trees.get(repo)?.sha === sha) return
+          const previous = trees.get(repo)?.sha
+          if (previous === sha) return
           moving.add(repo)
-          trees.delete(repo)
-          const dir = join(config.cacheRoot, 'trees', repo)
-          const at = yield* run('git', ['rev-parse', 'HEAD'], dir).pipe(Effect.orElseSucceed(() => undefined))
-          if (at === undefined) {
-            yield* inClone(repo, ['worktree', 'prune'])
-            yield* inClone(repo, ['worktree', 'add', '--quiet', '--detach', '--force', dir, sha])
-          } else if (at.trim() !== sha) yield* run('git', ['checkout', '--quiet', '--detach', '--force', sha], dir)
+          const root = join(config.cacheRoot, 'trees', repo)
+          const dir = join(root, sha)
+          if (!(yield* fs.exists(dir))) {
+            yield* fs.remove(`${dir}.partial`, { recursive: true, force: true })
+            yield* git.pruneTrees(repo)
+            yield* git.addTree(repo, dir, sha)
+          }
           trees.set(repo, { dir, sha })
+          const stale = (yield* fs.readDirectory(root)).filter((d) => d !== sha && d !== previous)
+          yield* Effect.forEach(stale, (d) => fs.remove(join(root, d), { recursive: true, force: true }))
+          if (stale.length) yield* git.pruneTrees(repo)
         }).pipe(
           Effect.ensuring(Effect.sync(() => void moving.delete(repo))),
-          measure('git.tree'),
           Effect.ignore,
         )
 
-      // ripgrep on the host's PATH, else on the login shell's (a browser starts the host with a bare one), else none.
+      const text = (s: Stream.Stream<Uint8Array, unknown>) => Stream.mkString(Stream.decodeText(s))
+      // ripgrep on the host's PATH, else on the login shell's (a browser starts the host with a bare one).
       let rgPath: string | undefined
-      let rgMissing = false
-      /** `path:line:text` lines in the checkout, by ripgrep, or git grep on its files when there is no rg. */
-      const grepTree = (dir: string, o: { pattern: string; paths: ReadonlyArray<string>; glob?: string | undefined; fixed?: boolean | undefined; ignoreCase?: boolean | undefined }) => {
-        const flags = [...(o.fixed ? ['-F'] : []), ...(o.ignoreCase ? ['-i'] : [])]
-        const where = o.paths.length ? o.paths : ['.']
-        const viaGit = Effect.map(
-          run('git', ['grep', '-n', '-I', '--no-color', ...(o.fixed ? [] : ['-E']), ...flags, '-e', o.pattern, '--', ...where], dir, [1]),
-          (out) => out.split('\n').filter(Boolean),
+      let noRg = false
+      const rgRun = (args: ReadonlyArray<string>, cwd: string, PATH?: string) =>
+        Effect.gen(function* () {
+          const handle = yield* spawner.spawn(ChildProcess.make('rg', args, { cwd, ...(PATH ? { env: { PATH }, extendEnv: true } : {}) }))
+          const [stdout, stderr, code] = yield* Effect.all([text(handle.stdout), text(handle.stderr), handle.exitCode], { concurrency: 'unbounded' })
+          if (code !== 0 && code !== 1) return yield* fail(`rg: ${stderr.trim().split('\n')[0] || `exit ${code}`}`)
+          return stdout
+        }).pipe(
+          Effect.scoped,
+          Effect.mapError((e) => (e instanceof GitError ? e : fail(String(e)))),
         )
-        if (rgMissing) return viaGit
-        const viaRg = (PATH?: string) =>
-          run('rg', ['-n', '--no-heading', '--color', 'never', '--hidden', '-g', '!.git', ...(o.glob ? ['-g', o.glob] : []), ...flags, '-e', o.pattern, '--', ...where], dir, [1], PATH).pipe(
-            Effect.map((out) => out.split('\n').filter(Boolean).map((l) => l.replace(/^\.\//, ''))),
-          )
+      /** `path:line:text` lines in a checkout, or undefined when there is no ripgrep with PCRE2 to run. */
+      const rg = (dir: string, o: GrepOptions & { paths: ReadonlyArray<string> }): Effect.Effect<ReadonlyArray<string> | undefined, GitError> => {
+        if (noRg) return Effect.succeed(undefined)
+        // --no-ignore: a tracked file that .gitignore names is still in the tree, and git grep reads it.
+        const args = ['-n', '--no-heading', '--color', 'never', '--hidden', '--no-ignore', '-g', '!.git', ...(o.glob ? ['-g', o.glob] : []), o.fixed ? '-F' : '-P', ...(o.ignoreCase ? ['-i'] : []), '-e', o.pattern, '--', ...(o.paths.length ? o.paths : ['.'])]
+        const once = (PATH?: string) => Effect.map(rgRun(args, dir, PATH), (out) => out.split('\n').filter(Boolean).map((l) => l.replace(/^\.\//, '')))
         const missing = (e: GitError) => /ENOENT|not found/i.test(e.message)
-        return viaRg(rgPath).pipe(
-          Effect.catchIf(missing, () =>
-            rgPath !== undefined
-              ? Effect.fail(fail('rg: not found'))
-              : Effect.flatMap(Effect.promise(loginPath), (PATH) => (PATH ? Effect.tap(viaRg(PATH), () => Effect.sync(() => void (rgPath = PATH))) : Effect.fail(fail('rg: not found')))),
+        return once(rgPath).pipe(
+          Effect.catchIf(
+            (e) => missing(e) && rgPath === undefined,
+            (e) => Effect.flatMap(Effect.promise(loginPath), (PATH) => (PATH ? Effect.tap(once(PATH), () => Effect.sync(() => void (rgPath = PATH))) : Effect.fail(e))),
           ),
-          Effect.catchIf(missing, () => Effect.andThen(Effect.sync(() => void (rgMissing = true)), viaGit)),
+          Effect.catchIf(
+            (e) => missing(e) || /PCRE2 is not available/i.test(e.message),
+            () => Effect.sync(() => void (noRg = true)),
+          ),
         )
       }
 
-      const grep = (repo: string, o: { pattern: string; ref: string; paths?: ReadonlyArray<string> | undefined; glob?: string | undefined; fixed?: boolean | undefined; ignoreCase?: boolean | undefined }) =>
+      const fileOf = (line: string) => line.slice(0, line.indexOf(':'))
+      const grep = (repo: string, o: GrepOptions & { ref: string; paths?: ReadonlyArray<string> | undefined }) =>
         Effect.gen(function* () {
           const sha = yield* commit(repo, o.ref)
           const paths = yield* Effect.forEach(o.paths ?? [], safePath)
           const wanted = (file: string) => underAny(paths)(file) && globMatch(o.glob)(file)
-          const flags = [...(o.fixed ? ['-F'] : ['-E']), ...(o.ignoreCase ? ['-i'] : [])]
-          const atRef = (files: ReadonlyArray<string>) =>
-            Effect.map(inClone(repo, ['grep', '-n', '-I', '--no-color', ...flags, '-e', o.pattern, sha, '--', ...files], [1]), (out) =>
-              out
-                .split('\n')
-                .filter(Boolean)
-                .map((l) => l.slice(sha.length + 1)),
-            )
+          const atRef = (files: ReadonlyArray<string>) => git.grep(repo, sha, { ...o, files })
+          const whole = Effect.map(atRef(paths), (ls) => ls.filter((l) => wanted(fileOf(l))))
           const tree = trees.get(repo)
-          // Without renames, a moved file counts at both paths, so the old one's lines in the checkout are dropped.
-          const differing = tree ? (yield* inClone(repo, ['diff', '--name-only', '--no-renames', '-z', tree.sha, sha])).split('\0').filter(Boolean) : []
+          // A moved file counts at both paths, so the old one's lines in the checkout are dropped.
+          const differing = tree ? yield* git.changedPaths(repo, tree.sha, sha) : []
           yield* annotate({ tree: tree !== undefined, differing: differing.length })
+          const fromTree = tree && differing.length <= MAX_DIFFERING ? yield* rg(tree.dir, { ...o, paths }) : undefined
           let lines: ReadonlyArray<string>
-          if (!tree || differing.length > MAX_DIFFERING) lines = (yield* atRef(paths)).filter((l) => wanted(l.slice(0, l.indexOf(':'))))
+          if (fromTree === undefined) lines = yield* whole
           else {
             const differs = new Set(differing)
-            const fromTree = (yield* grepTree(tree.dir, { ...o, paths })).filter((l) => {
-              const file = l.slice(0, l.indexOf(':'))
-              return !differs.has(file) && wanted(file)
-            })
             const changed = differing.filter(wanted)
             // A file the ref deletes is absent there; git grep skips it.
-            lines = [...fromTree, ...(changed.length ? yield* atRef(changed) : [])]
+            lines = [...fromTree.filter((l) => !differs.has(fileOf(l)) && wanted(fileOf(l))), ...(changed.length ? yield* atRef(changed) : [])]
           }
           const sorted = [...lines].sort((a, b) => {
-            const [pa, la] = [a.slice(0, a.indexOf(':')), Number(a.split(':')[1])]
-            const [pb, lb] = [b.slice(0, b.indexOf(':')), Number(b.split(':')[1])]
+            const [pa, la] = [fileOf(a), Number(a.split(':')[1])]
+            const [pb, lb] = [fileOf(b), Number(b.split(':')[1])]
             return pa === pb ? la - lb : pa < pb ? -1 : 1
           })
           return capped(sorted.map((l) => (l.length > 300 ? `${l.slice(0, 300)}…` : l)))
@@ -206,31 +202,27 @@ export class GitTools extends Context.Service<
         show: ({ ref, path, from, to }) =>
           Effect.gen(function* () {
             const { repo } = yield* Caller
-            const sha = yield* commit(repo, ref)
-            const p = yield* safePath(path)
-            return numbered(yield* inClone(repo, ['cat-file', '-p', `${sha}:${p}`]), Math.max(1, from ?? 1), to)
+            return numbered(yield* git.show(repo, yield* commit(repo, ref), yield* safePath(path)), Math.max(1, from ?? 1), to)
           }).pipe(measure('mcp.tool', { tool: 'show' })),
         grep: (o) => Effect.flatMap(Caller, ({ repo }) => grep(repo, o)).pipe(measure('mcp.tool', { tool: 'grep' })),
         diff: ({ from, to, paths }) =>
           Effect.gen(function* () {
             const { repo } = yield* Caller
             const [a, b] = yield* Effect.all([commit(repo, from), commit(repo, to)])
-            const out = yield* inClone(repo, ['diff', '--no-color', '--no-ext-diff', '-M', a, b, '--', ...(yield* Effect.forEach(paths ?? [], safePath))])
+            const out = yield* git.diff(repo, a, b, yield* Effect.forEach(paths ?? [], safePath))
             return out.length > MAX_DIFF ? `${out.slice(0, MAX_DIFF)}\n(diff cut at ${MAX_DIFF} characters; pass paths for the rest)` : out || '(no changes)'
           }).pipe(measure('mcp.tool', { tool: 'diff' })),
         list_files: ({ ref, path }) =>
           Effect.gen(function* () {
             const { repo } = yield* Caller
-            const sha = yield* commit(repo, ref)
-            const files = (yield* inClone(repo, ['ls-tree', '-r', '--name-only', sha, '--', ...(path ? [yield* safePath(path)] : [])])).split('\n').filter(Boolean)
+            const files = yield* git.lsTree(repo, yield* commit(repo, ref), path ? [yield* safePath(path)] : [])
             return files.length > MAX_LINES ? `${files.slice(0, MAX_LINES).join('\n')}\n(${files.length - MAX_LINES} more; pass a path)` : files.join('\n') || '(no files)'
           }).pipe(measure('mcp.tool', { tool: 'list_files' })),
         log: ({ ref, path, max }) =>
           Effect.gen(function* () {
             const { repo } = yield* Caller
-            const sha = yield* commit(repo, ref)
-            const n = Math.min(100, Math.max(1, max ?? 20))
-            return (yield* inClone(repo, ['log', '--no-color', '--date=short', '--format=%h %ad %an %s', `-n${n}`, sha, '--', ...(path ? [yield* safePath(path)] : [])])) || '(no commits)'
+            const out = yield* git.log(repo, yield* commit(repo, ref), path ? yield* safePath(path) : undefined, Math.min(100, Math.max(1, max ?? 20)))
+            return out || '(no commits)'
           }).pipe(measure('mcp.tool', { tool: 'log' })),
       })
 

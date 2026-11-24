@@ -42,23 +42,21 @@ describe('Git', () => {
       }),
     ))
 
-  it.live('maintain merges a clone of many packs into a few, and leaves one of few alone', () =>
-    run((g) =>
+  it.live('a fetch merges a clone of many packs into a few in the background', () =>
+    run((g, remote) =>
       Effect.gen(function* () {
-        yield* g.ensureClone(key)
+        yield* g.fetchPr(key, 7, 'master', git(remote, 'rev-parse', 'feat'))
         const dir = g.dir(key)
+        assert.strictEqual(git(dir, 'config', 'fetch.writeCommitGraph'), 'true')
         const packs = () => readdirSync(join(dir, 'objects', 'pack')).filter((f) => f.endsWith('.pack')).length
-        const addPack = (i: number) => {
+        for (let i = 1; packs() <= MAX_PACKS; i++) {
           const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, input: `blob ${i}` }).toString().trim()
           git(dir, 'update-ref', `refs/test/${i}`, blob)
           git(dir, 'repack', '-d', '-q')
         }
-        addPack(0)
-        const few = packs()
-        yield* g.maintain(key)
-        assert.strictEqual(packs(), few)
-        for (let i = 1; packs() <= MAX_PACKS; i++) addPack(i)
-        yield* g.maintain(key)
+        git(remote, 'update-ref', 'refs/pull/8/head', 'feat')
+        yield* g.fetchPr(key, 8, 'master', git(remote, 'rev-parse', 'feat'))
+        for (let i = 0; packs() >= 5 && i < 200; i++) yield* Effect.sleep('50 millis')
         assert.isBelow(packs(), 5)
         assert.strictEqual(git(dir, 'cat-file', '-t', 'refs/test/1'), 'blob')
       }),
