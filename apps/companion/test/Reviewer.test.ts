@@ -279,6 +279,19 @@ describe('Reviewer', () => {
       assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
     }))
 
+  it.effect('sessions on the free slots open once the sort starts writing, before its first decision', () =>
+    Effect.gen(function* () {
+      let sessions = () => 0
+      const opened = Effect.andThen(Effect.yieldNow, Effect.suspend(() => (sessions() >= 2 ? Effect.void : Effect.fail(new AgentError({ message: 'no side session yet' })))))
+      const { agent, layer } = setup({
+        pool: [fakeAccount, fakeAccount2],
+        sort: (call) => Effect.as(Effect.andThen(call.onDelta!('{"summary": "s", "decisions": [{"id": "h'), Effect.retry(opened, { times: 200 })), sortOf(many)),
+      })
+      sessions = agent.sessions
+      const r = yield* review.pipe(Effect.provide(layer))
+      assert.deepStrictEqual(r.opinion?.decisions.map((d) => d.decisionId), ['h1', 'l1', 'h2', 'l2', 'l3'])
+    }))
+
   it.effect('every free slot gets a session', () =>
     Effect.gen(function* () {
       const fakeAccount3 = { ...fakeAccount, id: 'fake3', name: 'Fake 3' }

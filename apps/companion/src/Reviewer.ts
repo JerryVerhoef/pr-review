@@ -239,6 +239,8 @@ export class Reviewer extends Context.Service<
         const taken = new Set<string>()
         const found = yield* Deferred.make<void>()
         const sorted = yield* Deferred.make<void>()
+        /** The sort has begun its JSON answer: its account is working, not at a usage limit. */
+        const writing = yield* Deferred.make<void>()
         let streamed = 0
         // Opinion workers are numbered as they join, so sessions that start during the sort come first.
         let workers = 0
@@ -258,6 +260,7 @@ export class Reviewer extends Context.Service<
         const fromSort = (delta: string) =>
           Effect.suspend(() => {
             sortText += delta
+            if (sortText.includes('"decisions"')) Deferred.doneUnsafe(writing, Exit.void)
             const ds = writtenDecisions(sortText).flatMap((d) => {
               const files = d.files.filter((f) => known.has(f.path))
               return files.length ? [{ ...d, files }] : []
@@ -330,7 +333,7 @@ export class Reviewer extends Context.Service<
          * Takes from the queue one turn at a time until it is drained. The first turn in a session gets the whole
          * context, later ones only their decision and diff; `continued` means the sort ran in this session.
          */
-        const judge = (turns: AgentTurns, slot: Slot, continued: boolean) =>
+        const judge = (turns: AgentTurns, slot: Slot, continued: boolean, account: string) =>
           Effect.gen(function* () {
             yield* turns.ready
             if (!contextFiber!.pollUnsafe())
@@ -347,13 +350,13 @@ export class Reviewer extends Context.Service<
               if (item === 'spec') {
                 if (specTaken) continue
                 specTaken = true
-                yield* t.worker('opinion', slot.worker, (w) => ({ ...w, current: 'Checking the ticket' }))
+                yield* t.worker('opinion', slot.worker, (w) => ({ ...w, account, current: 'Checking the ticket' }))
                 yield* specTurn(turns, c, continued)
               } else {
                 taken.add(item.id)
                 // The finished sort may have dropped a decision it was writing.
                 if (sort && !judged(sort).some((x) => x.id === item.id)) continue
-                yield* t.worker('opinion', slot.worker, (w) => ({ ...w, current: `Judging ${queued.indexOf(item) + 1} of ${queued.length}: ${item.title}` }))
+                yield* t.worker('opinion', slot.worker, (w) => ({ ...w, account, current: `Judging ${queued.indexOf(item) + 1} of ${queued.length}: ${item.title}` }))
                 yield* judgeTurn(turns, c, [item], { continued, brief: !first })
               }
               // A brief turn says "the same way"; after a spec-only turn that reads as spec-only, and the agent answers with nothing.
@@ -367,7 +370,7 @@ export class Reviewer extends Context.Service<
           return agent.session({ ...options(slot), noWait: true }, (turns, account) =>
             Effect.andThen(
               Effect.suspend(() => ((slot.worker = workers++), named(slot, account))),
-              judge(turns, slot, false),
+              judge(turns, slot, false, account.name),
             ),
           )
         })
@@ -386,18 +389,21 @@ export class Reviewer extends Context.Service<
         /** A session on every free slot, while there is still something to take. */
         const launch = Effect.gen(function* () {
           if (sort && queued.every((d) => answers.has(d.id) || taken.has(d.id)) && (specDone || specTaken)) return
+          // The session ended without a sort: nothing will be queued.
+          if (!sort && (yield* Deferred.isDone(sorted))) return
           const free = yield* agent.freeSlots()
           started += free
           return Array.from({ length: free }, () => Effect.ignore(side))
         })
-        /** Sessions once there is something to judge and the context is ready, and more when the ticket read gives its slot back. */
+        const launchAfter = (event: Effect.Effect<unknown>) => Effect.andThen(event, Effect.flatMap(launch, (more) => Effect.all(more ?? [], { concurrency: 'unbounded', discard: true })))
+        /**
+         * Sessions on the free slots once the sort is writing, so their agents are up when it finishes its first decision;
+         * more as slots free up. Not sooner: a sort benched at its first prompt reruns on another account, and idle sessions
+         * holding every slot there would leave it waiting for good.
+         */
         const sides = Effect.gen(function* () {
-          yield* Deferred.await(found)
-          if (!contextFiber || !queued.length) return
-          yield* Fiber.await(contextFiber)
-          const first = yield* launch
-          const later = Effect.andThen(Fiber.await(ticket), Effect.flatMap(launch, (more) => Effect.all(more ?? [], { concurrency: 'unbounded', discard: true })))
-          yield* Effect.all([...(first ?? []), later], { concurrency: 'unbounded', discard: true })
+          if (!contextFiber) return
+          yield* Effect.all([launchAfter(Deferred.await(writing)), launchAfter(Deferred.await(found)), launchAfter(Fiber.await(ticket))], { concurrency: 'unbounded', discard: true })
           yield* annotate({ sideSessions: started })
         })
 
@@ -429,7 +435,7 @@ export class Reviewer extends Context.Service<
             if (main.phase === 'sort') main.worker = workers++
             main.phase = 'opinion'
             yield* named(main, account)
-            yield* judge(turns, main, continued)
+            yield* judge(turns, main, continued, account.name)
           }),
         )
         // Nothing for a session to do: the sort is known and there is no opinion to make.
@@ -439,7 +445,7 @@ export class Reviewer extends Context.Service<
             : (yield* Effect.all(
                 [
                   // A failed session never sorted, or can't judge: nothing more goes in the queue.
-                  Effect.result(session).pipe(Effect.ensuring(Effect.all([Deferred.succeed(sorted, undefined), Deferred.succeed(found, undefined)]))),
+                  Effect.result(session).pipe(Effect.ensuring(Effect.all([Deferred.succeed(sorted, undefined), Deferred.succeed(found, undefined), Deferred.succeed(writing, undefined)]))),
                   sides,
                   specGate,
                 ],
