@@ -53,6 +53,9 @@ export const GitToolkit = Toolkit.make(
   }),
 )
 
+/** How Claude Code names each tool: `mcp__<server>__<tool>`. */
+export const gitToolNames = Object.keys(GitToolkit.tools).map((name) => `mcp__git__${name}`)
+
 const MAX_MATCHES = 200
 const MAX_LINES = 2000
 const MAX_DIFF = 60_000

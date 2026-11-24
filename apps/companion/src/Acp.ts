@@ -4,6 +4,7 @@ import { Clock, Context, Effect, Exit, Fiber, Layer, Option, Queue, Schema, type
 import { spawn } from 'node:child_process'
 import { Readable, Writable } from 'node:stream'
 import { safeGhCommand, safeGitCommand, words } from './gitOnly.ts'
+import { gitToolNames } from './GitTools.ts'
 import { directCommand, expandHome, loginPath } from './shellPath.ts'
 import { annotate, elapsedMs, measure, type Meta, round, startSpan } from './Perf.ts'
 import { ticketPermission } from './permissions.ts'
@@ -25,8 +26,6 @@ export type Launch = (account: AgentAccount, cwd: string) => Effect.Effect<{ tar
 
 // Claude Code's own settings could allow tools past the gate; its ACP adapter takes SDK options here.
 const disallowedTools = ['Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Task']
-/** The companion's read-only git tools (see `GitTools`); they never need a permission round trip. */
-const GIT_TOOLS = 'mcp__git__'
 // Only what a review uses: the companion's git tools, git through Bash, and skills with the files they name. claude.ai
 // connectors stay off; the ticket session reads tickets, and an agent reading untrusted PR content gets no tools beyond read-only git.
 const claudeOptions = (plugins: ReadonlyArray<string>) => ({
@@ -34,7 +33,8 @@ const claudeOptions = (plugins: ReadonlyArray<string>) => ({
     options: {
       settingSources: [],
       disallowedTools,
-      allowedTools: [`${GIT_TOOLS}*`],
+      // The companion's read-only git tools by name, so another server called git gets no pass.
+      allowedTools: gitToolNames,
       tools: ['Bash', 'Skill', 'Read'],
       plugins: plugins.map((path) => ({ type: 'local', path, skipMcpDiscovery: true })),
       env: { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' },
@@ -226,7 +226,7 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
                 // Non-MCP requests carry no tool name; the adapter's kind and title for each tool stand in for it.
                 const allowed = o?.tickets
                   ? ticketPermission(tool)
-                  : Option.getOrUndefined(Schema.decodeUnknownOption(ClaudeCodeMeta)(tool._meta))?.claudeCode.toolName.startsWith(GIT_TOOLS) === true ||
+                  : gitToolNames.includes(Option.getOrUndefined(Schema.decodeUnknownOption(ClaudeCodeMeta)(tool._meta))?.claudeCode.toolName ?? '') ||
                     (tool.kind === 'execute' && command !== undefined && (safeGitCommand(command) || safeGhCommand(command, o?.related ?? []))) ||
                     (tool.kind === 'other' && tool.title?.startsWith('Load skill') === true && Schema.is(SkillInput)(raw)) ||
                     (tool.kind === 'read' && tool.title?.startsWith('Read ') === true && Schema.is(ReadInput)(raw) && o?.readable?.(raw.file_path) === true)
