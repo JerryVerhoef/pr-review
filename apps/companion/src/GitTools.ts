@@ -159,7 +159,8 @@ export class GitTools extends Context.Service<
         // --no-ignore: a tracked file that .gitignore names is still in the tree, and git grep reads it.
         const args = ['-n', '--no-heading', '--color', 'never', '--hidden', '--no-ignore', '-g', '!.git', ...(o.glob ? ['-g', o.glob] : []), o.fixed ? '-F' : '-P', ...(o.ignoreCase ? ['-i'] : []), '-e', o.pattern, '--', ...(o.paths.length ? o.paths : ['.'])]
         const once = (PATH?: string) => Effect.map(rgRun(args, dir, PATH), (out) => out.split('\n').filter(Boolean).map((l) => l.replace(/^\.\//, '')))
-        const missing = (e: GitError) => /ENOENT|not found/i.test(e.message)
+        // Node says ENOENT, Effect's spawner NotFound.
+        const missing = (e: GitError) => /ENOENT|not ?found/i.test(e.message)
         return once(rgPath).pipe(
           Effect.catchIf(
             (e) => missing(e) && rgPath === undefined,
