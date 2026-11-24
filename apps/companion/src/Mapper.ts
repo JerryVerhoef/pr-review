@@ -7,12 +7,13 @@ import { checkEvidence } from './citations.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
-import { citationReader, describePr, guidanceSection } from './opinionContext.ts'
+import { citationReader, describePr, guidanceSection, toolsSection } from './opinionContext.ts'
 import { annotate, measure } from './Perf.ts'
 import { type SortError, Sorter } from './Sorter.ts'
 import { buildStack } from './stack.ts'
 import { makeSteps } from './steps.ts'
 import { ArchitectureKey, cacheOptions, measuredCache, peek, storeFailuresDie } from './Store.ts'
+import { trustedGroup } from './trusted.ts'
 
 const instructions = readFileSync(new URL('../prompts/architecture.md', import.meta.url), 'utf8')
 
@@ -68,6 +69,7 @@ export class Mapper extends Context.Service<
 
         const { prs, prompt } = yield* Effect.gen(function* () {
           const settings = yield* config.settings
+          const { review } = settings
           const gh = yield* github.forHost(host)
           const prs = yield* Effect.forEach(
             heads,
@@ -77,19 +79,28 @@ export class Mapper extends Context.Service<
                 const entry = { number: h.number, title: pr.title, headRef: pr.headRef, baseRef: pr.baseRef, headSha: h.headSha }
                 const { mergeBase } = yield* git.fetchPr(repoKey, h.number, pr.baseRef, h.headSha)
                 const [files, sort] = yield* Effect.all([git.numstat(repoKey, mergeBase, h.headSha), sorter.cached({ host, owner, repo, number: h.number }, h.headSha)], { concurrency: 2 })
-                return { entry, mergeBase, files, sort }
+                // As the sort reads it: lockfiles and generated files left out, a moved file with its old path.
+                const paths = files.filter((f) => !trustedGroup(f.path, review.likelyTrusted, review.neverTrust)).flatMap((f) => (f.previous ? [f.previous, f.path] : [f.path]))
+                const diff = paths.length ? yield* git.diff(repoKey, mergeBase, h.headSha, paths) : ''
+                return { entry, mergeBase, files, sort, diff }
               }),
             { concurrency: 4 },
           )
           const master = `origin/${yield* git.defaultBranch(repoKey)}`
-          const { guidance: globs } = settings.review
+          const { guidance: globs } = review
+          const diffBytes = prs.reduce((n, p) => n + Buffer.byteLength(p.diff), 0)
+          const diffInlined = diffBytes <= review.maxDiffKb * 1000
           const guidance = globs.length ? yield* git.lsTree(repoKey, master, globs) : []
           const prompt = [
             instructions,
+            toolsSection,
             `# Refs\nDefault branch: ${master}\n${prs.map((p) => `#${p.entry.number} head ${p.entry.headSha}, merge base ${p.mergeBase}`).join('\n')}`,
             guidanceSection(master, guidance),
             `# PRs (bottom first)\n${prs.map((p) => describePr(p.entry, p.sort, p.files)).join('\n\n')}`,
             `# Files changed\n${prs.map((p) => `#${p.entry.number}\n${p.files.map((f) => `  ${f.path} +${f.additions} -${f.deletions}`).join('\n')}`).join('\n')}`,
+            diffInlined
+              ? `# Diff (each PR's own change, lockfiles and generated files left out; read the files around it with show)\n${prs.map((p) => `## #${p.entry.number}\n${p.diff}`).join('\n\n')}`
+              : '# Diff\nDiff too large; read each PR\'s change with diff from its merge base to its head, with paths',
           ].join('\n\n')
           yield* annotate({
             prs: prs.length,
@@ -98,6 +109,8 @@ export class Mapper extends Context.Service<
             deletions: prs.reduce((n, p) => n + p.files.reduce((m, f) => m + f.deletions, 0), 0),
             sortsCached: prs.filter((p) => p.sort).length,
             guidanceFiles: guidance.length,
+            diffBytes,
+            diffInlined,
             promptBytes: Buffer.byteLength(prompt),
           })
           return { prs, prompt }
