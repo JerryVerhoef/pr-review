@@ -38,8 +38,9 @@ const tracker = (phases: Phases, partial: SubscriptionRef.SubscriptionRef<Review
     failRunning: Effect.flatMap(now, (endedAt) => SubscriptionRef.update(phases, (ps) => ps.map((p) => (p.state === 'running' ? { ...p, state: 'failed' as const, endedAt } : p)))),
     worker: (id: Phase['id'], i: number, f: (w: Worker) => Worker) =>
       update(id, (p) => {
-        const workers = [...p.workers]
-        workers[i] = f(workers[i] ?? { account: '', recent: [] })
+        // Dense: a session can be numbered before the phase exists, so its slot was never written and would encode as a hole.
+        const workers = Array.from({ length: Math.max(p.workers.length, i + 1) }, (_, j): Worker => p.workers[j] ?? { account: '', recent: [] })
+        workers[i] = f(workers[i]!)
         return { ...p, workers }
       }),
   }
