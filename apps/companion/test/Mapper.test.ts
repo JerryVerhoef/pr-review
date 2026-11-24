@@ -30,10 +30,11 @@ const reply: AgentArchitecture = {
   ],
 }
 
-const setup = (o: { prs?: () => StackEntry[] } = {}) => {
+const setup = (o: { prs?: () => StackEntry[]; diff?: string; maxDiffKb?: number } = {}) => {
   const agent = fakeAgent(() => Effect.succeed(reply))
   const git = fakeGit({
-    files: [{ path: 'src/billing/Bill.ts', additions: 3, deletions: 1 }],
+    files: [{ path: 'src/billing/Bill.ts', additions: 3, deletions: 1 }, { path: 'pnpm-lock.yaml', additions: 900, deletions: 0 }],
+    diff: o.diff ?? 'THE DIFF',
     rules: ['src/billing/Bill.ts', 'src/usage/Usage.ts'],
     show: { 'sha7:src/billing/Bill.ts': 'a\nawait usage.insert(row)\n', 'sha8:src/usage/Usage.ts': 'export class Usage {}\n', 'HEAD1:src/billing/Bill.ts': 'await usage.insert(row)\n' },
   })
@@ -42,7 +43,7 @@ const setup = (o: { prs?: () => StackEntry[] } = {}) => {
       agent.layer,
       git.layer,
       fakeGitHub({ listOpenPrs: () => Effect.sync(() => (o.prs ? o.prs() : stack)), getPr: (_o, _r, n) => Effect.succeed({ ...pr, number: n, title: `PR ${n}`, headSha: n === 7 && !o.prs ? 'sha7' : pr.headSha }) }),
-      Config.layerTest({ cacheRoot: '/cache', settings: { ...defaultSettings, hosts: [ref.host] } }),
+      Config.layerTest({ cacheRoot: '/cache', settings: { ...defaultSettings, hosts: [ref.host], review: { ...defaultSettings.review, maxDiffKb: o.maxDiffKb ?? defaultSettings.review.maxDiffKb } } }),
       fakeSorter,
     ]),
     Layer.provide(Store.layerWith(KeyValueStore.layerMemory)),
@@ -64,13 +65,26 @@ describe('Mapper', () => {
       assert.strictEqual(agent.calls[0]!.log.kind, 'architecture')
       const p = agent.calls[0]!.prompt
       assert.match(p, /untrusted input/)
-      const order = ['# Refs', '# Review guidance', '# PRs', '# Files changed'].map((s) => p.indexOf(s))
+      const order = ['# Tools', '# Refs', '# Review guidance', '# PRs', '# Files changed', '# Diff'].map((s) => p.indexOf(s))
       assert.notInclude(order, -1)
       assert.deepStrictEqual(order, [...order].sort((a, b) => a - b))
       assert.match(p, /#6 head sha6, merge base MB1\n#7 head sha7, merge base MB1\n#8 head sha8, merge base MB1/)
       assert.match(p, /#6 PR 6 \(head sha6\)\nAdds the model\.\n- \[architecture\/data-model\] Decision model/)
       assert.match(p, /#8\n {2}src\/billing\/Bill\.ts \+3 -1/)
       assert.deepStrictEqual(m.heads, { 6: 'sha6', 7: 'sha7', 8: 'sha8' })
+    }))
+
+  it.effect("inlines each PR's own diff without lockfiles, unless it is too large", () =>
+    Effect.gen(function* () {
+      const { agent, git, layer } = setup()
+      yield* mapOf(true).pipe(Effect.provide(layer))
+      assert.match(agent.calls[0]!.prompt, /## #6\nTHE DIFF\n\n## #7\nTHE DIFF\n\n## #8\nTHE DIFF/)
+      assert.deepStrictEqual(git.diffPaths, [['src/billing/Bill.ts'], ['src/billing/Bill.ts'], ['src/billing/Bill.ts']])
+
+      const big = setup({ diff: 'x'.repeat(600), maxDiffKb: 1 })
+      yield* mapOf(true).pipe(Effect.provide(big.layer))
+      assert.match(big.agent.calls[0]!.prompt, /# Diff\nDiff too large/)
+      assert.notInclude(big.agent.calls[0]!.prompt, 'xxx')
     }))
 
   it.effect('drops what it cannot check and corrects a citation’s line', () =>
