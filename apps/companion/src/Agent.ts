@@ -1,12 +1,13 @@
 import { type AccountStatus, type AgentAccount, AgentError, type AskEvent } from '@pr-review/domain'
-import { Clock, Context, Effect, FileSystem, Layer, Result, Schema, Scope, Stream } from 'effect'
+import { Clock, Context, Deferred, Effect, Exit, FileSystem, Layer, Result, Schema, Scope, Stream } from 'effect'
 import { dirname, join } from 'node:path'
 import { Acp, type AcpSession } from './Acp.ts'
 import { Config } from './Config.ts'
+import { GitTools } from './GitTools.ts'
 import { annotate, measure, measureStream } from './Perf.ts'
 import { Skills } from './Skills.ts'
 
-export type RunLog = { kind: 'sort' | 'ask' | 'chat' | 'overview' | 'opinion' | 'deeper' | 'stack-opinion' | 'architecture' | 'ticket' | 'rule'; owner: string; repo: string; number: number; headSha: string }
+export type RunLog = { kind: 'sort' | 'areas' | 'ask' | 'chat' | 'overview' | 'opinion' | 'deeper' | 'stack-opinion' | 'architecture' | 'ticket' | 'rule'; owner: string; repo: string; number: number; headSha: string }
 type Opts = { cwd: string; /** The repo key of the clone at `cwd`, for its skills. */ repo?: string; related?: ReadonlyArray<string>; /** Only `deep` accounts when the pool has any, else the whole pool. */ prefer?: 'deep'; log: RunLog; onStep?: (step: string) => Effect.Effect<void> }
 type Run = Opts & { prompt: string }
 export type SessionOptions = Opts & {
@@ -33,9 +34,11 @@ const LOGIN = /not logged in|authenticat|log ?in/i
 const LIMITED_FOR = 30 * 60_000
 // Most of a turn is the model thinking; low effort halved sort and opinion time with the same decisions found.
 // Dig deeper, ask, chat, rule drafts and architecture maps keep the agent's own level.
-const LOW_EFFORT: ReadonlySet<RunLog['kind']> = new Set(['sort', 'opinion', 'overview', 'stack-opinion', 'ticket'])
+const LOW_EFFORT: ReadonlySet<RunLog['kind']> = new Set(['sort', 'areas', 'opinion', 'overview', 'stack-opinion', 'ticket'])
 const effortFor = (kind: RunLog['kind']) => (LOW_EFFORT.has(kind) ? 'low' : undefined)
 const LOGIN_FOR = 5 * 60_000
+/** A warm session nobody took in this long is closed. */
+const WARM_IDLE = '10 minutes'
 
 /** Agents get the schema in the prompt and answer with JSON; their own structured-output modes differ per agent. */
 const jsonInstruction = (schema: Schema.Top) =>
@@ -52,9 +55,14 @@ const jsonIn = (text: string) => {
 export class Agent extends Context.Service<
   Agent,
   {
-    structured<S extends Decodable>(o: Run & { schema: S }): Effect.Effect<S['Type'], AgentError>
+    structured<S extends Decodable>(o: Run & { schema: S; model?: 'fast' | 'main'; noWait?: boolean }): Effect.Effect<S['Type'], AgentError>
     /** One account, one agent session, as many turns as `use` takes. A benched account reruns `use` on another. */
     session<A>(o: SessionOptions, use: (s: AgentTurns, account: AgentAccount) => Effect.Effect<A, AgentError>): Effect.Effect<A, AgentError>
+    /**
+     * Opens sessions ahead for `session` calls with these options, so they skip the agent's start: on each account, as
+     * many as its free slots, in place of any it holds for other options. A taken one is not replaced. Never fails; returns at once.
+     */
+    warm(o: Opts): Effect.Effect<void>
     /** Free slots across enabled accounts that are not sitting out. */
     freeSlots(): Effect.Effect<number>
     /** `resume` is a Done event's sessionId; it names the account the conversation ran on. */
@@ -70,6 +78,7 @@ export class Agent extends Context.Service<
       const acp = yield* Acp
       const config = yield* Config
       const skills = yield* Skills
+      const gitTools = yield* GitTools
       const fs = yield* FileSystem.FileSystem
       const usagePath = join(config.cacheRoot, 'usage.jsonl')
       const states = new Map<string, { busy: number; until: number; error: string | null }>()
@@ -77,6 +86,51 @@ export class Agent extends Context.Service<
       const step = (o: Opts, s: string) => (o.onStep ?? (() => Effect.void))(s)
 
       const eligible = (a: AgentAccount, tickets: boolean) => a.enabled && (!tickets || a.tickets === true)
+
+      /** A session reading a clone gets the companion's git tools for as long as it is open. */
+      const mcpFor = (repo: string | undefined) => (repo ? Effect.map(gitTools.register(repo), (s) => [s]) : Effect.succeed([]))
+      const openFor = (a: AgentAccount, o: Opts) =>
+        Effect.flatMap(Effect.all([skills.plugins(a, o.repo), mcpFor(o.repo)]), ([plugins, mcpServers]) =>
+          acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind), plugins, readable: skills.readable, mcpServers }),
+        )
+
+      // Sessions opened ahead, by what they were opened with. A warm session has had no prompt: taking one is the same as
+      // opening it, without the wait. Each lives in a scope of its own until its taker's scope closes or it sits unused.
+      // An account's warm and busy sessions together stay within its concurrency.
+      const layerScope = yield* Effect.scope
+      type WarmSession = { account: string; opened: Deferred.Deferred<AcpSession, AgentError>; scope: Scope.Closeable }
+      const pool = new Map<string, ReadonlyArray<WarmSession>>()
+      const poolKey = (a: AgentAccount, o: Opts) => JSON.stringify([a.id, a.command, a.env, a.model ?? null, a.mode ?? null, o.cwd, o.repo ?? null, o.related ?? [], effortFor(o.log.kind) ?? null])
+      const addWarm = (key: string, a: AgentAccount, o: Opts) =>
+        Effect.gen(function* () {
+          const scope = yield* Scope.fork(layerScope)
+          const entry: WarmSession = { account: a.id, opened: yield* Deferred.make<AcpSession, AgentError>(), scope }
+          pool.set(key, [...(pool.get(key) ?? []), entry])
+          yield* Effect.forkIn(Effect.flatMap(Effect.exit(Scope.provide(openFor(a, o), scope)), (exit) => Deferred.done(entry.opened, exit)), layerScope)
+          yield* Effect.forkIn(Effect.andThen(Effect.sleep(WARM_IDLE), drop(key, entry)), layerScope)
+        })
+      const drop = (key: string, entry: WarmSession) =>
+        Effect.suspend(() => {
+          const left = pool.get(key) ?? []
+          if (!left.includes(entry)) return Effect.void
+          pool.set(key, left.filter((e) => e !== entry))
+          return Scope.close(entry.scope, Exit.void)
+        })
+      const warmOn = (account: string) => [...pool].flatMap(([key, entries]) => entries.filter((e) => e.account === account).map((entry) => ({ key, entry })))
+      /** Closes the account's warm sessions past its free slots. */
+      const trim = (a: AgentAccount) => Effect.forEach(warmOn(a.id).slice(Math.max(0, a.concurrency - stateOf(a.id).busy)), ({ key, entry }) => drop(key, entry), { discard: true })
+      /** A warm session for these options, opened or opening, now owned by `scope`. */
+      const takeWarm = (a: AgentAccount, o: Opts, scope: Scope.Scope) =>
+        Effect.gen(function* () {
+          const key = poolKey(a, o)
+          const [entry, ...rest] = pool.get(key) ?? []
+          if (!entry) return yield* Effect.as(trim(a), undefined)
+          pool.set(key, rest)
+          yield* Scope.addFinalizer(scope, Scope.close(entry.scope, Exit.void))
+          const opened = yield* Effect.exit(Deferred.await(entry.opened))
+          // One that failed to open is opened again by the taker, so a real failure still reaches it.
+          return Exit.isSuccess(opened) ? opened.value : undefined
+        })
 
       /**
        * The least busy account with room, held until the scope closes. Waits while all are busy.
@@ -205,9 +259,10 @@ export class Agent extends Context.Service<
               const scope = yield* Effect.scope
               // Opened in the first turn, so a one-turn run's time limit and usage line cover the open as before.
               const open = yield* Effect.cached(
-                Effect.flatMap(skills.plugins(a, o.repo), (plugins) =>
-                  acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind), plugins, readable: skills.readable }),
-                ).pipe(Effect.tap(() => step(o, `${a.name} is reading the PR`)), Scope.provide(scope)),
+                Effect.flatMap(takeWarm(a, o, scope), (warm) => (warm ? Effect.succeed(warm) : openFor(a, o))).pipe(
+                  Effect.tap(() => step(o, `${a.name} is reading the PR`)),
+                  Scope.provide(scope),
+                ),
               )
               let onFast = false
               let mainRan = false
@@ -275,9 +330,20 @@ export class Agent extends Context.Service<
         )
 
       return Agent.of({
-        structured: (o) => session(o, (s) => s.structured(o.prompt, o.schema)),
+        structured: (o) => session(o, (s) => s.structured(o.prompt, o.schema, o.model)),
 
         session,
+
+        warm: (o) =>
+          Effect.gen(function* () {
+            const now = yield* Clock.currentTimeMillis
+            for (const a of (yield* config.settings).accounts.filter((a) => eligible(a, false) && stateOf(a.id).until <= now)) {
+              const key = poolKey(a, o)
+              yield* Effect.forEach(warmOn(a.id), (w) => (w.key === key ? Effect.void : drop(w.key, w.entry)), { discard: true })
+              yield* trim(a)
+              for (let n = warmOn(a.id).length; n < a.concurrency - stateOf(a.id).busy; n++) yield* addWarm(key, a, o)
+            }
+          }),
 
         freeSlots: () =>
           Effect.gen(function* () {
@@ -291,7 +357,7 @@ export class Agent extends Context.Service<
           return Stream.unwrap(
             Effect.gen(function* () {
               const a = yield* acquire(o, new Set(), owner)
-              const session = yield* acp.open(a, o.cwd, sessionId, { plugins: yield* skills.plugins(a, o.repo), readable: skills.readable })
+              const session = yield* acp.open(a, o.cwd, sessionId, { plugins: yield* skills.plugins(a, o.repo), readable: skills.readable, mcpServers: yield* mcpFor(o.repo) })
               yield* annotate({ agent: a.agent, account: a.id, model: a.model || session.defaultModel })
               const startedAt = yield* Clock.currentTimeMillis
               return session.prompt(o.prompt).pipe(

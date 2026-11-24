@@ -9,6 +9,7 @@ import { Acp } from '../src/Acp.ts'
 import { Agent } from '../src/Agent.ts'
 import { Config, defaultCacheRoot } from '../src/Config.ts'
 import { Git } from '../src/Git.ts'
+import { GitTools } from '../src/GitTools.ts'
 import { GitHub } from '../src/GitHub.ts'
 import { Skills } from '../src/Skills.ts'
 import { Sorter } from '../src/Sorter.ts'
@@ -47,7 +48,7 @@ const program = Effect.gen(function* () {
 
 const config = Config.layerTest({ cacheRoot: defaultCacheRoot, settings: { ...defaultSettings, hosts: [host] } })
 const layer = Layer.mergeAll(Sorter.layer, Git.layer, GitHub.layer).pipe(
-  Layer.provide([Agent.layer.pipe(Layer.provide([Acp.layer, Skills.layer.pipe(Layer.provide(Git.layer))])), Git.layer, GitHub.layer, Store.layer]),
+  Layer.provide([Agent.layer.pipe(Layer.provide([Acp.layer, Skills.layer.pipe(Layer.provide(Git.layer)), GitTools.layer.pipe(Layer.provide(Git.layer))])), Git.layer, GitHub.layer, Store.layer]),
   Layer.provide(config),
   Layer.provide(NodeServices.layer),
 )

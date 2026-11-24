@@ -2,10 +2,11 @@ import { NodeServices } from '@effect/platform-node'
 import { assert, describe, it } from '@effect/vitest'
 import { GitError } from '@pr-review/domain'
 import { Effect, Layer } from 'effect'
-import { appendFileSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { appendFileSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Config } from '../src/Config.ts'
-import { Git } from '../src/Git.ts'
+import { Git, MAX_PACKS } from '../src/Git.ts'
 import { git, makeRemote, tmp } from './helpers.ts'
 
 const key = 'example.com/acme/app'
@@ -40,6 +41,26 @@ describe('Git', () => {
         assert.strictEqual(git(dir, 'config', 'maintenance.auto'), 'false')
       }),
     ))
+
+  it.live('a fetch merges a clone of many packs into a few in the background', () =>
+    run((g, remote) =>
+      Effect.gen(function* () {
+        yield* g.fetchPr(key, 7, 'master', git(remote, 'rev-parse', 'feat'))
+        const dir = g.dir(key)
+        assert.strictEqual(git(dir, 'config', 'fetch.writeCommitGraph'), 'true')
+        const packs = () => readdirSync(join(dir, 'objects', 'pack')).filter((f) => f.endsWith('.pack')).length
+        for (let i = 1; packs() <= MAX_PACKS; i++) {
+          const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, input: `blob ${i}` }).toString().trim()
+          git(dir, 'update-ref', `refs/test/${i}`, blob)
+          git(dir, 'repack', '-d', '-q')
+        }
+        git(remote, 'update-ref', 'refs/pull/8/head', 'feat')
+        yield* g.fetchPr(key, 8, 'master', git(remote, 'rev-parse', 'feat'))
+        for (let i = 0; packs() >= 5 && i < 200; i++) yield* Effect.sleep('50 millis')
+        assert.isBelow(packs(), 5)
+        assert.strictEqual(git(dir, 'cat-file', '-t', 'refs/test/1'), 'blob')
+      }),
+    ), 30_000)
 
   it.live('ensureClone twice is a no-op', () => run((g) => Effect.andThen(g.ensureClone(key), g.ensureClone(key))))
 

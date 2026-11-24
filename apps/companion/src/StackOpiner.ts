@@ -8,7 +8,7 @@ import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
 import { anchorHunks, anchorIn, Opiner } from './Opiner.ts'
 import { annotate, measure } from './Perf.ts'
-import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection } from './opinionContext.ts'
+import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection, toolsSection } from './opinionContext.ts'
 import { type SortError, Sorter } from './Sorter.ts'
 import { buildStack } from './stack.ts'
 import { makeSteps } from './steps.ts'
@@ -102,6 +102,7 @@ export class StackOpiner extends Context.Service<
           })
           const prompt = [
             instructions,
+            toolsSection,
             `# Refs\nDefault branch: ${master}\n${prs.map((p) => `#${p.entry.number} head ${p.entry.headSha}, merge base ${p.mergeBase}`).join('\n')}`,
             guidanceSection(master, guidance),
             relatedSection(related),

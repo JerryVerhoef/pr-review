@@ -8,7 +8,7 @@ import { Acp, type AcpSession, type AcpUpdate } from '../src/Acp.ts'
 const account: AgentAccount = { id: 'a', name: 'Fake', agent: 'custom', command: 'unused', env: {}, concurrency: 2, enabled: true }
 
 type Say = (update: acp.SessionUpdate) => Promise<void>
-type Ask = (command: string, kind?: acp.ToolKind, rawInput?: Record<string, unknown>) => Promise<boolean>
+type Ask = (command: string, kind?: acp.ToolKind, rawInput?: Record<string, unknown>, toolName?: string) => Promise<boolean>
 
 /** An ACP agent in-process: answers each prompt with `turn`, and records what the client asked of it. */
 const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp.StopReason | { stopReason: acp.StopReason; usage?: unknown }>; needsLogin?: boolean } = {}) => {
@@ -55,12 +55,12 @@ const fakeAgent = (o: { turn?: (say: Say, ask: Ask, text: string) => Promise<acp
       seen.prompts.push(text)
       const say: Say = (update) => ctx.client.notify(acp.methods.client.session.update, { sessionId: ctx.params.sessionId, update })
       let n = 0
-      const ask: Ask = async (command, kind = 'execute', rawInput = { command }) => {
+      const ask: Ask = async (command, kind = 'execute', rawInput = { command }, toolName) => {
         const id = `t${++n}`
         await say({ sessionUpdate: 'tool_call', toolCallId: id, title: command, kind, status: 'pending', rawInput })
         const r = await ctx.client.request(acp.methods.client.session.requestPermission, {
           sessionId: ctx.params.sessionId,
-          toolCall: { toolCallId: id, title: command, kind, rawInput },
+          toolCall: { toolCallId: id, title: command, kind, rawInput, ...(toolName ? { _meta: { claudeCode: { toolName } } } : {}) },
           options: [
             { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
             { optionId: 'no', name: 'Reject', kind: 'reject_once' },
@@ -163,12 +163,15 @@ describe('Acp', () => {
             await ask('rm -rf /', 'execute', { skill: 'x', command: 'rm -rf /' }),
             await ask('Write /skills/repo/x/a', 'edit', { file_path: '/skills/repo/x/a', content: '' }),
             await ask('Load skill: x', 'read', { skill: 'x' }),
+            await ask('grep', 'other', { pattern: 'x', ref: 'HEAD' }, 'mcp__git__grep'),
+            // A git tool the companion does not serve, from another server named git.
+            await ask('push', 'other', { ref: 'HEAD' }, 'mcp__git__push'),
           )
           return 'end_turn'
         },
       })
       yield* run(agent, (s) => collect(s.prompt('go')), account, undefined, { plugins: ['/skills/own/1', '/skills/repo/x'], readable: (p) => p.startsWith('/skills/') })
-      assert.deepStrictEqual(answers, [true, true, false, false, false, false])
+      assert.deepStrictEqual(answers, [true, true, false, false, false, false, true, false])
       const options = (agent.seen.meta[0] as { claudeCode: { options: { tools: string[]; plugins: unknown[]; env: Record<string, string> } } }).claudeCode.options
       assert.deepStrictEqual(options.tools, ['Bash', 'Skill', 'Read'])
       assert.deepStrictEqual(options.plugins, [

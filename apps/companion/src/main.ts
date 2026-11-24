@@ -10,6 +10,7 @@ import { Agent } from './Agent.ts'
 import { Asker } from './Asker.ts'
 import { Config, defaultCacheRoot } from './Config.ts'
 import { Git } from './Git.ts'
+import { GitTools } from './GitTools.ts'
 import { GitHub } from './GitHub.ts'
 import { CompanionRpcs, HandlersLive, LoggedLive, VERSION } from './handlers.ts'
 import { defaultExtensionId, install } from './install.ts'
@@ -30,7 +31,7 @@ const services = Layer.mergeAll(StackOpiner.layer, Mapper.layer, Asker.layer, Ov
   Layer.provideMerge(Opiner.layer),
   Layer.provideMerge(Layer.mergeAll(Sorter.layer, Tickets.layer)),
   Layer.provideMerge(Layer.mergeAll(Git.layer, GitHub.layer, Store.layer)),
-  Layer.provideMerge(Agent.layer.pipe(Layer.provide([Acp.layer, Skills.layer]))),
+  Layer.provideMerge(Agent.layer.pipe(Layer.provide([Acp.layer, Skills.layer, GitTools.layer]))),
   Layer.provideMerge(Git.layer),
 )
 

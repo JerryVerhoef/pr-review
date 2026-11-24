@@ -1,4 +1,4 @@
-import { type AgentAccount, type AgentDecisionOpinion, type AgentFinding, AgentOpinion, AgentQuick, AgentSort, type Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
+import { type AgentAccount, type AgentDecisionOpinion, type AgentFinding, AgentAreas, AgentOpinion, AgentQuick, type Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
 import { type Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Stream, SubscriptionRef } from 'effect'
 import { Agent, type AgentTurns, type SessionOptions } from './Agent.ts'
@@ -8,7 +8,7 @@ import { GitHub } from './GitHub.ts'
 import { judged, type OpinionContext, Opiner, quickDecision } from './Opiner.ts'
 import { annotate, measure } from './Perf.ts'
 import { carryFindingStates } from './carry.ts'
-import { type SortError, Sorter, writtenDecisions } from './Sorter.ts'
+import { noAreas, type SortError, Sorter, sortIn, writtenDecisions } from './Sorter.ts'
 import { Store } from './Store.ts'
 import { type TicketSummary, Tickets } from './Tickets.ts'
 import { needsTicketAgent } from './ticketRefs.ts'
@@ -182,6 +182,16 @@ export class Reviewer extends Context.Service<
         const gh = yield* github.forHost(ref.host)
         const pr = yield* gh.getPr(ref.owner, ref.repo, ref.number)
         yield* t.begin('fetch', `Fetching #${ref.number}: ${pr.title}`)
+        const wantOpinion = automatic && !cachedOpinion
+        // What every session below opens with, so the ones warmed here match them.
+        const opened = {
+          cwd: git.dir(repoKey),
+          repo: repoKey,
+          ...(wantOpinion ? { related: repoSettings(settings, repoKey).related.map((r) => r.repo) } : {}),
+          log: { kind: 'sort', owner: ref.owner, repo: ref.repo, number: ref.number, headSha },
+        } satisfies SessionOptions
+        // The agents start while the PR is fetched; the sessions below take them as they come up.
+        yield* Effect.forkChild(Effect.andThen(git.ensureClone(repoKey), agent.warm(opened)).pipe(Effect.ignore))
         // Started now so the turn that needs it waits least; `opiner.context` joins the same lookup.
         const ticket = yield* Effect.forkChild(tickets.summary(ref, pr))
         let cachedSort = sortedEarlier
@@ -198,7 +208,6 @@ export class Reviewer extends Context.Service<
           const q = yield* quick(ref, headSha, t, ticket)
           if (q) return q
         }
-        const wantOpinion = automatic && !cachedOpinion
         if (!wantOpinion) yield* Fiber.interrupt(ticket)
         // Fetched while the sort runs.
         const contextFiber = wantOpinion ? yield* Effect.forkChild(opiner.context(ref, headSha)) : undefined
@@ -256,6 +265,8 @@ export class Reviewer extends Context.Service<
           })
         const known = new Set(sortPrompt?.files.map((f) => f.path))
         let sortText = ''
+        /** Skim areas and trusted groups, from the turn beside the sort. */
+        let areas: AgentAreas | undefined
         /** The sort as far as it is written, while it runs. */
         let sortSoFar: SortResult | undefined
         let shownSoFar = 0
@@ -271,7 +282,7 @@ export class Reviewer extends Context.Service<
             if (ds.length <= shownSoFar) return enqueue(ds)
             shownSoFar = ds.length
             // The page opens on the first decision instead of waiting for the whole sort.
-            const s = sortPrompt!.finish({ decisions: ds, skim: [], claims: [] })
+            const s = sortPrompt!.finish({ decisions: ds, ...(areas ?? noAreas), claims: [] })
             sortSoFar = { ...s, skim: s.skim.map((a) => (a.area === 'Unsorted' ? { ...a, area: 'Still sorting', summary: 'The sort has not placed these files yet.' } : a)) }
             return Effect.andThen(enqueue(ds), publish)
           })
@@ -312,10 +323,7 @@ export class Reviewer extends Context.Service<
 
         const step = (w: Worker, s: string): Worker => ({ ...w, step: s, recent: w.step ? [...w.recent, w.step].slice(-4) : w.recent })
         const options = (slot: Slot): SessionOptions => ({
-          cwd: git.dir(repoKey),
-          repo: repoKey,
-          ...(wantOpinion ? { related: repoSettings(settings, repoKey).related.map((r) => r.repo) } : {}),
-          log: { kind: 'sort', owner: ref.owner, repo: ref.repo, number: ref.number, headSha },
+          ...opened,
           onStep: (s) => Effect.suspend(() => t.worker(slot.phase, slot.worker, (w) => step(w, s))),
         })
         const named = (slot: Slot, a: AgentAccount) => t.worker(slot.phase, slot.worker, (w) => ({ ...w, account: a.name }))
@@ -416,6 +424,17 @@ export class Reviewer extends Context.Service<
         })
 
         const main: Slot = { phase: 'sort', worker: 0 }
+        const besideSort: Slot = { phase: 'sort', worker: 1 }
+        // On a free slot, never waiting for one; kept for a rerun of the sort on another account.
+        const areasTurn = Effect.suspend(() =>
+          areas
+            ? Effect.succeed(areas)
+            : agent
+                .session({ ...options(besideSort), log: { ...options(besideSort).log, kind: 'areas' }, noWait: true }, (turns, account) =>
+                  Effect.andThen(named(besideSort, account), turns.structured(sortPrompt!.areas, AgentAreas, 'fast', 'areas')),
+                )
+                .pipe(Effect.tap((a) => Effect.sync(() => void (areas = a)))),
+        )
         // Begun before the session takes an account, so a wait for one shows on it.
         if (!sort) yield* t.begin('sort', `Sorting ${plural(sortPrompt!.files.length, 'file')}`)
         else if (!judged(sort).length) opinionError = 'Nothing to judge'
@@ -428,7 +447,7 @@ export class Reviewer extends Context.Service<
               sortText = ''
               yield* t.begin('sort', `Sorting ${plural(sortPrompt!.files.length, 'file')}`)
               yield* named(main, account)
-              sort = sortPrompt!.finish(yield* turns.structured(sortPrompt!.prompt, AgentSort, 'main', 'sort'))
+              sort = yield* sortIn(sortPrompt!, turns, areasTurn)
               yield* sorter.remember(ref, headSha, sort)
               yield* t.end('sort', 'done')
               streamed = queued.length

@@ -34,7 +34,7 @@ describe('Sorter', () => {
       const { agent, layer } = layers({ diff: 'x'.repeat(300_001) })
       yield* sortWith(layer)
       const p = agent.calls[0]!.prompt
-      assert.match(p, /Diff too large; read files with git show HEAD1:<path>/)
+      assert.match(p, /Diff too large; read files with show at HEAD1/)
       assert.notMatch(p, /xxxxxxxxxx/)
       assert.match(p, /src\/a\.ts\t\+3\t-1/)
     }))
@@ -64,15 +64,15 @@ describe('Sorter', () => {
       assert.deepStrictEqual(git.diffPaths[0], ['src/a.ts', 'src/b.ts'])
     }))
 
-  it.effect('prompt lists the repo guidance at the default branch and says never cd', () =>
+  it.effect('prompt lists the repo guidance at the default branch and names the git tools', () =>
     Effect.gen(function* () {
       const { agent, git, layer } = layers()
       yield* sortWith(layer)
       const p = agent.calls[0]!.prompt
-      assert.match(p, /git show origin\/master:<path>/)
+      assert.match(p, /show at origin\/master/)
       assert.match(p, /\.agents\/agents\/frontend-reviewer\.md/)
       assert.deepStrictEqual(git.listed[0], defaultSettings.review.guidance)
-      assert.match(p, /never `cd`/)
+      assert.match(p, /the git tools: `show`/)
       assert.match(p, /MB1/)
     }))
 
@@ -84,6 +84,17 @@ describe('Sorter', () => {
       assert.strictEqual(r.headSha, 'HEAD1')
       assert.deepStrictEqual(r.trusted.map((t) => t.group), ['tests'])
       assert.deepStrictEqual(r.skim, [{ area: 'Unsorted', summary: 'Not placed by the sort.', files: ['src/a.ts'] }])
+    }))
+  it.effect('areas come from a turn beside the decisions, or from the same session after them when that turn fails', () =>
+    Effect.gen(function* () {
+      const reply = (c: { log: { kind: string } }) => Effect.succeed(c.log.kind === 'areas' ? { skim: [{ area: 'Late', summary: 's', files: ['src/a.ts'] }] } : { decisions: [], claims: [] })
+      const beside = layers({ agent: fakeAgent(reply, undefined, undefined, () => Effect.succeed({ skim: [{ area: 'Beside', summary: 's', files: ['src/a.ts'] }] })) })
+      assert.deepStrictEqual((yield* sortWith(beside.layer)).skim.map((s) => s.area), ['Beside'])
+      assert.deepStrictEqual(beside.agent.calls.map((c) => c.log.kind), ['sort'])
+      const failed = layers({ agent: fakeAgent(reply, undefined, undefined, () => Effect.fail(new AgentError({ message: 'No AI account has a free slot' }))) })
+      assert.deepStrictEqual((yield* sortWith(failed.layer)).skim.map((s) => s.area), ['Late'])
+      assert.deepStrictEqual(failed.agent.calls.map((c) => c.log.kind), ['sort', 'areas'])
+      assert.isTrue((failed.agent.areasCalls[0] as { noWait?: boolean }).noWait)
     }))
 })
 

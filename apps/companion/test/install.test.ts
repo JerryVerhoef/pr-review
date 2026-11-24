@@ -95,9 +95,9 @@ describe('host', () => {
       const child = spawn(process.execPath, [main, 'host'], { env: { ...process.env, HOME: home }, stdio: ['pipe', 'pipe', 'pipe'] })
       yield* Effect.addFinalizer(() => Effect.sync(() => child.kill()))
       const client = yield* makePortClient(ReviewRpcs, Effect.sync(() => streamPort(child.stdout, child.stdin)))
-      const health = yield* client.Health().pipe(Effect.timeout('10 seconds'))
+      const health = yield* client.Health().pipe(Effect.timeout('20 seconds'))
       assert.match(health.version, /^\d+\.\d+\.\d+$/)
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-    20_000, // spawns a real node process, which is slow under a parallel turbo run
+    30_000, // spawns a real node process, which is slow under a parallel turbo run
   )
 })

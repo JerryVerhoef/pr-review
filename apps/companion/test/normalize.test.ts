@@ -112,3 +112,9 @@ test("a candidate Claude trusted itself takes Claude's group", () => {
   const r = normalize(agent({ skim: [{ area: 's', summary: '', files: ['a.ts', 'b.ts', 'c.ts'] }], trusted: [{ group: 'Tests', why: 'Only renames a fixture', files: ['x.test.ts'] }] }), files, trusted, 'sha')
   assert.deepEqual(r.trusted, [{ group: 'Tests', why: 'Only renames a fixture', files: ['x.test.ts'] }])
 })
+
+test('a file the sort trusted after reading its diff leaves the skim area placed from its path', () => {
+  const r = normalize(agent({ skim: [{ area: 's', summary: '', files: ['a.ts', 'b.ts', 'c.ts'] }], trusted: [{ group: 'Fixtures', why: 'Sample data only', files: ['c.ts'] }] }), files, trusted, 'sha')
+  assert.deepEqual(r.skim, [{ area: 's', summary: '', files: ['a.ts', 'b.ts'] }])
+  assert.deepEqual(r.trusted, [trusted[0], { group: 'Fixtures', why: 'Sample data only', files: ['c.ts'] }])
+})

@@ -9,7 +9,7 @@ import { GitHub } from './GitHub.ts'
 import { annotate, measure } from './Perf.ts'
 import { type SortError, Sorter } from './Sorter.ts'
 import { hunkLines, nearestLine } from './interdiff.ts'
-import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection } from './opinionContext.ts'
+import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection, toolsSection } from './opinionContext.ts'
 import { buildStack } from './stack.ts'
 import { type TicketSummary, Tickets } from './Tickets.ts'
 import { needsTicketAgent } from './ticketRefs.ts'
@@ -237,19 +237,19 @@ export class Opiner extends Context.Service<
                   : [
                       skill,
                       // A continued turn has the refs, guidance and PR from the sort prompt above it.
-                      ...(o.continued ? [] : [`# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`, guidanceSection(master, guidance)]),
+                      ...(o.continued ? [] : [toolsSection, `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`, guidanceSection(master, guidance)]),
                       relatedSection(related),
                       ticketText,
-                      `# Stack (bottom first; compare a PR with the one below it using git diff <head below> <its head>)\n${stackText.join('\n\n') || '(not stacked)'}`,
+                      `# Stack (bottom first; compare a PR with the one below it using diff from the head below to its head)\n${stackText.join('\n\n') || '(not stacked)'}`,
                       ...(o.continued ? [] : [`# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`]),
                     ]),
                 `# Decisions\n${JSON.stringify(decisions)}`,
                 // Here, not in the skill: a repo's own skill must still show which decision is being judged.
                 '# Progress\nBefore you judge each decision, write a line `Judging: <decisionId>` on its own.',
                 o.continued
-                  ? `# Diff\nIn the sort above; read files again with git show ${head}:<path> where you need more.`
+                  ? `# Diff\nIn the sort above; read files again with show at ${head} where you need more.`
                   : diff === undefined || diff.length > review.maxDiffKb * 1000
-                    ? `# Diff\nDiff too large; read files with git show ${head}:<path> and compare with git diff ${mergeBase} ${head} -- <path>`
+                    ? `# Diff\nDiff too large; read files with show at ${head} and compare with diff from ${mergeBase} to ${head} with their paths`
                     : `# Diff\n${diff || '(no decision files)'}`,
                 ...(o.deep ? ['# Depth\nTake your time on this one decision; read every file it touches in full.'] : []),
                 ...(o.spec === 'only'
