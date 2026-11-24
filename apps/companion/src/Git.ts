@@ -11,7 +11,12 @@ export interface PrShas {
   readonly mergeBase: string
 }
 
-/** Full bare clones owned by the companion; the reviewer's own working copy is never touched. */
+/**
+ * Each fetch adds a pack, and every object read searches all of them; auto gc is off in the clones (see `ensureClone`),
+ * so the companion merges them itself past this many.
+ */
+export const MAX_PACKS = 20
+
 /** `git diff --numstat -z -M`: `add\tdel\tpath\0`, or for a rename `add\tdel\t\0old\0new\0`. Binary files count 0. */
 export function parseNumstat(out: string): FileStat[] {
   const fields = out.split('\0')
@@ -44,6 +49,8 @@ export class Git extends Context.Service<
     /** Every file at `ref`, with its blob id. */
     blobs(key: string, ref: string): Effect.Effect<ReadonlyArray<{ path: string; id: string }>, GitError>
     revParse(key: string, ref: string): Effect.Effect<string, GitError>
+    /** Merges a clone's packs once fetches have left more than `MAX_PACKS`, and writes a commit-graph. Never fails. */
+    maintain(key: string): Effect.Effect<void>
   }
 >()('pr-review/Git') {
   static readonly layer = Layer.effect(
@@ -69,6 +76,21 @@ export class Git extends Context.Service<
         )
       const inRepo = (key: string, ...args: string[]) => exec(args, dir(key))
       const failuresExpire = (exit: Exit.Exit<unknown, unknown>) => (Exit.isSuccess(exit) ? Infinity : 0)
+      const scope = yield* Effect.scope
+
+      const maintaining = new Set<string>()
+      // Geometric: only small packs are merged, so after the first run this is quick. Readers and fetches keep going meanwhile.
+      const maintain = (key: string) =>
+        Effect.gen(function* () {
+          if (maintaining.has(key)) return
+          const packs = (yield* fs.readDirectory(join(dir(key), 'objects', 'pack'))).filter((f) => f.endsWith('.pack')).length
+          if (packs <= MAX_PACKS) return
+          maintaining.add(key)
+          yield* annotate({ packs })
+          yield* Effect.andThen(inRepo(key, 'repack', '-d', '-q', '--geometric=2', '--write-midx'), inRepo(key, 'commit-graph', 'write', '--reachable')).pipe(
+            Effect.ensuring(Effect.sync(() => void maintaining.delete(key))),
+          )
+        }).pipe(measure('git.maintain'), Effect.ignore)
 
       const clones = yield* Cache.makeWith(
         (key: string) =>
@@ -115,6 +137,7 @@ export class Git extends Context.Service<
             // Checked again once it is this fetch's turn: the one before it may have brought the head in.
             const network = !(yield* upToDate) && (yield* Semaphore.withPermit(oneFetch(key))(Effect.flatMap(upToDate, (now) => (now ? Effect.succeed(false) : Effect.as(inRepo(key, 'fetch', '--quiet', '--no-prune', url, ...refspecs), true)))))
             yield* annotate({ network, refspecs: refspecs.length })
+            if (network) yield* Effect.forkIn(maintain(key), scope)
             const headSha = (yield* inRepo(key, 'rev-parse', `refs/pr/${n}`)).trim()
             const baseSha = (yield* inRepo(key, 'rev-parse', `refs/remotes/origin/${baseRef}`)).trim()
             const mergeBase = (yield* inRepo(key, 'merge-base', baseSha, headSha)).trim()
@@ -126,6 +149,7 @@ export class Git extends Context.Service<
       return Git.of({
         dir,
         ensureClone,
+        maintain,
         fetchPr: (key, n, baseRef, headSha) => Cache.get(fetches, JSON.stringify([key, n, baseRef, headSha])),
         defaultBranch: branchOf,
         numstat: (key, from, to) =>

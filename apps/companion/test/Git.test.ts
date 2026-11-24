@@ -2,10 +2,11 @@ import { NodeServices } from '@effect/platform-node'
 import { assert, describe, it } from '@effect/vitest'
 import { GitError } from '@pr-review/domain'
 import { Effect, Layer } from 'effect'
-import { appendFileSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { appendFileSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Config } from '../src/Config.ts'
-import { Git } from '../src/Git.ts'
+import { Git, MAX_PACKS } from '../src/Git.ts'
 import { git, makeRemote, tmp } from './helpers.ts'
 
 const key = 'example.com/acme/app'
@@ -38,6 +39,28 @@ describe('Git', () => {
         assert.notMatch(config, /partialclonefilter/)
         assert.strictEqual(git(dir, 'config', 'gc.auto'), '0')
         assert.strictEqual(git(dir, 'config', 'maintenance.auto'), 'false')
+      }),
+    ))
+
+  it.live('maintain merges a clone of many packs into a few, and leaves one of few alone', () =>
+    run((g) =>
+      Effect.gen(function* () {
+        yield* g.ensureClone(key)
+        const dir = g.dir(key)
+        const packs = () => readdirSync(join(dir, 'objects', 'pack')).filter((f) => f.endsWith('.pack')).length
+        const addPack = (i: number) => {
+          const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, input: `blob ${i}` }).toString().trim()
+          git(dir, 'update-ref', `refs/test/${i}`, blob)
+          git(dir, 'repack', '-d', '-q')
+        }
+        addPack(0)
+        const few = packs()
+        yield* g.maintain(key)
+        assert.strictEqual(packs(), few)
+        for (let i = 1; packs() <= MAX_PACKS; i++) addPack(i)
+        yield* g.maintain(key)
+        assert.isBelow(packs(), 5)
+        assert.strictEqual(git(dir, 'cat-file', '-t', 'refs/test/1'), 'blob')
       }),
     ))
 
