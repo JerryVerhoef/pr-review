@@ -279,6 +279,39 @@ describe('Agent.session', () => {
     }))
 })
 
+describe('Agent.warm', () => {
+  it.live('a session takes a session opened ahead, and another is opened in its place', () =>
+    Effect.gen(function* () {
+      const { layer, opened } = setup(() => Effect.succeed('{"ok": true}'))
+      yield* Effect.gen(function* () {
+        const agent = yield* Agent
+        yield* agent.warm({ cwd: '/repo', log })
+        yield* Effect.sleep('20 millis')
+        assert.deepStrictEqual(opened.map((o) => o.account), ['a', 'b'])
+        assert.deepStrictEqual(yield* agent.structured({ prompt: 'Sort this', schema: Ok, cwd: '/repo', log }), { ok: true })
+        yield* Effect.sleep('20 millis')
+        // The session opened nothing itself: the third open is a's replacement.
+        assert.deepStrictEqual(opened.map((o) => o.account), ['a', 'b', 'a'])
+        // Topped up, not added to.
+        yield* agent.warm({ cwd: '/repo', log })
+        yield* Effect.sleep('20 millis')
+        assert.strictEqual(opened.length, 3)
+      }).pipe(Effect.provide(layer))
+    }))
+
+  it.live('sessions with other options open their own', () =>
+    Effect.gen(function* () {
+      const { layer, opened } = setup(() => Effect.succeed('{"ok": true}'))
+      yield* Effect.gen(function* () {
+        const agent = yield* Agent
+        yield* agent.warm({ cwd: '/other', log })
+        yield* Effect.sleep('20 millis')
+        yield* agent.structured({ prompt: 'Sort this', schema: Ok, cwd: '/repo', log })
+        assert.deepStrictEqual(opened.map((o) => o.cwd), ['/other', '/other', '/repo'])
+      }).pipe(Effect.provide(layer))
+    }))
+})
+
 describe('Agent.ticket', () => {
   const ticket = Effect.gen(function* () {
     return yield* (yield* Agent).ticket({ prompt: 'Fetch ABC-1', log: { ...log, kind: 'ticket' } })

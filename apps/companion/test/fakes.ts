@@ -79,6 +79,7 @@ export const fakeAgent = (
           })
         return attempt(new Set())
       },
+      warm: () => Effect.void,
       freeSlots: () => Effect.succeed(pool.reduce((n, a) => n + a.concurrency, 0) - 1),
       streaming: (o) =>
         Stream.suspend(() => {

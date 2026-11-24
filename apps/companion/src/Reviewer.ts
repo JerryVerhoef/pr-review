@@ -182,6 +182,18 @@ export class Reviewer extends Context.Service<
         const gh = yield* github.forHost(ref.host)
         const pr = yield* gh.getPr(ref.owner, ref.repo, ref.number)
         yield* t.begin('fetch', `Fetching #${ref.number}: ${pr.title}`)
+        // The agents start while the PR is fetched; the sessions below take them as they come up.
+        yield* Effect.forkChild(
+          Effect.andThen(
+            git.ensureClone(repoKey),
+            agent.warm({
+              cwd: git.dir(repoKey),
+              repo: repoKey,
+              ...(automatic && !cachedOpinion ? { related: repoSettings(settings, repoKey).related.map((r) => r.repo) } : {}),
+              log: { kind: 'sort', owner: ref.owner, repo: ref.repo, number: ref.number, headSha },
+            }),
+          ).pipe(Effect.ignore),
+        )
         // Started now so the turn that needs it waits least; `opiner.context` joins the same lookup.
         const ticket = yield* Effect.forkChild(tickets.summary(ref, pr))
         let cachedSort = sortedEarlier
