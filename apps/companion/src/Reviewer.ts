@@ -1,4 +1,4 @@
-import { type AgentAccount, type AgentDecisionOpinion, type AgentFinding, AgentOpinion, AgentQuick, AgentSort, type Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
+import { type AgentAccount, type AgentDecisionOpinion, type AgentFinding, AgentAreas, AgentDecisions, AgentOpinion, AgentQuick, type Decision, type DecisionOpinion, impact, opinionsMode, type Phase, type PrOpinion, type PrRef, repoSettings, smallPrLines, type SortResult } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
 import { type Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Stream, SubscriptionRef } from 'effect'
 import { Agent, type AgentTurns, type SessionOptions } from './Agent.ts'
@@ -8,7 +8,7 @@ import { GitHub } from './GitHub.ts'
 import { judged, type OpinionContext, Opiner, quickDecision } from './Opiner.ts'
 import { annotate, measure } from './Perf.ts'
 import { carryFindingStates } from './carry.ts'
-import { type SortError, Sorter, writtenDecisions } from './Sorter.ts'
+import { noAreas, type SortError, Sorter, writtenDecisions } from './Sorter.ts'
 import { Store } from './Store.ts'
 import { type TicketSummary, Tickets } from './Tickets.ts'
 import { needsTicketAgent } from './ticketRefs.ts'
@@ -268,6 +268,8 @@ export class Reviewer extends Context.Service<
           })
         const known = new Set(sortPrompt?.files.map((f) => f.path))
         let sortText = ''
+        /** Skim areas and trusted groups, from the turn beside the sort. */
+        let areas: AgentAreas | undefined
         /** The sort as far as it is written, while it runs. */
         let sortSoFar: SortResult | undefined
         let shownSoFar = 0
@@ -283,7 +285,7 @@ export class Reviewer extends Context.Service<
             if (ds.length <= shownSoFar) return enqueue(ds)
             shownSoFar = ds.length
             // The page opens on the first decision instead of waiting for the whole sort.
-            const s = sortPrompt!.finish({ decisions: ds, skim: [], claims: [] })
+            const s = sortPrompt!.finish({ decisions: ds, ...(areas ?? noAreas), claims: [] })
             sortSoFar = { ...s, skim: s.skim.map((a) => (a.area === 'Unsorted' ? { ...a, area: 'Still sorting', summary: 'The sort has not placed these files yet.' } : a)) }
             return Effect.andThen(enqueue(ds), publish)
           })
@@ -428,6 +430,20 @@ export class Reviewer extends Context.Service<
         })
 
         const main: Slot = { phase: 'sort', worker: 0 }
+        const besideSort: Slot = { phase: 'sort', worker: 1 }
+        // Beside the sort on a free slot, never waiting for one: the sort session writes the areas itself when none is free.
+        const areasTurn = Effect.suspend(() =>
+          areas
+            ? Effect.void
+            : agent
+                .session({ ...options(besideSort), log: { ...options(besideSort).log, kind: 'areas' }, noWait: true }, (turns, account) =>
+                  Effect.andThen(named(besideSort, account), turns.structured(sortPrompt!.areas, AgentAreas, 'fast', 'areas')),
+                )
+                .pipe(
+                  Effect.flatMap((a) => Effect.sync(() => void (areas = a))),
+                  Effect.ignore,
+                ),
+        )
         // Begun before the session takes an account, so a wait for one shows on it.
         if (!sort) yield* t.begin('sort', `Sorting ${plural(sortPrompt!.files.length, 'file')}`)
         else if (!judged(sort).length) opinionError = 'Nothing to judge'
@@ -440,7 +456,11 @@ export class Reviewer extends Context.Service<
               sortText = ''
               yield* t.begin('sort', `Sorting ${plural(sortPrompt!.files.length, 'file')}`)
               yield* named(main, account)
-              sort = sortPrompt!.finish(yield* turns.structured(sortPrompt!.prompt, AgentSort, 'main', 'sort'))
+              const beside = yield* Effect.forkChild(areasTurn)
+              const decisions = yield* turns.structured(sortPrompt!.prompt, AgentDecisions, 'main', 'sort')
+              yield* Fiber.join(beside)
+              areas ??= yield* turns.structured(sortPrompt!.areas, AgentAreas, 'fast', 'areas').pipe(Effect.orElseSucceed(() => noAreas))
+              sort = sortPrompt!.finish({ ...decisions, ...areas })
               yield* sorter.remember(ref, headSha, sort)
               yield* t.end('sort', 'done')
               streamed = queued.length

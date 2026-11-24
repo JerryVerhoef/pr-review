@@ -1,4 +1,4 @@
-import { type AgentAccount, AgentError, type AgentSort, defaultSettings, type FileStat, GitError, type PrMeta, type StackOverview } from '@pr-review/domain'
+import { type AgentAccount, AgentError, type AgentSort, defaultSettings, type FileStat, GitError, type PrMeta, type StackOverview, type AgentAreas } from '@pr-review/domain'
 import { Effect, Layer, Schema, Stream } from 'effect'
 import { Agent } from '../src/Agent.ts'
 import { Config } from '../src/Config.ts'
@@ -31,15 +31,19 @@ export const fakeAccount2: AgentAccount = { ...fakeAccount, id: 'fake2', name: '
 
 /**
  * An Agent whose structured runs and session turns answer with `reply()`, streaming runs emit `Hi` then Done, and ticket runs answer with `ticket()` (default: no ticket account).
- * A session takes the least busy `pool` account it doesn't avoid (the first of equals); `freeSlots()` is the pool's slots but one, the asking session's.
+ * A session takes the least loaded `pool` account it doesn't avoid with a slot left (the first of equals), else the least loaded; `freeSlots()` is the pool's slots no session holds.
  * A session failing with "usage limit" benches its account for later sessions too: `use` reruns in a new session on the next pool account, while there is one.
+ * The sort's areas turns (see `AgentAreas`) answer with `areas()` apart from all that: in `areasCalls`, outside `calls` and the session count.
  */
 export const fakeAgent = (
   reply: (call: AgentCall) => Effect.Effect<unknown, any> = () => Effect.succeed({ decisions: [], skim: [], claims: [] } satisfies AgentSort),
   ticket: (prompt: string) => Effect.Effect<string, AgentError> = () => Effect.fail(new AgentError({ message: 'No AI account is set to read tickets' })),
   pool: ReadonlyArray<AgentAccount> = [fakeAccount],
+  areas: (call: AgentCall) => Effect.Effect<AgentAreas, AgentError> = () => Effect.succeed({ skim: [] }),
 ) => {
   const calls: AgentCall[] = []
+  const areasCalls: AgentCall[] = []
+  const answerAreas = (call: AgentCall) => Effect.suspend(() => (areasCalls.push(call), areas(call)))
   let sessions = 0
   const busy = new Map<string, number>()
   const benched = new Set<string>()
@@ -56,13 +60,17 @@ export const fakeAgent = (
   const layer = Layer.succeed(
     Agent,
     Agent.of({
-      structured: (o) => answer(o, o.onStep, o.schema) as never,
+      structured: (o) => (o.log.kind === 'areas' ? answerAreas(o) : answer(o, o.onStep, o.schema)) as never,
       session: (o, use) => {
+        if (o.log.kind === 'areas')
+          return use({ ready: Effect.void, structured: (prompt, _schema, model = 'main') => answerAreas({ ...o, prompt, model }) as never }, pool[0] ?? fakeAccount)
         const attempt = (tried: ReadonlySet<string>): ReturnType<typeof use> =>
           Effect.suspend(() => {
             const session = ++sessions
             const free = (a: AgentAccount) => !o.avoid?.has(a.id) && !tried.has(a.id) && !benched.has(a.id)
-            const account = pool.filter(free).sort((a, b) => (busy.get(a.id) ?? 0) - (busy.get(b.id) ?? 0))[0] ?? fakeAccount
+            const load = (a: AgentAccount) => (busy.get(a.id) ?? 0) / Math.max(1, a.concurrency)
+            const candidates = pool.filter(free).sort((a, b) => load(a) - load(b))
+            const account = candidates.find((a) => (busy.get(a.id) ?? 0) < a.concurrency) ?? candidates[0] ?? fakeAccount
             busy.set(account.id, (busy.get(account.id) ?? 0) + 1)
             let turn = 0
             return use(
@@ -80,7 +88,7 @@ export const fakeAgent = (
         return attempt(new Set())
       },
       warm: () => Effect.void,
-      freeSlots: () => Effect.succeed(pool.reduce((n, a) => n + a.concurrency, 0) - 1),
+      freeSlots: () => Effect.sync(() => pool.reduce((n, a) => n + Math.max(0, a.concurrency - (busy.get(a.id) ?? 0)), 0)),
       streaming: (o) =>
         Stream.suspend(() => {
           calls.push(o)
@@ -90,7 +98,7 @@ export const fakeAgent = (
       status: Effect.succeed([]),
     }),
   )
-  return { calls, ticketPrompts, ticketModels, layer, sessions: () => sessions }
+  return { calls, areasCalls, ticketPrompts, ticketModels, layer, sessions: () => sessions }
 }
 
 export const overviewReply: StackOverview = { summary: 's', tables: [], modules: [], endpoints: [], sharedLayers: [] }

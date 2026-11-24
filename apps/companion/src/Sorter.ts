@@ -1,4 +1,4 @@
-import { AgentSort, type AgentError, Decision, type FileStat, type GitError, type GitHubError, type PrRef, type RepoNotConfigured, type SortResult } from '@pr-review/domain'
+import { AgentAreas, AgentDecisions, type AgentSort, type AgentError, Decision, type FileStat, type GitError, type GitHubError, type PrRef, type RepoNotConfigured, type SortResult } from '@pr-review/domain'
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, type Stream } from 'effect'
 import { readFileSync } from 'node:fs'
 import { parse } from 'partial-json'
@@ -16,6 +16,7 @@ import { cacheOptions, measuredCache, peek, poke, SortKey, storeFailuresDie } fr
 import { buildTrusted } from './trusted.ts'
 
 const instructions = readFileSync(new URL('../prompts/sort.md', import.meta.url), 'utf8')
+const areasInstructions = readFileSync(new URL('../prompts/areas.md', import.meta.url), 'utf8')
 
 export type SortError = AgentError | GitError | GitHubError | RepoNotConfigured
 
@@ -36,8 +37,14 @@ export const writtenDecisions = (text: string): ReadonlyArray<Decision> => {
   )
 }
 
-/** A sort ready to run: the prompt, and what makes the agent's answer a `SortResult`. */
-export type SortPrompt = { prompt: string; cwd: string; repo: string; files: ReadonlyArray<FileStat>; finish(answer: AgentSort): SortResult }
+/**
+ * A sort ready to run: the decisions prompt, the areas prompt for the turn beside it (see `AgentAreas`), and what makes
+ * the two answers a `SortResult`.
+ */
+export type SortPrompt = { prompt: string; areas: string; cwd: string; repo: string; files: ReadonlyArray<FileStat>; finish(answer: AgentSort): SortResult }
+
+/** Areas for a sort whose areas turn failed: every file the decisions leave is Unsorted, as `normalize` places it. */
+export const noAreas: AgentAreas = { skim: [] }
 
 /** A push smaller than this, in interdiff lines, is sorted from the previous sort; a larger one from scratch. */
 export const RESORT_LINES = 400
@@ -129,13 +136,20 @@ export class Sorter extends Context.Service<
                     ? `Interdiff too large; read it with diff from ${previous.headSha} to ${head} with its paths`
                     : `Interdiff (git diff ${previous.headSha} ${head}):\n${previous.interdiff}`
                 }`,
-                `# This sort\nThe PR was sorted at ${previous.headSha} and pushed to since. Return decisions for the changed code only: revise, split, merge or drop the decisions to revise, add decisions where the changed code needs them, and place every file under "Changed since then" that is still in the PR. Give new decisions ids no kept decision has. Return skim, trusted, claims and summary for the whole PR at ${head}; a claim may name kept decisions. The full diff is diff from ${mergeBase} to ${head}; read from it where the interdiff is not enough.`,
+                `# This sort\nThe PR was sorted at ${previous.headSha} and pushed to since. Return decisions for the changed code only: revise, split, merge or drop the decisions to revise, add decisions where the changed code needs them, and place every file under "Changed since then" that is still in the PR. Give new decisions ids no kept decision has. Return claims and summary for the whole PR at ${head}; a claim may name kept decisions. The full diff is diff from ${mergeBase} to ${head}; read from it where the interdiff is not enough.`,
               ]
             : [
                 diff.length > review.maxDiffKb * 1000
                   ? `# Diff\nDiff too large; read files with show at ${head} and compare with diff from ${mergeBase} to ${head} with their paths`
                   : `# Diff\n${diff}`,
               ]),
+        ].join('\n\n')
+        const areas = [
+          areasInstructions,
+          `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
+          `# Changed files\n${rest.map((f) => `${f.path}\t+${f.additions}\t-${f.deletions}`).join('\n')}`,
+          `# Likely trusted\n${groups.map((g) => `## ${g.group}: ${g.why}\n${g.files.join('\n')}`).join('\n\n') || '(none)'}`,
+          ...(previous ? [`# Areas at the previous push\nKeep their grouping where it still fits:\n${JSON.stringify({ skim: previous.sort.skim, trusted: previous.sort.trusted })}`] : []),
         ].join('\n\n')
         yield* annotate({
           files: files.length,
@@ -151,16 +165,23 @@ export class Sorter extends Context.Service<
         // Kept decisions come first, as the agent never writes them.
         const finish = (answer: AgentSort) =>
           normalize({ ...answer, decisions: [...(previous?.kept ?? []), ...answer.decisions.filter((d) => !keptIds.has(d.id))] }, files, groups, head, review.neverTrust, mergeBase)
-        return { prompt, cwd: git.dir(repoKey), repo: repoKey, files, finish } satisfies SortPrompt
+        return { prompt, areas, cwd: git.dir(repoKey), repo: repoKey, files, finish } satisfies SortPrompt
       }, measure('context.prepare'))
 
       const run = Effect.fn('Sorter.run')(function* (key: SortKey) {
         const { owner, repo, number, headSha } = key
         const report = steps.report(keyOf(key))
         const p = yield* prepare(key, headSha, report)
-        const sorted = yield* agent.structured({ prompt: p.prompt, schema: AgentSort, cwd: p.cwd, repo: p.repo, log: { kind: 'sort', owner, repo, number, headSha }, onStep: report })
+        const log = { kind: 'sort' as const, owner, repo, number, headSha }
+        const [decisions, areas] = yield* Effect.all(
+          [
+            agent.structured({ prompt: p.prompt, schema: AgentDecisions, cwd: p.cwd, repo: p.repo, log, onStep: report }),
+            agent.structured({ prompt: p.areas, schema: AgentAreas, model: 'fast', cwd: p.cwd, repo: p.repo, log: { ...log, kind: 'areas' } }).pipe(Effect.orElseSucceed(() => noAreas)),
+          ],
+          { concurrency: 2 },
+        )
         yield* report('Checking the answer')
-        return p.finish(sorted)
+        return p.finish({ ...decisions, ...areas })
       }, (effect, key) => measure('operation', { kind: 'sort', owner: key.owner, repo: key.repo, prNumber: key.number, headSha: key.headSha })(effect))
 
       const cache = yield* measuredCache(run, { storeId: 'sort', ...cacheOptions })

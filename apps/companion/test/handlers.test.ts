@@ -57,14 +57,23 @@ const setup = (
   o: { delay?: number; overviewFails?: string; github?: Parameters<typeof fakeGitHub>[0]; sorts?: ReadonlyArray<AgentSort>; files?: FileStat[]; diff?: NonNullable<Parameters<typeof fakeGit>[0]>['diff']; git?: ReturnType<typeof fakeGit>; opinions?: ReadonlyArray<AgentOpinion> } = {},
 ) => {
   let sorted = 0
+  let areas = 0
   let opined = 0
-  const agent = fakeAgent((call) =>
+  const agent = fakeAgent(
+    (call) =>
     call.log.kind === 'overview' && o.overviewFails
       ? Effect.fail(new AgentError({ message: o.overviewFails }))
       : Effect.as(
           o.delay ? Effect.sleep(o.delay) : Effect.void,
           call.log.kind === 'overview' ? overviewReply : call.log.kind === 'stack-opinion' ? { findings: [] } : call.log.kind === 'opinion' || call.log.kind === 'deeper' ? (o.opinions?.[opined++] ?? opinionReply) : (o.sorts?.[sorted++] ?? sortReply),
         ),
+    undefined,
+    undefined,
+    // Each sort's areas, in the order the sorts run.
+    () => {
+      const { skim, trusted }: AgentSort = o.sorts?.[areas++] ?? sortReply
+      return Effect.succeed({ skim, ...(trusted ? { trusted } : {}) })
+    },
   )
   const deps = Layer.mergeAll(agent.layer, (o.git ?? fakeGit({ files: o.files ?? files, diff: o.diff ?? 'd' })).layer, fakeGitHub({ listOpenPrs: () => Effect.succeed([entry(7, 'master', 'feat')]), ...o.github }), configLayer())
   const store = Store.layerWith(KeyValueStore.layerMemory)

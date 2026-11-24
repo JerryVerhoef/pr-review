@@ -1,5 +1,5 @@
 import { assert, describe, it } from '@effect/vitest'
-import { type AgentAccount, AgentError, type AgentFinding, type AgentQuick, type FileStat, type AgentOpinion, type AgentSort, type Decision, GitError, type Phase, type SortResult } from '@pr-review/domain'
+import { type AgentAccount, type AgentAreas, AgentError, type AgentFinding, type AgentQuick, type FileStat, type AgentOpinion, type AgentSort, type Decision, GitError, type Phase, type SortResult } from '@pr-review/domain'
 import { Deferred, Effect, Fiber, Layer, Option, Stream } from 'effect'
 import { KeyValueStore } from 'effect/persistence'
 import { Opiner } from '../src/Opiner.ts'
@@ -40,12 +40,14 @@ const setup = (
     ticket?: Effect.Effect<TicketSummary>
     github?: Partial<GitHubClient>
     diff?: (from: string, to: string, paths: ReadonlyArray<string>) => string | GitError
+    areas?: (call: AgentCall) => Effect.Effect<AgentAreas, AgentError>
   } = {},
 ) => {
   const agent = fakeAgent(
     (call) => (call.log.kind === 'opinion' || call.log.kind === 'deeper' ? (o.opinion?.(call) ?? Effect.succeed(opinionOn(call.prompt))) : (o.sort?.(call) ?? Effect.succeed(sortOf(o.decisions ?? many)))),
     undefined,
     o.pool,
+    o.areas,
   )
   const files = o.stats ?? (o.decisions ?? many).map((d) => ({ path: d.files[0]!.path, additions: 100, deletions: 1 }))
   const deps = Layer.mergeAll(agent.layer, fakeGit({ files, diff: o.diff ?? 'THE DIFF' }).layer, fakeGitHub(o.github), configLayer(), Layer.succeed(Tickets, Tickets.of({ summary: () => o.ticket ?? Effect.succeed({ text: null, note: 'none' }) })))
@@ -231,6 +233,31 @@ describe('Reviewer', () => {
       assert.deepStrictEqual(sorted?.decisions.map((d) => d.id), many.map((d) => d.id))
       assert.strictEqual(opined?.decisions.length, 5)
       assert.isTrue(Option.isSome(last))
+    }))
+
+  it.effect('skim areas and trusted groups come from a turn beside the sort, on the fast model', () =>
+    Effect.gen(function* () {
+      const stats = [...many.map((d) => stat(d.files[0]!.path, 100)), stat('src/feature/page.tsx', 40), stat('src/gen/client.ts', 900)]
+      const { agent, layer } = setup({
+        stats,
+        areas: () => Effect.succeed({ skim: [{ area: 'Feature page', summary: 's', files: ['src/feature/'] }], trusted: [{ group: 'Generated client', why: 'w', files: ['src/gen/client.ts'] }] }),
+      })
+      const r = yield* review.pipe(Effect.provide(layer))
+      assert.deepStrictEqual(r.sort.skim.map((a) => [a.area, a.files]), [['Feature page', ['src/feature/page.tsx']]])
+      assert.deepStrictEqual(r.sort.trusted.map((g) => g.group), ['Generated client'])
+      assert.deepStrictEqual(agent.areasCalls.map((c) => [c.model, c.log.kind]), [['fast', 'areas']])
+      assert.match(agent.areasCalls[0]!.prompt, /src\/feature\/page\.tsx\t\+40/)
+      assert.notMatch(agent.areasCalls[0]!.prompt, /THE DIFF/)
+      // The sort itself is asked for decisions only.
+      assert.notMatch(agent.calls[0]!.prompt.split('# Answer format')[1]!, /"skim"/)
+    }))
+
+  it.effect('when the turn beside it fails, the sort session writes the areas itself', () =>
+    Effect.gen(function* () {
+      const { agent, layer } = setup({ areas: () => Effect.fail(new AgentError({ message: 'No AI account has a free slot' })) })
+      const r = yield* review.pipe(Effect.provide(layer))
+      assert.deepStrictEqual(turns(agent.calls).slice(0, 2), ['1/fake/0/main/sort', '1/fake/1/fast/areas'])
+      assert.isUndefined(r.opinionError)
     }))
 
   it.effect('sort turn uses main', () =>
