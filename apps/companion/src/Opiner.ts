@@ -9,7 +9,7 @@ import { GitHub } from './GitHub.ts'
 import { annotate, measure } from './Perf.ts'
 import { type SortError, Sorter } from './Sorter.ts'
 import { hunkLines, nearestLine } from './interdiff.ts'
-import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection } from './opinionContext.ts'
+import { citationReader, contentIds, describePr, guidanceSection, relatedSection, ticketSection, toolsSection } from './opinionContext.ts'
 import { buildStack } from './stack.ts'
 import { type TicketSummary, Tickets } from './Tickets.ts'
 import { needsTicketAgent } from './ticketRefs.ts'
@@ -237,7 +237,7 @@ export class Opiner extends Context.Service<
                   : [
                       skill,
                       // A continued turn has the refs, guidance and PR from the sort prompt above it.
-                      ...(o.continued ? [] : [`# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`, guidanceSection(master, guidance)]),
+                      ...(o.continued ? [] : [toolsSection, `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`, guidanceSection(master, guidance)]),
                       relatedSection(related),
                       ticketText,
                       `# Stack (bottom first; compare a PR with the one below it using diff from the head below to its head)\n${stackText.join('\n\n') || '(not stacked)'}`,

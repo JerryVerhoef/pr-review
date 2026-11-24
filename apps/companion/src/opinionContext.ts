@@ -9,6 +9,10 @@ import type { TicketSummary } from './Tickets.ts'
 /** The repo's skills reach the agent through the Skill tool (see `Skills`), so the list leaves their files out. */
 export const guidanceFiles = (guidance: ReadonlyArray<string>) => guidance.filter((p) => !REPO_SKILL.test(p))
 
+/** How an agent reads the repo: the companion's git tools (see `GitTools`), and Bash as far as `gitOnly` lets it. */
+export const toolsSection = `# Tools
+Read the repository with the git tools: \`show\` (a file at a ref, with line numbers), \`grep\` (a Perl-compatible regular expression over the files at a ref), \`diff\`, \`list_files\` and \`log\`. Each takes a ref; there is no working tree. They are much faster than Bash, so use Bash only for what they can't do. It runs one read-only git command per call, with no shell variables; piping it into \`head\` or \`tail\` is fine, other pipes, \`;\`, \`&&\`, redirects and \`$(...)\` are refused. Its only gh is \`gh api\` reads of the related repos, when any are listed. Make independent reads in one message, as parallel calls.`
+
 export const guidanceSection = (master: string, guidance: ReadonlyArray<string>) =>
   `# Review guidance (the repo's own rules; read the ones that apply with show at ${master})\n${guidanceFiles(guidance).join('\n') || '(none)'}`
 

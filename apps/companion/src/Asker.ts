@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { Agent } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
+import { toolsSection } from './opinionContext.ts'
 
 const instructions = readFileSync(new URL('../prompts/ask.md', import.meta.url), 'utf8')
 
@@ -54,6 +55,7 @@ export class Asker extends Context.Service<
                 ? question
                 : [
                     instructions,
+                    toolsSection,
                     `# Refs\nPR #${ref.number} head: ${headSha}\nDefault branch: origin/${defaultBranch}`,
                     yield* context(repoKey, headSha, target),
                     `# Question\n${question}`,

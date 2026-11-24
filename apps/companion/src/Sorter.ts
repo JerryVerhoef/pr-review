@@ -9,7 +9,7 @@ import { GitHub } from './GitHub.ts'
 import { changedBetween, shiftRanges } from './carry.ts'
 import { parseDiff } from './interdiff.ts'
 import { normalize } from './normalize.ts'
-import { guidanceSection } from './opinionContext.ts'
+import { guidanceSection, toolsSection } from './opinionContext.ts'
 import { annotate, measure } from './Perf.ts'
 import { makeSteps } from './steps.ts'
 import { cacheOptions, measuredCache, peek, poke, SortKey, storeFailuresDie } from './Store.ts'
@@ -119,6 +119,7 @@ export class Sorter extends Context.Service<
         )
         const prompt = [
           instructions,
+          toolsSection,
           `# Refs\nPR head: ${head}\nMerge base: ${mergeBase}\nDefault branch: ${master}`,
           guidanceSection(master, guidance),
           `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
