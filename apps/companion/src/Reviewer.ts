@@ -356,7 +356,8 @@ export class Reviewer extends Context.Service<
                 yield* t.worker('opinion', slot.worker, (w) => ({ ...w, current: `Judging ${queued.indexOf(item) + 1} of ${queued.length}: ${item.title}` }))
                 yield* judgeTurn(turns, c, [item], { continued, brief: !first })
               }
-              first = false
+              // A brief turn says "the same way"; after a spec-only turn that reads as spec-only, and the agent answers with nothing.
+              first = item === 'spec'
             }
           })
 

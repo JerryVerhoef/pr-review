@@ -460,6 +460,9 @@ describe('Reviewer', () => {
       assert.deepStrictEqual(idsIn(specTurns[0]!), ['h1', 'l1', 'h2', 'l2', 'l3'])
       // Decision turns are told to leave the Spec axis alone.
       assert.isTrue(turnsOf.filter((c) => !specTurns.includes(c) && !c.prompt.startsWith('Now these decisions')).every((c) => c.prompt.includes('skip the Spec axis')))
+      // "The same way" after a spec-only turn reads as spec-only, and the agent answers with nothing.
+      const afterSpec = turnsOf.find((c) => c.session === specTurns[0]!.session && c.turn === specTurns[0]!.turn! + 1)!
+      assert.notMatch(afterSpec.prompt, /^Now these decisions/)
       assert.deepStrictEqual(
         r.opinion?.decisions.map((d) => [d.decisionId, d.findings.map((f) => f.title)]),
         [['h1', []], ['l1', []], ['h2', ['Missing export']], ['l2', []], ['l3', []]],
