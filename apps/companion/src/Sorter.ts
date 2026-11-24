@@ -2,7 +2,7 @@ import { AgentAreas, AgentDecisions, type AgentSort, type AgentError, Decision, 
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, type Stream } from 'effect'
 import { readFileSync } from 'node:fs'
 import { parse } from 'partial-json'
-import { Agent } from './Agent.ts'
+import { Agent, type AgentTurns } from './Agent.ts'
 import { Config } from './Config.ts'
 import { Git } from './Git.ts'
 import { GitHub } from './GitHub.ts'
@@ -45,6 +45,18 @@ export type SortPrompt = { prompt: string; areas: string; cwd: string; repo: str
 
 /** Areas for a sort whose areas turn failed: every file the decisions leave is Unsorted, as `normalize` places it. */
 export const noAreas: AgentAreas = { skim: [] }
+
+/**
+ * A sort in `turns`: the decisions there, and the areas from `beside` (a turn on another slot) meanwhile. When `beside`
+ * fails, the same session writes them after the decisions; when that fails too, every file Unsorted beats no sort.
+ */
+export const sortIn = (p: SortPrompt, turns: AgentTurns, beside: Effect.Effect<AgentAreas, AgentError>) =>
+  Effect.gen(function* () {
+    const areasFiber = yield* Effect.forkChild(Effect.option(beside))
+    const decisions = yield* turns.structured(p.prompt, AgentDecisions, 'main', 'sort')
+    const areas = Option.getOrUndefined(yield* Fiber.join(areasFiber)) ?? (yield* turns.structured(p.areas, AgentAreas, 'fast', 'areas').pipe(Effect.orElseSucceed(() => noAreas)))
+    return p.finish({ ...decisions, ...areas })
+  })
 
 /** A push smaller than this, in interdiff lines, is sorted from the previous sort; a larger one from scratch. */
 export const RESORT_LINES = 400
@@ -174,15 +186,8 @@ export class Sorter extends Context.Service<
         const report = steps.report(keyOf(key))
         const p = yield* prepare(key, headSha, report)
         const log = { kind: 'sort' as const, owner, repo, number, headSha }
-        const [decisions, areas] = yield* Effect.all(
-          [
-            agent.structured({ prompt: p.prompt, schema: AgentDecisions, cwd: p.cwd, repo: p.repo, log, onStep: report }),
-            agent.structured({ prompt: p.areas, schema: AgentAreas, model: 'fast', cwd: p.cwd, repo: p.repo, log: { ...log, kind: 'areas' } }).pipe(Effect.orElseSucceed(() => noAreas)),
-          ],
-          { concurrency: 2 },
-        )
-        yield* report('Checking the answer')
-        return p.finish({ ...decisions, ...areas })
+        const beside = agent.structured({ prompt: p.areas, schema: AgentAreas, model: 'fast', cwd: p.cwd, repo: p.repo, log: { ...log, kind: 'areas' }, noWait: true })
+        return yield* agent.session({ cwd: p.cwd, repo: p.repo, log, onStep: report }, (turns) => sortIn(p, turns, beside))
       }, (effect, key) => measure('operation', { kind: 'sort', owner: key.owner, repo: key.repo, prNumber: key.number, headSha: key.headSha })(effect))
 
       const cache = yield* measuredCache(run, { storeId: 'sort', ...cacheOptions })

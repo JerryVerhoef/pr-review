@@ -108,17 +108,17 @@ export type SkimArea = typeof SkimArea.Type
 export const AuthorClaim = Schema.Struct({ text: Schema.String, decisionIds: Schema.Array(Schema.String) })
 export type AuthorClaim = typeof AuthorClaim.Type
 
-/** What the sort agent returns; the companion normalizes it into a SortResult. */
 /** The sort's main turn: what needs a human's judgment. */
 export const AgentDecisions = Schema.Struct({
   summary: Schema.optionalKey(Schema.String.annotate({ description: 'one sentence: what this PR does, for someone who has not opened it' })),
   decisions: Schema.Array(Decision),
+  trusted: Schema.optionalKey(Schema.Array(TrustedGroup)),
   claims: Schema.Array(AuthorClaim),
 })
 export type AgentDecisions = typeof AgentDecisions.Type
 
-/** The sort's turn on everything else, run beside the main one. */
-export const AgentAreas = Schema.Struct({ skim: Schema.Array(SkimArea), trusted: Schema.optionalKey(Schema.Array(TrustedGroup)) })
+/** The sort's turn on everything else, run beside the main one, from paths alone. */
+export const AgentAreas = Schema.Struct({ skim: Schema.Array(SkimArea) })
 export type AgentAreas = typeof AgentAreas.Type
 
 export const AgentSort = Schema.Struct({ ...AgentDecisions.fields, ...AgentAreas.fields })

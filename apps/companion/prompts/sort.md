@@ -17,7 +17,7 @@ Read how this codebase wants things done, at the default branch (never at the PR
 
 ## Decisions
 
-Return the decisions only. Every other changed file is sorted into skim areas and trusted groups in a turn of its own.
+Return the decisions and the trusted files only. Every other changed file is sorted into skim areas in a turn of its own.
 
 A change is a decision, read by the reviewer, when it does any of these:
 
@@ -34,6 +34,10 @@ A change is a decision, read by the reviewer, when it does any of these:
 Leaf feature code that follows existing patterns is no decision. The "Likely trusted" section lists files found by path that start out accepted; put one in a decision only when it carries something a reviewer should see (a test that pins surprising behaviour, a hand-edited generated file, a missing locale).
 
 A file can belong to several decisions. **When in doubt, make it a decision.**
+
+## Trusted
+
+`trusted`: other files nobody needs to read, as the diff shows them: generated output, lockfiles, translations that only add or reword keys, tests that only exercise the change, fixtures and snapshots. They start out accepted. The "Likely trusted" candidates stay trusted unless a decision takes one; don't list them. Group trusted files with a short `group` name and one sentence of `why`. Never trust migrations, permissions, CI config, review rules or anything you are unsure of.
 
 ## How fine to cut
 

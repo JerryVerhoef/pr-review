@@ -5,7 +5,7 @@ import { Deferred, Effect, Fiber, Layer, Schema, Stream } from 'effect'
 import { TestClock } from 'effect/testing'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Acp } from '../src/Acp.ts'
+import { Acp, type AcpSession } from '../src/Acp.ts'
 import { Agent } from '../src/Agent.ts'
 import { Config } from '../src/Config.ts'
 import { GitTools } from '../src/GitTools.ts'
@@ -21,32 +21,34 @@ type Answer = (a: AgentAccount, prompt: string) => Effect.Effect<string, AgentEr
 /** An Acp whose sessions answer each prompt with `answer`, after one step; `|` in an answer splits it into chunks. */
 const setup = (answer: Answer, accounts = [account('a'), account('b')]) => {
   const opened: Array<{ account: string; resume: string | undefined; cwd: string; tickets?: boolean }> = []
+  const closed: Array<{ account: string; cwd: string }> = []
   const prompts: string[] = []
   const models: string[] = []
   const acp = Layer.succeed(
     Acp,
     Acp.of({
       open: (a, cwd, resume, o) =>
-        Effect.sync(() => {
+        Effect.andThen(Effect.addFinalizer(() => Effect.sync(() => void closed.push({ account: a.id, cwd }))), Effect.sync(() => {
           opened.push({ account: a.id, resume, cwd, ...(o?.tickets ? { tickets: true } : {}) })
-          return {
+          const session: AcpSession = {
             sessionId: resume ?? `S-${a.id}`,
             defaultModel: 'default',
-            setModel: (m) => Effect.sync(() => void models.push(m)),
-            prompt: (text) =>
+            setModel: (m: string) => Effect.sync(() => void models.push(m)),
+            prompt: (text: string) =>
               Stream.unwrap(
                 Effect.map(Effect.suspend(() => (prompts.push(text), answer(a, text))), (t) =>
                   Stream.make({ _tag: 'Step' as const, step: 'Reading a.ts' }).pipe(Stream.concat(Stream.fromIterable(t.split('|').map((delta) => ({ _tag: 'Text' as const, delta }))))),
                 ),
               ),
           }
-        }),
+          return session
+        })),
     }),
   )
   const cacheRoot = tmp()
   const config = Config.layerTest({ cacheRoot, settings: { ...defaultSettings, accounts } })
   const layer = Agent.layer.pipe(Layer.provide([acp, config, Skills.layerTest(), GitTools.layerTest, NodeServices.layer]))
-  return { layer, opened, prompts, models, usagePath: join(cacheRoot, 'usage.jsonl') }
+  return { layer, opened, closed, prompts, models, usagePath: join(cacheRoot, 'usage.jsonl') }
 }
 
 const Ok = Schema.Struct({ ok: Schema.Boolean })
@@ -281,7 +283,7 @@ describe('Agent.session', () => {
 })
 
 describe('Agent.warm', () => {
-  it.live('a session takes a session opened ahead, and another is opened in its place', () =>
+  it.live('a session takes a session opened ahead, and the next warm tops the pool up', () =>
     Effect.gen(function* () {
       const { layer, opened } = setup(() => Effect.succeed('{"ok": true}'))
       yield* Effect.gen(function* () {
@@ -291,12 +293,35 @@ describe('Agent.warm', () => {
         assert.deepStrictEqual(opened.map((o) => o.account), ['a', 'b'])
         assert.deepStrictEqual(yield* agent.structured({ prompt: 'Sort this', schema: Ok, cwd: '/repo', log }), { ok: true })
         yield* Effect.sleep('20 millis')
-        // The session opened nothing itself: the third open is a's replacement.
-        assert.deepStrictEqual(opened.map((o) => o.account), ['a', 'b', 'a'])
-        // Topped up, not added to.
+        // The session opened nothing itself, and nothing took its place.
+        assert.deepStrictEqual(opened.map((o) => o.account), ['a', 'b'])
+        yield* agent.warm({ cwd: '/repo', log })
         yield* agent.warm({ cwd: '/repo', log })
         yield* Effect.sleep('20 millis')
-        assert.strictEqual(opened.length, 3)
+        assert.deepStrictEqual(opened.map((o) => o.account), ['a', 'b', 'a'])
+      }).pipe(Effect.provide(layer))
+    }))
+
+  it.live('warming for other options closes the ones held for the last, and a busy account warms none', () =>
+    Effect.gen(function* () {
+      const { layer, opened, closed } = setup(() => Effect.succeed('{"ok": true}'))
+      yield* Effect.gen(function* () {
+        const agent = yield* Agent
+        yield* agent.warm({ cwd: '/one', log })
+        yield* Effect.sleep('20 millis')
+        yield* agent.warm({ cwd: '/two', log })
+        yield* Effect.sleep('20 millis')
+        assert.deepStrictEqual(closed.map((c) => c.cwd), ['/one', '/one'])
+        assert.deepStrictEqual(opened.map((o) => o.cwd), ['/one', '/one', '/two', '/two'])
+        // A session on other options holds a's slot, so a keeps no warm one.
+        const done = yield* Deferred.make<void>()
+        yield* Effect.forkChild(agent.session({ cwd: '/three', log }, () => Deferred.await(done)))
+        yield* Effect.sleep('20 millis')
+        yield* agent.warm({ cwd: '/two', log })
+        yield* Effect.sleep('20 millis')
+        assert.deepStrictEqual(closed, [{ account: 'a', cwd: '/one' }, { account: 'b', cwd: '/one' }, { account: 'a', cwd: '/two' }])
+        assert.strictEqual(opened.filter((o) => o.cwd === '/two').length, 2)
+        yield* Deferred.succeed(done, undefined)
       }).pipe(Effect.provide(layer))
     }))
 

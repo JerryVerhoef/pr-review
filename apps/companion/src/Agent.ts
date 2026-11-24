@@ -55,12 +55,12 @@ const jsonIn = (text: string) => {
 export class Agent extends Context.Service<
   Agent,
   {
-    structured<S extends Decodable>(o: Run & { schema: S; model?: 'fast' | 'main' }): Effect.Effect<S['Type'], AgentError>
+    structured<S extends Decodable>(o: Run & { schema: S; model?: 'fast' | 'main'; noWait?: boolean }): Effect.Effect<S['Type'], AgentError>
     /** One account, one agent session, as many turns as `use` takes. A benched account reruns `use` on another. */
     session<A>(o: SessionOptions, use: (s: AgentTurns, account: AgentAccount) => Effect.Effect<A, AgentError>): Effect.Effect<A, AgentError>
     /**
-     * Opens sessions ahead for `session` calls with these options, up to each account's concurrency, so they skip the
-     * agent's start. A taken one is replaced. Never fails; returns at once.
+     * Opens sessions ahead for `session` calls with these options, so they skip the agent's start: on each account, as
+     * many as its free slots, in place of any it holds for other options. A taken one is not replaced. Never fails; returns at once.
      */
     warm(o: Opts): Effect.Effect<void>
     /** Free slots across enabled accounts that are not sitting out. */
@@ -96,33 +96,37 @@ export class Agent extends Context.Service<
 
       // Sessions opened ahead, by what they were opened with. A warm session has had no prompt: taking one is the same as
       // opening it, without the wait. Each lives in a scope of its own until its taker's scope closes or it sits unused.
+      // An account's warm and busy sessions together stay within its concurrency.
       const layerScope = yield* Effect.scope
-      type WarmSession = { opened: Deferred.Deferred<AcpSession, AgentError>; scope: Scope.Closeable }
+      type WarmSession = { account: string; opened: Deferred.Deferred<AcpSession, AgentError>; scope: Scope.Closeable }
       const pool = new Map<string, ReadonlyArray<WarmSession>>()
       const poolKey = (a: AgentAccount, o: Opts) => JSON.stringify([a.id, a.command, a.env, a.model ?? null, a.mode ?? null, o.cwd, o.repo ?? null, o.related ?? [], effortFor(o.log.kind) ?? null])
       const addWarm = (key: string, a: AgentAccount, o: Opts) =>
         Effect.gen(function* () {
           const scope = yield* Scope.fork(layerScope)
-          const entry: WarmSession = { opened: yield* Deferred.make<AcpSession, AgentError>(), scope }
+          const entry: WarmSession = { account: a.id, opened: yield* Deferred.make<AcpSession, AgentError>(), scope }
           pool.set(key, [...(pool.get(key) ?? []), entry])
           yield* Effect.forkIn(Effect.flatMap(Effect.exit(Scope.provide(openFor(a, o), scope)), (exit) => Deferred.done(entry.opened, exit)), layerScope)
-          const unused = Effect.suspend(() => {
-            const left = pool.get(key) ?? []
-            if (!left.includes(entry)) return Effect.void
-            pool.set(key, left.filter((e) => e !== entry))
-            return Scope.close(scope, Exit.void)
-          })
-          yield* Effect.forkIn(Effect.andThen(Effect.sleep(WARM_IDLE), unused), layerScope)
+          yield* Effect.forkIn(Effect.andThen(Effect.sleep(WARM_IDLE), drop(key, entry)), layerScope)
         })
-      /** A warm session for these options, opened or opening, now owned by `scope`; another is opened in its place. */
+      const drop = (key: string, entry: WarmSession) =>
+        Effect.suspend(() => {
+          const left = pool.get(key) ?? []
+          if (!left.includes(entry)) return Effect.void
+          pool.set(key, left.filter((e) => e !== entry))
+          return Scope.close(entry.scope, Exit.void)
+        })
+      const warmOn = (account: string) => [...pool].flatMap(([key, entries]) => entries.filter((e) => e.account === account).map((entry) => ({ key, entry })))
+      /** Closes the account's warm sessions past its free slots. */
+      const trim = (a: AgentAccount) => Effect.forEach(warmOn(a.id).slice(Math.max(0, a.concurrency - stateOf(a.id).busy)), ({ key, entry }) => drop(key, entry), { discard: true })
+      /** A warm session for these options, opened or opening, now owned by `scope`. */
       const takeWarm = (a: AgentAccount, o: Opts, scope: Scope.Scope) =>
         Effect.gen(function* () {
           const key = poolKey(a, o)
           const [entry, ...rest] = pool.get(key) ?? []
-          if (!entry) return undefined
+          if (!entry) return yield* Effect.as(trim(a), undefined)
           pool.set(key, rest)
           yield* Scope.addFinalizer(scope, Scope.close(entry.scope, Exit.void))
-          yield* addWarm(key, a, o)
           const opened = yield* Effect.exit(Deferred.await(entry.opened))
           // One that failed to open is opened again by the taker, so a real failure still reaches it.
           return Exit.isSuccess(opened) ? opened.value : undefined
@@ -335,7 +339,9 @@ export class Agent extends Context.Service<
             const now = yield* Clock.currentTimeMillis
             for (const a of (yield* config.settings).accounts.filter((a) => eligible(a, false) && stateOf(a.id).until <= now)) {
               const key = poolKey(a, o)
-              for (let n = pool.get(key)?.length ?? 0; n < a.concurrency; n++) yield* addWarm(key, a, o)
+              yield* Effect.forEach(warmOn(a.id), (w) => (w.key === key ? Effect.void : drop(w.key, w.entry)), { discard: true })
+              yield* trim(a)
+              for (let n = warmOn(a.id).length; n < a.concurrency - stateOf(a.id).busy; n++) yield* addWarm(key, a, o)
             }
           }),
 

@@ -85,6 +85,17 @@ describe('Sorter', () => {
       assert.deepStrictEqual(r.trusted.map((t) => t.group), ['tests'])
       assert.deepStrictEqual(r.skim, [{ area: 'Unsorted', summary: 'Not placed by the sort.', files: ['src/a.ts'] }])
     }))
+  it.effect('areas come from a turn beside the decisions, or from the same session after them when that turn fails', () =>
+    Effect.gen(function* () {
+      const reply = (c: { log: { kind: string } }) => Effect.succeed(c.log.kind === 'areas' ? { skim: [{ area: 'Late', summary: 's', files: ['src/a.ts'] }] } : { decisions: [], claims: [] })
+      const beside = layers({ agent: fakeAgent(reply, undefined, undefined, () => Effect.succeed({ skim: [{ area: 'Beside', summary: 's', files: ['src/a.ts'] }] })) })
+      assert.deepStrictEqual((yield* sortWith(beside.layer)).skim.map((s) => s.area), ['Beside'])
+      assert.deepStrictEqual(beside.agent.calls.map((c) => c.log.kind), ['sort'])
+      const failed = layers({ agent: fakeAgent(reply, undefined, undefined, () => Effect.fail(new AgentError({ message: 'No AI account has a free slot' }))) })
+      assert.deepStrictEqual((yield* sortWith(failed.layer)).skim.map((s) => s.area), ['Late'])
+      assert.deepStrictEqual(failed.agent.calls.map((c) => c.log.kind), ['sort', 'areas'])
+      assert.isTrue((failed.agent.areasCalls[0] as { noWait?: boolean }).noWait)
+    }))
 })
 
 describe('Store', () => {

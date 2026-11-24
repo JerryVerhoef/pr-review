@@ -346,7 +346,8 @@ describe('Reviewer', () => {
         const r = yield* reviewer.result(ref, 'HEAD1')
         assert.strictEqual(r.opinion?.decisions.length, 2)
       }).pipe(Effect.provide(layer))
-      assert.deepStrictEqual(turns(agent.calls), ['1/fake/0/main/opinion', '1/fake/1/fast/opinion'])
+      // Session 1 was the sort's.
+      assert.deepStrictEqual(turns(agent.calls), ['2/fake/0/main/opinion', '2/fake/1/fast/opinion'])
       // A fresh session: the first opinion turn brings the diff.
       assert.match(agent.calls[0]!.prompt, /THE DIFF/)
     }))
@@ -565,11 +566,13 @@ describe('Reviewer', () => {
   it.effect('a cached sort with nothing to judge takes no account', () =>
     Effect.gen(function* () {
       const { agent, layer } = setup({ decisions: [], stats: [stat('src/a.ts', 300)] })
+      let sorted = 0
       const r = yield* Effect.gen(function* () {
         yield* (yield* Sorter).sort(ref, 'HEAD1')
+        sorted = agent.sessions()
         return yield* review
       }).pipe(Effect.provide(layer))
-      assert.strictEqual(agent.sessions(), 0)
+      assert.strictEqual(agent.sessions(), sorted)
       assert.strictEqual(r.opinionError, 'Nothing to judge')
     }))
 

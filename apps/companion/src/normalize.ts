@@ -23,18 +23,19 @@ export function normalize(agent: AgentSort, files: ReadonlyArray<FileStat>, cand
       .flatMap((p) => (p.endsWith('/') ? files.map((f) => f.path).filter((x) => !named.has(x) && dirs.find((d) => x.startsWith(d)) === p) : [p]))
       .filter((p) => !taken.has(p) && taken.add(p))
 
+  const claimed = new Set<string>()
+  const trust = (groups: ReadonlyArray<TrustedGroup>, own: boolean, skip: ReadonlySet<string>) =>
+    groups
+      .map((t) => ({ ...t, files: (own ? expand(t.files) : t.files).filter((p) => known.has(p) && !skip.has(p) && !neverTrusted(p, never) && !claimed.has(p) && claimed.add(p)) }))
+      .filter((t) => t.files.length > 0)
+  // Claude's groups first: the sort trusts a file after reading its diff, so that beats a skim area placed from its path,
+  // and a candidate it placed itself takes its grouping and reason.
+  const byClaude = trust(agent.trusted ?? [], true, inDecision)
   const skim = agent.skim
-    .map((s) => ({ ...s, files: expand(s.files).filter((p) => known.has(p) && !inDecision.has(p)) }))
+    .map((s) => ({ ...s, files: expand(s.files).filter((p) => known.has(p) && !inDecision.has(p) && !claimed.has(p)) }))
     .filter((s) => s.files.length > 0)
   const inSkim = new Set(skim.flatMap((s) => s.files))
-  const claimed = new Set<string>()
-  const keep = (groups: ReadonlyArray<TrustedGroup>, own = false) =>
-    groups
-      .map((t) => ({ ...t, files: (own ? expand(t.files) : t.files).filter((p) => known.has(p) && !inDecision.has(p) && !inSkim.has(p) && !neverTrusted(p, never) && !claimed.has(p) && claimed.add(p)) }))
-      .filter((t) => t.files.length > 0)
-  // Claude's groups first, so a candidate it placed itself takes its grouping and reason.
-  const byClaude = keep(agent.trusted ?? [], true)
-  const trustedOut = [...keep(candidates), ...byClaude]
+  const trustedOut = [...trust(candidates, false, new Set([...inDecision, ...inSkim])), ...byClaude]
 
   const placed = new Set([...inDecision, ...inSkim, ...claimed])
   const unplaced = files.map((f) => f.path).filter((p) => !placed.has(p))
