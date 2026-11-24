@@ -13,6 +13,7 @@ import { CompanionRpcs, HandlersLive, LoggedLive } from '../src/handlers.ts'
 import { Opiner } from '../src/Opiner.ts'
 import { makeTracer, type PerformanceEvent } from '../src/Perf.ts'
 import { contentIds } from '../src/opinionContext.ts'
+import { Mapper } from '../src/Mapper.ts'
 import { Overview } from '../src/Overview.ts'
 import { Reviewer } from '../src/Reviewer.ts'
 import { Sorter } from '../src/Sorter.ts'
@@ -67,7 +68,7 @@ const setup = (
   )
   const deps = Layer.mergeAll(agent.layer, (o.git ?? fakeGit({ files: o.files ?? files, diff: o.diff ?? 'd' })).layer, fakeGitHub({ listOpenPrs: () => Effect.succeed([entry(7, 'master', 'feat')]), ...o.github }), configLayer())
   const store = Store.layerWith(KeyValueStore.layerMemory)
-  const services = Layer.mergeAll(StackOpiner.layer, Asker.layer, Overview.layer, Reviewer.layer).pipe(Layer.provideMerge(Opiner.layer), Layer.provideMerge(Layer.mergeAll(Sorter.layer, Tickets.layer)), Layer.provideMerge(store), Layer.provideMerge(deps))
+  const services = Layer.mergeAll(StackOpiner.layer, Mapper.layer, Asker.layer, Overview.layer, Reviewer.layer).pipe(Layer.provideMerge(Opiner.layer), Layer.provideMerge(Layer.mergeAll(Sorter.layer, Tickets.layer)), Layer.provideMerge(store), Layer.provideMerge(deps))
   const layer = HandlersLive.pipe(Layer.provide(services))
   // Built in the test's scope, like the companion's process scope: the handlers outlive each client call.
   const client = Effect.flatMap(Layer.build(Layer.merge(layer, LoggedLive)), (ctx) => RpcTest.makeClient(CompanionRpcs).pipe(Effect.provideContext(ctx)))
@@ -639,7 +640,7 @@ describe('handlers', () => {
   const ruleClient = (reply: { path: string; rule: string }, fg = fakeGit({ rules: ['AGENTS.md'], show: { 'origin/master:AGENTS.md': '# Rules\n\n- one\n' } })) => {
     const agent = fakeAgent(() => Effect.succeed(reply))
     const deps = Layer.mergeAll(agent.layer, fg.layer, fakeGitHub(), configLayer())
-    const services = Layer.mergeAll(StackOpiner.layer, Asker.layer, Overview.layer, Reviewer.layer).pipe(Layer.provideMerge(Opiner.layer), Layer.provideMerge(Layer.mergeAll(Sorter.layer, Tickets.layer)), Layer.provideMerge(Store.layerWith(KeyValueStore.layerMemory)), Layer.provideMerge(deps))
+    const services = Layer.mergeAll(StackOpiner.layer, Mapper.layer, Asker.layer, Overview.layer, Reviewer.layer).pipe(Layer.provideMerge(Opiner.layer), Layer.provideMerge(Layer.mergeAll(Sorter.layer, Tickets.layer)), Layer.provideMerge(Store.layerWith(KeyValueStore.layerMemory)), Layer.provideMerge(deps))
     const client = Effect.flatMap(Layer.build(Layer.merge(HandlersLive.pipe(Layer.provide(services)), LoggedLive)), (ctx) => RpcTest.makeClient(CompanionRpcs).pipe(Effect.provideContext(ctx)))
     return { agent, client }
   }

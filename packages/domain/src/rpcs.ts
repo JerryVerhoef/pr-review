@@ -4,6 +4,7 @@ import { AgentError, CompanionUnavailable, ReviewRejected, GitError, GitHubError
 import { AskEvent, AskTarget, Chat, DecisionState, Draft, PrRef, PrView, ReviewEvent, SortEvent, StackEvent } from './schemas.ts'
 import { DeeperEvent, FindingState, OpinionEvent, RuleDraft, StackOpinionEvent } from './opinion.ts'
 import { AccountStatus, Settings } from './settings.ts'
+import { ArchitectureEvent } from './architecture.ts'
 
 // CompanionUnavailable is raised by the extension's background when the native host is missing or gone.
 const PrFailure = Schema.Union([RepoNotConfigured, GitError, GitHubError, CompanionUnavailable])
@@ -78,6 +79,13 @@ export class ReviewRpcs extends RpcGroup.make(
   Rpc.make('StackOpinion', {
     payload: { ref: PrRef, run: Schema.Boolean },
     success: StackOpinionEvent,
+    error: Schema.Union([RepoNotConfigured, GitError, GitHubError, AgentError, CompanionUnavailable]),
+    stream: true,
+  }),
+  /** The architecture map of one PR, or with `stack` of the stack it is in: a cached one, `Idle` when there is none and `run` is false, else a run. */
+  Rpc.make('Architecture', {
+    payload: { ref: PrRef, stack: Schema.Boolean, run: Schema.Boolean },
+    success: ArchitectureEvent,
     error: Schema.Union([RepoNotConfigured, GitError, GitHubError, AgentError, CompanionUnavailable]),
     stream: true,
   }),

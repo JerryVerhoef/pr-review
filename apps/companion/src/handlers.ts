@@ -1,4 +1,4 @@
-import { AgentError, AgentRule, appendPatch, inGuidance, opinionsMode, ruleBranch, ruleTitle, type Decision, type DecisionState, type DeeperEvent, type DecisionOpinion, type DecisionStates, type Draft, type FindingStates, type OpinionEvent, type PrOpinion, type PrRef, type Rereview, type ReviewEvent, ReviewRejected, ReviewRpcs, type SortResult, type SortEvent, type StackEntry, type StackEntryStatus, type StackEvent, type StackOpinion, type StackOpinionEvent, targetKey } from '@pr-review/domain'
+import { AgentError, AgentRule, type ArchitectureEvent, type ArchitectureMap, appendPatch, inGuidance, opinionsMode, ruleBranch, ruleTitle, type Decision, type DecisionState, type DeeperEvent, type DecisionOpinion, type DecisionStates, type Draft, type FindingStates, type OpinionEvent, type PrOpinion, type PrRef, type Rereview, type ReviewEvent, ReviewRejected, ReviewRpcs, type SortResult, type SortEvent, type StackEntry, type StackEntryStatus, type StackEvent, type StackOpinion, type StackOpinionEvent, targetKey } from '@pr-review/domain'
 import { readFileSync } from 'node:fs'
 import { Cause, Clock, Effect, Exit, Fiber, Layer, Option, Queue, type Scope, Stream } from 'effect'
 import { RpcMiddleware } from 'effect/rpc'
@@ -12,6 +12,7 @@ import { changedBetween, carryFindingStates, continues } from './carry.ts'
 import { moveLine } from './interdiff.ts'
 import { Opiner } from './Opiner.ts'
 import { guidanceSection } from './opinionContext.ts'
+import { Mapper } from './Mapper.ts'
 import { Overview } from './Overview.ts'
 import { annotate, measure } from './Perf.ts'
 import { Reviewer } from './Reviewer.ts'
@@ -101,6 +102,7 @@ export const HandlersLive = ReviewRpcs.toLayer(
     const sorter = yield* Sorter
     const opiner = yield* Opiner
     const stackOpiner = yield* StackOpiner
+    const mapper = yield* Mapper
     const asker = yield* Asker
     const overview = yield* Overview
     const agent = yield* Agent
@@ -503,6 +505,12 @@ export const HandlersLive = ReviewRpcs.toLayer(
         const done = (opinion: StackOpinion) => Effect.succeed<StackOpinionEvent>({ _tag: 'Done', opinion })
         if (run) return progress(scope, stackOpiner.opine(ref), stackOpiner.steps(ref), done)
         return Stream.unwrap(Effect.map(stackOpiner.cached(ref), (hit) => (hit ? Stream.fromEffect(done(hit)) : Stream.succeed<StackOpinionEvent>({ _tag: 'Idle' }))))
+      },
+
+      Architecture: ({ ref, stack, run }) => {
+        const done = (map: ArchitectureMap) => Effect.succeed<ArchitectureEvent>({ _tag: 'Done', map })
+        if (run) return progress(scope, mapper.map(ref, stack), mapper.steps(ref, stack), done)
+        return Stream.unwrap(Effect.map(mapper.cached(ref, stack), (hit) => (hit ? Stream.fromEffect(done(hit)) : Stream.succeed<ArchitectureEvent>({ _tag: 'Idle' }))))
       },
 
       Recall: ({ key }) => store.remembered.get(key).pipe(Effect.map(Option.getOrNull), Effect.orDie),

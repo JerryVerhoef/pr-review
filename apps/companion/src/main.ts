@@ -16,6 +16,7 @@ import { defaultExtensionId, install } from './install.ts'
 import { Opiner } from './Opiner.ts'
 import { PerfLive, performanceFile } from './Perf.ts'
 import { parseLog, parseSince, summarize } from './perfSummary.ts'
+import { Mapper } from './Mapper.ts'
 import { Overview } from './Overview.ts'
 import { Reviewer } from './Reviewer.ts'
 import { loginPath } from './shellPath.ts'
@@ -25,7 +26,7 @@ import { StackOpiner } from './StackOpiner.ts'
 import { Store } from './Store.ts'
 import { Tickets } from './Tickets.ts'
 
-const services = Layer.mergeAll(StackOpiner.layer, Asker.layer, Overview.layer, Reviewer.layer).pipe(
+const services = Layer.mergeAll(StackOpiner.layer, Mapper.layer, Asker.layer, Overview.layer, Reviewer.layer).pipe(
   Layer.provideMerge(Opiner.layer),
   Layer.provideMerge(Layer.mergeAll(Sorter.layer, Tickets.layer)),
   Layer.provideMerge(Layer.mergeAll(Git.layer, GitHub.layer, Store.layer)),

@@ -1,4 +1,4 @@
-import { AgentError, AskTarget, ChatTurn, DecisionOpinion, DecisionState, DecisionStates, Draft, FileStat, FindingStates, GitError, GitHubError, PrOpinion, RepoNotConfigured, Rereview, SortResult, StackOpinion, StackOverview } from '@pr-review/domain'
+import { AgentError, ArchitectureMap, AskTarget, ChatTurn, DecisionOpinion, DecisionState, DecisionStates, Draft, FileStat, FindingStates, GitError, GitHubError, PrOpinion, RepoNotConfigured, Rereview, SortResult, StackOpinion, StackOverview } from '@pr-review/domain'
 import { Context, Effect, Exit, Layer, Schema } from 'effect'
 import { KeyValueStore, Persistable, PersistedCache, Persistence } from 'effect/persistence'
 import { NodeServices } from '@effect/platform-node'
@@ -60,6 +60,15 @@ export class StackOpinionKey extends Persistable.Class<{
 }>()('StackOpinionKey', {
   primaryKey: (k) => digest(`${k.host}/${k.owner}/${k.repo} stack opinion ${k.heads.map((h) => `${h.number}@${h.headSha}`).join(' ')}`),
   success: StackOpinion,
+  error: errors,
+}) {}
+
+/** One PR's map is a stack of one, so the PR tab and a one-PR stack share it. */
+export class ArchitectureKey extends Persistable.Class<{
+  payload: { host: string; owner: string; repo: string; heads: ReadonlyArray<{ number: number; headSha: string }> }
+}>()('ArchitectureKey', {
+  primaryKey: (k) => digest(`${k.host}/${k.owner}/${k.repo} architecture ${k.heads.map((h) => `${h.number}@${h.headSha}`).join(' ')}`),
+  success: ArchitectureMap,
   error: errors,
 }) {}
 
