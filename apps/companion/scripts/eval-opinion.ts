@@ -11,6 +11,7 @@ import { Acp } from '../src/Acp.ts'
 import { Agent } from '../src/Agent.ts'
 import { Config } from '../src/Config.ts'
 import { Git } from '../src/Git.ts'
+import { GitTools } from '../src/GitTools.ts'
 import { GitHub } from '../src/GitHub.ts'
 import { Opiner } from '../src/Opiner.ts'
 import { Reviewer } from '../src/Reviewer.ts'
@@ -138,7 +139,7 @@ const agentTraced = Layer.effect(
         ),
     })
   }),
-).pipe(Layer.provide(Agent.layer.pipe(Layer.provide([acpTraced, Skills.layer]))))
+).pipe(Layer.provide(Agent.layer.pipe(Layer.provide([acpTraced, Skills.layer, GitTools.layer]))))
 
 const config = fastModel
   ? Layer.effect(

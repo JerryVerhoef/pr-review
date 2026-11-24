@@ -34,7 +34,7 @@ describe('Sorter', () => {
       const { agent, layer } = layers({ diff: 'x'.repeat(300_001) })
       yield* sortWith(layer)
       const p = agent.calls[0]!.prompt
-      assert.match(p, /Diff too large; read files with git show HEAD1:<path>/)
+      assert.match(p, /Diff too large; read files with show at HEAD1/)
       assert.notMatch(p, /xxxxxxxxxx/)
       assert.match(p, /src\/a\.ts\t\+3\t-1/)
     }))
@@ -64,15 +64,15 @@ describe('Sorter', () => {
       assert.deepStrictEqual(git.diffPaths[0], ['src/a.ts', 'src/b.ts'])
     }))
 
-  it.effect('prompt lists the repo guidance at the default branch and says never cd', () =>
+  it.effect('prompt lists the repo guidance at the default branch and names the git tools', () =>
     Effect.gen(function* () {
       const { agent, git, layer } = layers()
       yield* sortWith(layer)
       const p = agent.calls[0]!.prompt
-      assert.match(p, /git show origin\/master:<path>/)
+      assert.match(p, /show at origin\/master/)
       assert.match(p, /\.agents\/agents\/frontend-reviewer\.md/)
       assert.deepStrictEqual(git.listed[0], defaultSettings.review.guidance)
-      assert.match(p, /never `cd`/)
+      assert.match(p, /the git tools: `show`/)
       assert.match(p, /MB1/)
     }))
 

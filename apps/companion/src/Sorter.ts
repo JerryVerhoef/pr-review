@@ -116,7 +116,7 @@ export class Sorter extends Context.Service<
           guidanceSection(master, guidance),
           `# PR #${number}: ${pr.title} (by ${pr.author})\n\n${pr.body || '(no description)'}`,
           `# Changed files\n${rest.map((f) => `${f.path}\t+${f.additions}\t-${f.deletions}`).join('\n')}`,
-          `# Likely trusted (not in the diff below; read with git diff if unsure)\n${groups.map((g) => `## ${g.group}: ${g.why}\n${g.files.join('\n')}`).join('\n\n') || '(none)'}`,
+          `# Likely trusted (not in the diff below; read with diff if unsure)\n${groups.map((g) => `## ${g.group}: ${g.why}\n${g.files.join('\n')}`).join('\n\n') || '(none)'}`,
           ...(previous
             ? [
                 `# Previous sort (head ${previous.headSha})\n${JSON.stringify({ summary: previous.sort.summary ?? '', skim: previous.sort.skim, trusted: previous.sort.trusted, claims: previous.sort.claims })}`,
@@ -126,14 +126,14 @@ export class Sorter extends Context.Service<
                 `# Decisions to revise\n${JSON.stringify(previous.sort.decisions.filter((d) => !keptIds.has(d.id)))}`,
                 `# Changed since then\nOnly these files change differently than at ${previous.headSha}:\n${previous.changed.join('\n')}\n\n${
                   previous.interdiff.length > review.maxDiffKb * 1000
-                    ? `Interdiff too large; read it with git diff ${previous.headSha} ${head} -- <path>`
+                    ? `Interdiff too large; read it with diff from ${previous.headSha} to ${head} with its paths`
                     : `Interdiff (git diff ${previous.headSha} ${head}):\n${previous.interdiff}`
                 }`,
-                `# This sort\nThe PR was sorted at ${previous.headSha} and pushed to since. Return decisions for the changed code only: revise, split, merge or drop the decisions to revise, add decisions where the changed code needs them, and place every file under "Changed since then" that is still in the PR. Give new decisions ids no kept decision has. Return skim, trusted, claims and summary for the whole PR at ${head}; a claim may name kept decisions. The full diff is git diff ${mergeBase} ${head}; read from it where the interdiff is not enough.`,
+                `# This sort\nThe PR was sorted at ${previous.headSha} and pushed to since. Return decisions for the changed code only: revise, split, merge or drop the decisions to revise, add decisions where the changed code needs them, and place every file under "Changed since then" that is still in the PR. Give new decisions ids no kept decision has. Return skim, trusted, claims and summary for the whole PR at ${head}; a claim may name kept decisions. The full diff is diff from ${mergeBase} to ${head}; read from it where the interdiff is not enough.`,
               ]
             : [
                 diff.length > review.maxDiffKb * 1000
-                  ? `# Diff\nDiff too large; read files with git show ${head}:<path> and compare with git diff ${mergeBase} ${head} -- <path>`
+                  ? `# Diff\nDiff too large; read files with show at ${head} and compare with diff from ${mergeBase} to ${head} with their paths`
                   : `# Diff\n${diff}`,
               ]),
         ].join('\n\n')

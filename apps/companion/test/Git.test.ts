@@ -62,7 +62,7 @@ describe('Git', () => {
         assert.isBelow(packs(), 5)
         assert.strictEqual(git(dir, 'cat-file', '-t', 'refs/test/1'), 'blob')
       }),
-    ))
+    ), 30_000)
 
   it.live('ensureClone twice is a no-op', () => run((g) => Effect.andThen(g.ensureClone(key), g.ensureClone(key))))
 

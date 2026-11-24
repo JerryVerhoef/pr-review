@@ -25,13 +25,16 @@ export type Launch = (account: AgentAccount, cwd: string) => Effect.Effect<{ tar
 
 // Claude Code's own settings could allow tools past the gate; its ACP adapter takes SDK options here.
 const disallowedTools = ['Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Task']
-// Only what a review uses: git through Bash, and skills with the files they name. claude.ai connectors stay off; the
-// ticket session reads tickets, and an agent reading untrusted PR content gets no tools beyond read-only git.
+/** The companion's read-only git tools (see `GitTools`); they never need a permission round trip. */
+const GIT_TOOLS = 'mcp__git__'
+// Only what a review uses: the companion's git tools, git through Bash, and skills with the files they name. claude.ai
+// connectors stay off; the ticket session reads tickets, and an agent reading untrusted PR content gets no tools beyond read-only git.
 const claudeOptions = (plugins: ReadonlyArray<string>) => ({
   claudeCode: {
     options: {
       settingSources: [],
       disallowedTools,
+      allowedTools: [`${GIT_TOOLS}*`],
       tools: ['Bash', 'Skill', 'Read'],
       plugins: plugins.map((path) => ({ type: 'local', path, skipMcpDiscovery: true })),
       env: { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' },
@@ -194,7 +197,7 @@ export const spawnAgent: Launch = (account, cwd) =>
     return { target, output: () => output }
   })
 
-export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd: string, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; /** A `thought_level` value, set when the agent offers it. */ effort?: string | undefined; /** Skill-only plugin folders, and the files a Read may open. */ plugins?: ReadonlyArray<string>; readable?: (path: string) => boolean }): Effect.Effect<AcpSession, AgentError, Scope.Scope> }>()(
+export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd: string, resume?: string, o?: { related?: ReadonlyArray<string>; tickets?: boolean; /** A `thought_level` value, set when the agent offers it. */ effort?: string | undefined; /** Skill-only plugin folders, and the files a Read may open. */ plugins?: ReadonlyArray<string>; readable?: (path: string) => boolean; mcpServers?: ReadonlyArray<acp.McpServer> }): Effect.Effect<AcpSession, AgentError, Scope.Scope> }>()(
   'pr-review/Acp',
 ) {
   static readonly layerWith = (launch: Launch) =>
@@ -223,7 +226,8 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
                 // Non-MCP requests carry no tool name; the adapter's kind and title for each tool stand in for it.
                 const allowed = o?.tickets
                   ? ticketPermission(tool)
-                  : (tool.kind === 'execute' && command !== undefined && (safeGitCommand(command) || safeGhCommand(command, o?.related ?? []))) ||
+                  : Option.getOrUndefined(Schema.decodeUnknownOption(ClaudeCodeMeta)(tool._meta))?.claudeCode.toolName.startsWith(GIT_TOOLS) === true ||
+                    (tool.kind === 'execute' && command !== undefined && (safeGitCommand(command) || safeGhCommand(command, o?.related ?? []))) ||
                     (tool.kind === 'other' && tool.title?.startsWith('Load skill') === true && Schema.is(SkillInput)(raw)) ||
                     (tool.kind === 'read' && tool.title?.startsWith('Read ') === true && Schema.is(ReadInput)(raw) && o?.readable?.(raw.file_path) === true)
                 timer?.permission(ctx.params.toolCall.toolCallId, Boolean(allowed))
@@ -245,9 +249,9 @@ export class Acp extends Context.Service<Acp, { open(account: AgentAccount, cwd:
             const start = () =>
               resume
                 ? caps?.sessionCapabilities?.resume
-                  ? agent.request(acp.methods.agent.session.resume, { sessionId: resume, cwd, mcpServers: [], _meta })
-                  : agent.request(acp.methods.agent.session.load, { sessionId: resume, cwd, mcpServers: [], _meta })
-                : agent.request(acp.methods.agent.session.new, { cwd, mcpServers: [], _meta })
+                  ? agent.request(acp.methods.agent.session.resume, { sessionId: resume, cwd, mcpServers: [...(o?.mcpServers ?? [])], _meta })
+                  : agent.request(acp.methods.agent.session.load, { sessionId: resume, cwd, mcpServers: [...(o?.mcpServers ?? [])], _meta })
+                : agent.request(acp.methods.agent.session.new, { cwd, mcpServers: [...(o?.mcpServers ?? [])], _meta })
             // Agents that keep their own login (Cursor, Gemini) want it named first; an API key is never offered.
             const login = init.authMethods?.find((m) => m.id !== 'api-key' && !('type' in m && m.type === 'terminal'))
             const session = yield* call(start).pipe(

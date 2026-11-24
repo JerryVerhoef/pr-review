@@ -10,7 +10,7 @@ import type { TicketSummary } from './Tickets.ts'
 export const guidanceFiles = (guidance: ReadonlyArray<string>) => guidance.filter((p) => !REPO_SKILL.test(p))
 
 export const guidanceSection = (master: string, guidance: ReadonlyArray<string>) =>
-  `# Review guidance (the repo's own rules; read the ones that apply with git show ${master}:<path>)\n${guidanceFiles(guidance).join('\n') || '(none)'}`
+  `# Review guidance (the repo's own rules; read the ones that apply with show at ${master})\n${guidanceFiles(guidance).join('\n') || '(none)'}`
 
 export const relatedSection = (related: ReadonlyArray<RelatedRepo>) =>
   related.length

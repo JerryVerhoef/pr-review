@@ -3,6 +3,7 @@ import { Clock, Context, Deferred, Effect, Exit, FileSystem, Layer, Result, Sche
 import { dirname, join } from 'node:path'
 import { Acp, type AcpSession } from './Acp.ts'
 import { Config } from './Config.ts'
+import { GitTools } from './GitTools.ts'
 import { annotate, measure, measureStream } from './Perf.ts'
 import { Skills } from './Skills.ts'
 
@@ -77,6 +78,7 @@ export class Agent extends Context.Service<
       const acp = yield* Acp
       const config = yield* Config
       const skills = yield* Skills
+      const gitTools = yield* GitTools
       const fs = yield* FileSystem.FileSystem
       const usagePath = join(config.cacheRoot, 'usage.jsonl')
       const states = new Map<string, { busy: number; until: number; error: string | null }>()
@@ -85,9 +87,11 @@ export class Agent extends Context.Service<
 
       const eligible = (a: AgentAccount, tickets: boolean) => a.enabled && (!tickets || a.tickets === true)
 
+      /** A session reading a clone gets the companion's git tools for as long as it is open. */
+      const mcpFor = (repo: string | undefined) => (repo ? Effect.map(gitTools.register(repo), (s) => [s]) : Effect.succeed([]))
       const openFor = (a: AgentAccount, o: Opts) =>
-        Effect.flatMap(skills.plugins(a, o.repo), (plugins) =>
-          acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind), plugins, readable: skills.readable }),
+        Effect.flatMap(Effect.all([skills.plugins(a, o.repo), mcpFor(o.repo)]), ([plugins, mcpServers]) =>
+          acp.open(a, o.cwd, undefined, { ...(o.related ? { related: o.related } : {}), effort: effortFor(o.log.kind), plugins, readable: skills.readable, mcpServers }),
         )
 
       // Sessions opened ahead, by what they were opened with. A warm session has had no prompt: taking one is the same as
@@ -347,7 +351,7 @@ export class Agent extends Context.Service<
           return Stream.unwrap(
             Effect.gen(function* () {
               const a = yield* acquire(o, new Set(), owner)
-              const session = yield* acp.open(a, o.cwd, sessionId, { plugins: yield* skills.plugins(a, o.repo), readable: skills.readable })
+              const session = yield* acp.open(a, o.cwd, sessionId, { plugins: yield* skills.plugins(a, o.repo), readable: skills.readable, mcpServers: yield* mcpFor(o.repo) })
               yield* annotate({ agent: a.agent, account: a.id, model: a.model || session.defaultModel })
               const startedAt = yield* Clock.currentTimeMillis
               return session.prompt(o.prompt).pipe(
